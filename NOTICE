@@ -1,0 +1,20 @@
+zig-tachi
+
+Portions of the host runtime are adapted from:
+
+  Mihon — https://github.com/mihonapp/mihon
+  Copyright the Mihon contributors. Licensed under the Apache License, Version 2.0.
+  Files: host/src/main/kotlin/eu/kanade/tachiyomi/** (source-api, network helpers)
+
+  extensions-lib — https://github.com/keiyoushi/extensions-lib
+  Licensed under the Apache License, Version 2.0.
+  (API surface that host/src/main/kotlin/eu/kanade/tachiyomi/** implements)
+
+The android.*, androidx.* and dalvik.* classes under host/src/main/java
+re-implement public Android framework APIs (Android Open Source Project,
+Apache License, Version 2.0) for a plain JVM. The stripped android.jar stub
+library built by host/build.gradle.kts is derived from the Android SDK.
+
+The approach of running extensions on a desktop JVM follows Suwayomi-Server
+(https://github.com/Suwayomi/Suwayomi-Server, MPL-2.0); no Suwayomi code is
+included.

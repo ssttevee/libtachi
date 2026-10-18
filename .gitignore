@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+.tachi-data/
+host/.gradle/
+host/build/
+host/.kotlin/
+*.log
+.DS_Store
+/host/lib/
