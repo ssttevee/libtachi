@@ -34,6 +34,16 @@ pub const Vm = struct {
         extra_options: []const []const u8 = &.{},
     };
 
+    /// Options every VM gets. Extensions lean on reflection through
+    /// kotlinx.serialization, so the module system is opened up; AWT is never
+    /// wanted; sources parse large pages recursively, hence the bigger stack.
+    const base_options = [_][*:0]const u8{
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        "--add-opens=java.base/java.util=ALL-UNNAMED",
+        "-Djava.awt.headless=true",
+        "-Xss2m",
+    };
+
     /// Create a new JVM in this process. HotSpot only supports one VM per
     /// process, so call this at most once.
     pub fn create(gpa: std.mem.Allocator, opts: CreateOptions) Error!Vm {
@@ -52,24 +62,18 @@ pub const Vm = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        var options: std.ArrayList(jni.JavaVMOption) = .empty;
+        var options = try std.ArrayList(jni.JavaVMOption).initCapacity(
+            arena,
+            base_options.len + opts.extra_options.len + 1,
+        );
         if (opts.classpath.len > 0) {
-            const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
-            var cp: std.ArrayList(u8) = .empty;
-            try cp.appendSlice(arena, "-Djava.class.path=");
-            for (opts.classpath, 0..) |entry, i| {
-                if (i != 0) try cp.append(arena, sep);
-                try cp.appendSlice(arena, entry);
-            }
-            try options.append(arena, .{ .optionString = try arena.dupeSentinel(u8, cp.items, 0) });
+            const joined = try std.mem.join(arena, &.{std.fs.path.delimiter}, opts.classpath);
+            const cp = try std.fmt.allocPrintSentinel(arena, "-Djava.class.path={s}", .{joined}, 0);
+            options.appendAssumeCapacity(.{ .optionString = cp });
         }
-        // Extensions use plenty of reflection through kotlinx.serialization; keep the module system open.
-        try options.append(arena, .{ .optionString = "--add-opens=java.base/java.lang=ALL-UNNAMED" });
-        try options.append(arena, .{ .optionString = "--add-opens=java.base/java.util=ALL-UNNAMED" });
-        try options.append(arena, .{ .optionString = "-Djava.awt.headless=true" });
-        try options.append(arena, .{ .optionString = "-Xss2m" });
+        for (base_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
         for (opts.extra_options) |o| {
-            try options.append(arena, .{ .optionString = try arena.dupeSentinel(u8, o, 0) });
+            options.appendAssumeCapacity(.{ .optionString = try arena.dupeSentinel(u8, o, 0) });
         }
 
         var args = jni.JavaVMInitArgs{
