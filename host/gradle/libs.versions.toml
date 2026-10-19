@@ -8,10 +8,8 @@ okhttp = "5.5.0"
 jsoup = "1.23.2"
 dex2jar = "2.4.38"
 shadow = "9.2.2"
-aircompressor = "0.27"
 
 [libraries]
-aircompressor = { module = "io.airlift:aircompressor", version.ref = "aircompressor" }
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
 kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlin" }
 coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }

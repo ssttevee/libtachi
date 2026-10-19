@@ -69,11 +69,53 @@ pub fn build(b: *std.Build) void {
     install_built_jar.step.dependOn(&gradle.step);
     b.step("host", "Build tachi-host.jar with Gradle and copy it to <prefix>/lib").dependOn(&install_built_jar.step);
 
+    // libzstd's decoder and the JNI bridge behind okhttp3.zstd.Zstd, for -Dtarget.
+    // The host loads it from disk, so consumers install the named lazy paths
+    // `pocketmanga-zstd` and `zstd-license` wherever their JVM looks.
+    const zstd_step = b.step("zstd", "Build libpocketmanga-zstd for -Dtarget into <prefix>/lib");
+    if (b.lazyDependency("zstd", .{})) |upstream| {
+        const jdk = b.option([]const u8, "jdk", "JDK whose include/jni.h the zstd bridge compiles against (default: $JAVA_HOME)") orelse
+            b.graph.environ_map.get("JAVA_HOME");
+        const zstd = zstdJni(b, upstream, jdk, target, optimize);
+        b.addNamedLazyPath("pocketmanga-zstd", zstd.getEmittedBin());
+        b.addNamedLazyPath("zstd-license", upstream.path("LICENSE"));
+        zstd_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
+        zstd_step.dependOn(&b.addInstallFile(upstream.path("LICENSE"), "share/licenses/zstd-LICENSE.txt").step);
+    }
+
     // A plain `zig build` copies an already built jar too, unless it is embedded.
     // A missing jar is not an error here: the runtime may be pointed at one.
     if (!embed_host_jar and fileExists(b, host_jar)) {
         b.getInstallStep().dependOn(&b.addInstallLibFile(sourcePath(b, host_jar), "tachi-host.jar").step);
     }
+}
+
+/// Upstream lib/common and lib/decompress plus host/native/zstd_jni.c. Legacy
+/// formats and assembly stay off, and word access goes through memcpy, so the
+/// same source suits ARMv7 with strict alignment.
+fn zstdJni(b: *std.Build, upstream: *std.Build.Dependency, jdk: ?[]const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .strip = true });
+    module.addIncludePath(b.path("host/native/include"));
+    module.addIncludePath(upstream.path("lib"));
+    module.addCSourceFiles(.{
+        .root = upstream.path("lib"),
+        .files = &.{
+            "common/debug.c",          "common/entropy_common.c",      "common/error_private.c",
+            "common/fse_decompress.c", "common/pool.c",                "common/threading.c",
+            "common/xxhash.c",         "common/zstd_common.c",         "decompress/huf_decompress.c",
+            "decompress/zstd_ddict.c", "decompress/zstd_decompress.c", "decompress/zstd_decompress_block.c",
+        },
+        .flags = &.{ "-fvisibility=hidden", "-DZSTD_DISABLE_ASM", "-DZSTD_LEGACY_SUPPORT=0", "-DZSTD_FORCE_MEMORY_ACCESS=0" },
+    });
+    module.addCSourceFile(.{ .file = b.path("host/native/zstd_jni.c"), .flags = &.{"-fvisibility=hidden"} });
+    const lib = b.addLibrary(.{ .name = "pocketmanga-zstd", .linkage = .dynamic, .root_module = module });
+    // jni.h comes from a JDK; host/native/include supplies the Linux jni_md.h.
+    if (jdk) |home| {
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ home, "include" }) });
+    } else {
+        lib.step.dependOn(&b.addFail("libpocketmanga-zstd needs jni.h: pass -Djdk=<path> or set JAVA_HOME").step);
+    }
+    return lib;
 }
 
 /// `b.path` only takes project-relative paths; `-Dhost-jar` may be absolute.

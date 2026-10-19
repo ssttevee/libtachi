@@ -2,7 +2,7 @@
 """Compare the host zstd public ABI and extension constant-pool references.
 Reads jars only. The optional reference is the published okhttp-zstd 5.5.0 jar.
 """
-import argparse, hashlib, struct, zipfile
+import argparse, hashlib, struct, zipfile, re, shutil, subprocess
 from pathlib import Path
 
 def decode(data):
@@ -53,11 +53,13 @@ def decode(data):
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--provider',type=Path,default=Path(__file__).resolve().parents[1]/'build/libs/tachi-host.jar')
 parser.add_argument('--reference',type=Path)
+parser.add_argument('--native', type=Path, help='Audit the source-built ARM JNI shared library')
 parser.add_argument('extensions',type=Path,nargs='*')
 args=parser.parse_args()
 with zipfile.ZipFile(args.provider) as z:
     public,_=decode(z.read('okhttp3/zstd/Zstd.class'))
-    assert not any(n.startswith(('com/squareup/zstd/','com/github/luben/')) for n in z.namelist()), 'JNI zstd implementation leaked into host'
+    assert 'dev/tachi/host/NativeZstdInputStream.class' in z.namelist()
+    assert not any(n.startswith(('io/airlift/compress/', 'dev/tachi/host/AlignedUnsafe', 'com/squareup/zstd/', 'com/github/luben/')) for n in z.namelist()), 'Obsolete or extracting decoder bundled'
 if args.reference:
     with zipfile.ZipFile(args.reference) as z: reference,_=decode(z.read('okhttp3/zstd/Zstd.class'))
     assert public==reference, (public,reference)
@@ -74,4 +76,19 @@ for extension in args.extensions:
     assert refs<=provided, refs-provided
     print(extension.name, 'sha256='+hashlib.sha256(extension.read_bytes()).hexdigest())
     for ref in sorted(refs): print('  '+'.'.join(ref[:2])+' '+ref[2])
-print('PASS: zstd compatibility; no JNI zstd classes bundled')
+if args.native:
+    readelf=shutil.which('llvm-readelf') or '/opt/homebrew/opt/llvm/bin/llvm-readelf'
+    header=subprocess.check_output([readelf,'-h','-A',str(args.native)],text=True)
+    flags=int(re.search(r'Flags:\s+(0x[0-9a-fA-F]+)',header).group(1),16)
+    assert 'ARM' in header and flags & 0x200 and not flags & 0x400, header
+    dynamic=subprocess.check_output([readelf,'-d',str(args.native)],text=True)
+    needed=re.findall(r'\(NEEDED\).*\[([^]]+)\]',dynamic)
+    assert needed == ['libc.so.6'], needed
+    symbols=subprocess.check_output([readelf,'--dyn-syms','--wide',str(args.native)],text=True)
+    versions=re.findall(r'@GLIBC_([0-9.]+)',symbols)
+    maximum=max(versions,key=lambda v:tuple(map(int,v.split('.'))))
+    assert tuple(map(int,maximum.split('.'))) <= (2,17), maximum
+    for method in ('create','inflate','destroy'):
+        assert 'Java_dev_tachi_host_NativeZstdInputStream_'+method in symbols
+    print('ARM soft-float JNI: NEEDED='+','.join(needed)+' max GLIBC='+maximum)
+print('PASS: zstd ABI and bundled JNI provider')

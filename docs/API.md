@@ -187,7 +187,7 @@ Android: 2 verbose … 7 assert.
 
 `call(source, "imageRequests", {"chapter": Chapter})` returns one request per page:
 `{page, url, method, headers:[{name,value}], rates:[{key,spacingMs,initialWaitMs}], cookies:[Set-Cookie-string], fallback:null|string}`.
-It resolves null imageUrl with getImageUrl, uses the source's virtual imageRequest, exports URL-matched jar cookies, recognized rate limits and Keiyoushi cookie injection. Unknown interceptors/client policies conservatively require fetchImage. A native caller must preserve the limits, handle redirects/challenges through the original client, retain partial pages and never forward headers to an unexamined redirect target.
+It resolves null imageUrl with getImageUrl and uses the source's virtual imageRequest. Rate limiters are identified structurally, including R8-minified Keiyoushi rule lists and Mihon's legacy host/permit/window/queue/semaphore layout. Their waits are removed from the probe and exported as conservative spacing plus an initial drain window. Unknown locking/queue layouts require fetchImage. All other application interceptors run before a simulated bridge (default User-Agent, URL-matched jar cookies, identity encoding), followed by network interceptors and a synthetic empty 200 response. The captured final request supplies URL, method and ordered headers, including dynamic cookie/signing changes. A replaced response body, exception or terminal bypass/repetition selects fetchImage with the responsible interceptor's name. Custom client transport/authentication/TLS policies, non-GET/body requests and non-identity final encoding also require fetchImage. A native caller must preserve the limits, handle redirects/challenges through the original client, retain partial pages and never forward headers to an unexamined redirect target.
 
 `call(source, "imageCookies", {"url": URL, "cookies": [...]})` restores the exported matching cookies into a restarted source client before JVM fallback; it returns true. `call(source, "cancel", {})` calls the source client's dispatcher.cancelAll and returns true. Process owners must still terminate an unresponsive host; extension code need not cooperate with cancellation.
 
@@ -196,20 +196,32 @@ It resolves null imageUrl with getImageUrl, uses the source's virtual imageReque
 The host supplies `okhttp3.zstd.Zstd` with the public ABI of okhttp-zstd 5.5.0:
 `INSTANCE`, `getEncoding(): String`, and `decompress(BufferedSource): Source`,
 implementing `CompressionInterceptor.DecompressionAlgorithm`. Extensions can keep
-using `CompressionInterceptor(Zstd, Brotli, Gzip)`. Decoding uses Apache-2.0
-Aircompressor 0.27, without a zstd JNI library or FFM. Brotli remains pure Java.
+using `CompressionInterceptor(Zstd, Brotli, Gzip)`. Decoding uses the source-built
+libzstd 1.5.7 streaming decoder through `NativeZstdInputStream` and a small JNI
+bridge. No Aircompressor, alignment adapter, or ASM bytecode transform remains.
+Brotli continues to use its existing Java decoder.
 
-Stock Aircompressor uses unaligned Unsafe word accesses, which fault on ARM Zero.
-The host build rewrites its zstd package's 97 word-access call sites through
-`AlignedUnsafe`, preserving aligned fast paths and splitting unaligned accesses
-into smaller aligned words/bytes. Only this rewritten jar is on runtimeClasspath;
-the alignment tool and its ASM dependency are build-only (existing dex2jar ASM
-dependencies are unaffected). This adapter requires little-endian targets, like upstream
-Aircompressor 0.27. The bundled Java 17 soft-float Zero JVM is tested by the app's
-ARM and firmware fixtures using actual zstd-encoded metadata over HTTP/TLS.
+The pinned upstream source, target flags, loader choice and build commands
+are documented in [host/native/README.md](../host/native/README.md).
+`zig build zstd -Dtarget=...` builds `<prefix>/lib/libpocketmanga-zstd.so`, and
+dependent builds can install the `pocketmanga-zstd` named lazy path for their
+own target. Package it into `runtime/lib/` beside the bundled JRE's parent.
+The worker loads the absolute normalized `java.home/../lib/libpocketmanga-zstd.so`
+path with `System.load`; it never extracts native code from jar resources.
+Desktop tests can explicitly set
+`-Dtachi.zstd.library=/absolute/path/to/the/desktop/library`.
 
-Run `cd host && ./gradlew shadowJar testZstd` for decoding, truncation and close
-checks. `python3 tools/check_zstd_abi.py --reference /path/to/okhttp-zstd-5.5.0.jar
-/path/to/extension.jar ...` additionally compares the published public members
-and scans the extension bytecode's actual zstd references. The shadow jar includes
-Aircompressor's license and the modification notice under `META-INF/licenses/`.
+Run `cd host && ./gradlew shadowJar testZstd testImageRequests --offline` for
+streaming, single-byte input, concatenated frames, checksum/truncation, closure,
+and interceptor/rate-limit fixtures. `testImageRequests` accepts
+`-PextensionJars=/path/to/mangadex.jar,/path/to/mangafox.jar` to instantiate and
+probe the installed clients. Add `-PliveMangaDex=true` to plan the documented
+43-page MangaDex chapter through live metadata requests without image transfers.
+
+`python3 tools/check_zstd_abi.py --native zig-out/lib/libpocketmanga-zstd.so
+--reference /path/to/okhttp-zstd-5.5.0.jar /path/to/extension.jar ...` compares the
+published public members and actual extension references, rejects obsolete
+or extracting decoders, and audits the ARM soft-float ABI, NEEDED entries and
+maximum GLIBC version. The BSD zstd license is included in the shadow jar and
+next to the built library for device packaging. The app's ARM/firmware fixtures
+exercise actual zstd HTTP/TLS metadata and verify the bundled JNI mapping.

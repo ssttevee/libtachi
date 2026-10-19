@@ -3,12 +3,19 @@
     .version = "0.1.0",
     .fingerprint = 0xa3fab57f04e3ad7f,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "include",
+        "host/native",
         "README.md",
     },
 }

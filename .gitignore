@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+zig-pkg/
 .tachi-data/
 host/.gradle/
 host/build/
@@ -7,3 +8,4 @@ host/.kotlin/
 *.log
 .DS_Store
 /host/lib/
+__pycache__/
