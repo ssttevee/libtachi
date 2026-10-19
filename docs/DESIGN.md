@@ -155,8 +155,10 @@ escape (bridge bug) is caught by `ExceptionCheck`, described via
    ~10% of sources that descramble images in an OkHttp interceptor (Suwayomi
    has an implementation to port).
 4. **Streaming images** (`fetchImage` currently buffers the whole body).
-5. **Repo index client**: parse `index.pb`/`index.min.json` and download
-   extensions from within the library.
+5. ~~Repo index client~~: done in Zig (`src/repo.zig`, `src/manage.zig`);
+   the JVM stays a pure extension interface. Still open: verifying the JAR
+   signature over every entry (today only the signer's certificate hash is
+   checked, over HTTPS), APK v2/v3 signing-block parsing, and icon download.
 6. **Async API**: optional callback-based variants so hosts need not manage
    threads themselves.
 7. extensions-lib 1.4/1.5 if a repository that still ships them matters.

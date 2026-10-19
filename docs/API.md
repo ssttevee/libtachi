@@ -41,7 +41,45 @@ SourceInfo {
 }
 ```
 
-Loaded extensions are not persisted; reload them when your process starts.
+`install` is the only way a package enters the JVM. The Zig/C layers wrap it
+with a registry so installs survive the process; see below.
+
+## Management (native side)
+
+Everything in this section is implemented in Zig on `std.Io` and never
+crosses into the JVM except to call `install`/`uninstall` above. It is
+exposed as `Runtime.installExtension/uninstallExtension/restore/repo*` in
+Zig and as `tachi_install/tachi_uninstall/tachi_restore/tachi_repo_*` in C.
+
+| Call | Does |
+|---|---|
+| `installExtension(path)` | `install` + records the package in `<data_dir>/extensions/installed.json` |
+| `uninstallExtension(pkg)` | `uninstall` + forgets it; deletes the file if it was downloaded from a repo |
+| `restore()` | reloads every recorded package; `{"loaded": n, "failed": [{"pkg", "error"}]}` |
+| `repoList(url?)` | `RepoEntry[]`: the index joined with the registry |
+| `repoInstall(pkg, url?)` | download, verify signer, `install`, record |
+| `repoUpdate(url?)` | `{"updated": ExtensionInfo[], "failed": [{"pkg","error"}], "missing": [pkg]}` |
+
+```json
+RepoEntry {
+  "pkg": "eu.kanade.tachiyomi.extension.en.weebcentral", "name": "Weeb Central",
+  "versionName": "1.6.25", "versionCode": 106025, "libVersion": "1.6",
+  "nsfw": true, "lang": "en",
+  "jarUrl": "https://…/tachiyomi-en.weebcentral-v1.6.25.jar", "apkUrl": "https://…", "iconUrl": "https://…",
+  "supported": true,                 // libVersion is one the host implements
+  "installed": true, "installedVersionCode": 106025, "hasUpdate": false,
+  "sources": [ { "id": "2131019126180322627", "name": "Weeb Central", "lang": "en", "baseUrl": "https://weebcentral.com" } ]
+}
+```
+
+The index is Mihon's `index.pb` (gzip protobuf; `index.min.json` is no
+longer produced by keiyoushi). It is cached under `<data_dir>/repo/` for an
+hour. Packages are stored as `<data_dir>/extensions/<pkg>-<versionCode>.jar`;
+the jar URL is preferred over the apk so dex2jar is never needed for
+keiyoushi. Before a download is loaded, the SHA-256 of the certificate in its
+`META-INF/*.RSA` block must equal the index's `signing_key` (the check Mihon
+makes on APK signatures). Packages without a v1 signature block are rejected;
+keiyoushi APKs are v2/v3-only, which is one more reason to prefer the jar.
 
 ## `call(sourceId, method, args)`
 
