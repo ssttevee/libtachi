@@ -26,6 +26,12 @@ pub const ErrorCode = enum(c_int) {
     extension_error = 7,
     invalid_response = 8,
     out_of_memory = 9,
+    network_error = 10,
+    invalid_index = 11,
+    file_system_error = 12,
+    extension_not_in_repo = 13,
+    signature_mismatch = 14,
+    unsupported_extension = 15,
 
     fn int(c: ErrorCode) c_int {
         return @backingInt(c);
@@ -43,14 +49,27 @@ fn mapError(err: tachi.Error) c_int {
         error.JvmCreateFailed, error.AttachFailed => .jvm_create_failed,
         error.HostJarNotFound => .host_jar_not_found,
         error.BridgeClassNotFound, error.BridgeMethodNotFound => .bridge_missing,
-        error.JavaException, error.ExtensionError, error.InvalidResponse => |e| {
+        error.JavaException,
+        error.ExtensionError,
+        error.InvalidResponse,
+        error.FileSystemError,
+        error.ExtensionNotInRepo,
+        error.SignatureMismatch,
+        error.UnsupportedExtension,
+        => |e| {
             // tachi already recorded a message for these; keep it.
             return @as(ErrorCode, switch (e) {
                 error.JavaException => .java_exception,
                 error.ExtensionError => .extension_error,
                 error.InvalidResponse => .invalid_response,
+                error.FileSystemError => .file_system_error,
+                error.ExtensionNotInRepo => .extension_not_in_repo,
+                error.SignatureMismatch => .signature_mismatch,
+                error.UnsupportedExtension => .unsupported_extension,
             }).int();
         },
+        error.NetworkError => .network_error,
+        error.InvalidIndex => .invalid_index,
         error.OutOfMemory => .out_of_memory,
     };
     return fail(mapped, @errorName(err));
@@ -154,6 +173,40 @@ pub export fn tachi_uninstall(rt: ?*tachi.Runtime, pkg: ?[*:0]const u8) c_int {
     const p = optSlice(pkg) orelse return fail(.invalid_argument, "pkg is NULL");
     _ = r.uninstallExtension(p) catch |e| return mapError(e);
     return ErrorCode.ok.int();
+}
+
+pub export fn tachi_restore(rt: ?*tachi.Runtime, out_json: ?*?[*:0]u8) c_int {
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const json = r.restore() catch |e| return mapError(e);
+    return returnJson(json, out_json);
+}
+
+fn repoOptions(index_url: ?[*:0]const u8, refresh: c_int) tachi.Runtime.RepoOptions {
+    return .{ .url = optSlice(index_url), .refresh = refresh != 0 };
+}
+
+pub export fn tachi_repo_list(rt: ?*tachi.Runtime, index_url: ?[*:0]const u8, refresh: c_int, out_json: ?*?[*:0]u8) c_int {
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const json = r.repoListJson(repoOptions(index_url, refresh)) catch |e| return mapError(e);
+    return returnJson(json, out_json);
+}
+
+pub export fn tachi_repo_install(
+    rt: ?*tachi.Runtime,
+    index_url: ?[*:0]const u8,
+    package_name: ?[*:0]const u8,
+    out_json: ?*?[*:0]u8,
+) c_int {
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const pkg = optSlice(package_name) orelse return fail(.invalid_argument, "package_name is NULL");
+    const json = r.repoInstall(pkg, repoOptions(index_url, 0)) catch |e| return mapError(e);
+    return returnJson(json, out_json);
+}
+
+pub export fn tachi_repo_update(rt: ?*tachi.Runtime, index_url: ?[*:0]const u8, out_json: ?*?[*:0]u8) c_int {
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const json = r.repoUpdate(repoOptions(index_url, 1)) catch |e| return mapError(e);
+    return returnJson(json, out_json);
 }
 
 pub export fn tachi_list_extensions(rt: ?*tachi.Runtime, out_json: ?*?[*:0]u8) c_int {

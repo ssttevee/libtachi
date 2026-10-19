@@ -33,6 +33,12 @@ typedef enum tachi_error {
     TACHI_E_EXTENSION_ERROR = 7,
     TACHI_E_INVALID_RESPONSE = 8,
     TACHI_E_OUT_OF_MEMORY = 9,
+    TACHI_E_NETWORK_ERROR = 10,          /* index/package download failed or non-2xx */
+    TACHI_E_INVALID_INDEX = 11,          /* index.pb could not be decoded */
+    TACHI_E_FILE_SYSTEM_ERROR = 12,
+    TACHI_E_EXTENSION_NOT_IN_REPO = 13,
+    TACHI_E_SIGNATURE_MISMATCH = 14,     /* package not signed with the repository's key */
+    TACHI_E_UNSUPPORTED_EXTENSION = 15,  /* extensions-lib version the host does not implement */
 } tachi_error;
 
 /* Levels follow android.util.Log. */
@@ -72,11 +78,36 @@ void tachi_thread_detach(tachi_runtime *rt);
 const char *tachi_last_error(void);
 void tachi_free(void *p);
 
-/* Load a .jar or .apk extension. *out_json receives an ExtensionInfo document. */
+/*
+ * Install a .jar or .apk extension from a file. The package is loaded now and
+ * remembered in <data_dir>/extensions/installed.json so tachi_restore() can
+ * reload it in a later process. *out_json receives an ExtensionInfo document.
+ */
 int tachi_install(tachi_runtime *rt, const char *path, char **out_json);
+/* Unload and forget a package; deletes its file if it was downloaded by tachi_repo_install(). */
 int tachi_uninstall(tachi_runtime *rt, const char *package_name);
-/* *out_json receives a JSON array of ExtensionInfo. */
+/* *out_json receives a JSON array of ExtensionInfo (what is loaded right now). */
 int tachi_list_extensions(tachi_runtime *rt, char **out_json);
+/*
+ * Reload every remembered package. Call once after tachi_runtime_new().
+ * *out_json receives {"loaded": n, "failed": [{"pkg", "error"}]}; a failure
+ * keeps the package remembered so a later update can repair it.
+ */
+int tachi_restore(tachi_runtime *rt, char **out_json);
+
+/*
+ * Repositories. index_url is a Mihon-style index.pb (NULL = keiyoushi).
+ * The index is cached under <data_dir>/repo for an hour; refresh != 0 bypasses
+ * the cache. Downloads are checked against the repository's signing key.
+ *
+ * tachi_repo_list:    *out_json receives a JSON array of RepoEntry (see docs/API.md).
+ * tachi_repo_install: downloads, verifies and installs one package; ExtensionInfo out.
+ * tachi_repo_update:  upgrades every package installed from index_url;
+ *                     {"updated": [ExtensionInfo], "failed": [...], "missing": [pkg]} out.
+ */
+int tachi_repo_list(tachi_runtime *rt, const char *index_url, int refresh, char **out_json);
+int tachi_repo_install(tachi_runtime *rt, const char *index_url, const char *package_name, char **out_json);
+int tachi_repo_update(tachi_runtime *rt, const char *index_url, char **out_json);
 
 /*
  * Invoke a method on a loaded source. `method` is one of:
