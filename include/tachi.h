@@ -58,7 +58,8 @@ typedef struct tachi_config {
     const char *data_dir;          /* preferences, cookies, converted APKs */
     const char *cache_dir;         /* default: <data_dir>/cache */
     const char *host_jar;          /* default: $TACHI_HOST_JAR, the copy embedded at build time (extracted
-                                      into cache_dir), ./tachi-host.jar, ./host/build/libs/tachi-host.jar */
+                                      into cache_dir), tachi-host.jar beside the executable or in ../lib,
+                                      ./tachi-host.jar, ./host/build/libs/tachi-host.jar */
     const char *java_home;         /* default: $TACHI_JAVA_HOME, $JAVA_HOME, well-known install dirs */
     const char *libjvm_path;       /* overrides java_home */
     const char *user_agent;

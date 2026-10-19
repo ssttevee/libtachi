@@ -48,8 +48,10 @@ pub const Options = struct {
     data_dir: []const u8,
     cache_dir: ?[]const u8 = null,
     /// Path to tachi-host.jar. Defaults to $TACHI_HOST_JAR, then the copy
-    /// embedded at build time (`-Dhost-jar`, extracted into `cache_dir`),
-    /// then ./tachi-host.jar and ./host/build/libs/tachi-host.jar.
+    /// embedded at build time (`-Dembed-host-jar`, extracted into `cache_dir`),
+    /// then tachi-host.jar beside the executable or in ../lib (where
+    /// `zig build` installs it), then ./tachi-host.jar and
+    /// ./host/build/libs/tachi-host.jar.
     host_jar: ?[]const u8 = null,
     /// Extra jars for the JVM classpath (e.g. a JavaScript engine implementation).
     extra_classpath: []const []const u8 = &.{},
@@ -570,10 +572,24 @@ fn findHostJar(gpa: std.mem.Allocator, io: Io, environ: Environ, explicit: ?[]co
         if (jvm.fileExists(io, p)) return gpa.dupe(u8, p);
     }
     if (host_jar.bytes) |bytes| return extractHostJar(gpa, io, bytes, cache_dir);
+    if (try besideExecutable(gpa, io)) |p| return p;
     for (host_jar_candidates) |p| {
         if (jvm.fileExists(io, p)) return gpa.dupe(u8, p);
     }
     return error.HostJarNotFound;
+}
+
+/// `<prefix>/bin/tachi-cli` finds `<prefix>/lib/tachi-host.jar`, the layout
+/// `zig build` installs; a jar dropped next to the executable also works.
+fn besideExecutable(gpa: std.mem.Allocator, io: Io) Error!?[]u8 {
+    const exe_dir = std.process.executableDirPathAlloc(io, gpa) catch return null;
+    defer gpa.free(exe_dir);
+    for ([_][]const u8{ ".", "../lib" }) |rel| {
+        const p = try std.fs.path.join(gpa, &.{ exe_dir, rel, "tachi-host.jar" });
+        if (jvm.fileExists(io, p)) return p;
+        gpa.free(p);
+    }
+    return null;
 }
 
 /// Writes the embedded jar to `<cache_dir>/tachi-host-<hash>.jar` once; later
