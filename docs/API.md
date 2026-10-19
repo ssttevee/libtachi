@@ -190,3 +190,26 @@ Android: 2 verbose … 7 assert.
 It resolves null imageUrl with getImageUrl, uses the source's virtual imageRequest, exports URL-matched jar cookies, recognized rate limits and Keiyoushi cookie injection. Unknown interceptors/client policies conservatively require fetchImage. A native caller must preserve the limits, handle redirects/challenges through the original client, retain partial pages and never forward headers to an unexamined redirect target.
 
 `call(source, "imageCookies", {"url": URL, "cookies": [...]})` restores the exported matching cookies into a restarted source client before JVM fallback; it returns true. `call(source, "cancel", {})` calls the source client's dispatcher.cancelAll and returns true. Process owners must still terminate an unresponsive host; extension code need not cooperate with cancellation.
+
+### Zstd compression compatibility
+
+The host supplies `okhttp3.zstd.Zstd` with the public ABI of okhttp-zstd 5.5.0:
+`INSTANCE`, `getEncoding(): String`, and `decompress(BufferedSource): Source`,
+implementing `CompressionInterceptor.DecompressionAlgorithm`. Extensions can keep
+using `CompressionInterceptor(Zstd, Brotli, Gzip)`. Decoding uses Apache-2.0
+Aircompressor 0.27, without a zstd JNI library or FFM. Brotli remains pure Java.
+
+Stock Aircompressor uses unaligned Unsafe word accesses, which fault on ARM Zero.
+The host build rewrites its zstd package's 97 word-access call sites through
+`AlignedUnsafe`, preserving aligned fast paths and splitting unaligned accesses
+into smaller aligned words/bytes. Only this rewritten jar is on runtimeClasspath;
+the alignment tool and its ASM dependency are build-only (existing dex2jar ASM
+dependencies are unaffected). This adapter requires little-endian targets, like upstream
+Aircompressor 0.27. The bundled Java 17 soft-float Zero JVM is tested by the app's
+ARM and firmware fixtures using actual zstd-encoded metadata over HTTP/TLS.
+
+Run `cd host && ./gradlew shadowJar testZstd` for decoding, truncation and close
+checks. `python3 tools/check_zstd_abi.py --reference /path/to/okhttp-zstd-5.5.0.jar
+/path/to/extension.jar ...` additionally compares the published public members
+and scans the extension bytecode's actual zstd references. The shadow jar includes
+Aircompressor's license and the modification notice under `META-INF/licenses/`.

@@ -68,6 +68,25 @@ val androidStubs = tasks.register<Zip>("androidStubs") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
+// Only the rewritten jar enters runtimeClasspath. ASM is a build tool only.
+val aircompressorOriginal by configurations.creating
+val alignmentTools by configurations.creating
+val compileAlignmentTool = tasks.register<JavaCompile>("compileAlignmentTool") {
+    source("tools/AlignAircompressor.java")
+    classpath = alignmentTools
+    destinationDirectory.set(layout.buildDirectory.dir("alignment-tool"))
+    options.release.set(17)
+}
+val alignedJar = layout.buildDirectory.file("compat/aircompressor-0.27.jar")
+val alignAircompressor = tasks.register<JavaExec>("alignAircompressor") {
+    dependsOn(compileAlignmentTool)
+    classpath = files(compileAlignmentTool.flatMap { it.destinationDirectory }) + alignmentTools
+    mainClass.set("AlignAircompressor")
+    inputs.files(aircompressorOriginal)
+    outputs.file(alignedJar)
+    doFirst { args = listOf(aircompressorOriginal.singleFile.absolutePath, alignedJar.get().asFile.absolutePath) }
+}
+
 dependencies {
     compileOnly(files(androidStubs.map { it.archiveFile }))
     // The stubs are also needed at runtime so extension bytecode can link.
@@ -81,6 +100,11 @@ dependencies {
     implementation(libs.serialization.protobuf)
     implementation(libs.okhttp.core)
     implementation(libs.okhttp.brotli)
+    // Java-8-compatible, pure Java zstd. No okhttp-zstd / zstd-kmp JNI dependency.
+    compileOnly(libs.aircompressor)
+    add(aircompressorOriginal.name, libs.aircompressor)
+    add(alignmentTools.name, "org.ow2.asm:asm:9.8")
+    runtimeOnly(files(alignedJar).builtBy(alignAircompressor))
     implementation(libs.okhttp.logging)
     implementation(libs.jsoup)
     implementation(libs.injekt.core)
@@ -100,3 +124,17 @@ tasks.shadowJar {
 }
 
 tasks.build { dependsOn(tasks.shadowJar) }
+
+
+val testZstd = tasks.register<JavaExec>("testZstd") {
+    description = "Check the JNI-free okhttp-zstd ABI, decoding and stream lifecycle."
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.tachi.host.ZstdCompatibilityTest")
+}
+tasks.check { dependsOn(testZstd) }
+
+
+tasks.processResources {
+    from("licenses") { into("META-INF/licenses") }
+}

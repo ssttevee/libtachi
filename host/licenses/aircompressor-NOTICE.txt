@@ -1,0 +1,9 @@
+Aircompressor 0.27 (io.airlift:aircompressor:0.27)
+Source: https://github.com/airlift/aircompressor/tree/0.27
+License: Apache License, Version 2.0 (aircompressor-LICENSE.txt)
+PocketManga uses the pure Java io.airlift.compress.zstd.ZstdInputStream.
+No Aircompressor native codec or zstd-kmp JNI implementation is included.
+
+PocketManga modification: zstd package Unsafe get/putShort/Int/Long calls are
+rewritten at build time to dev.tachi.host.AlignedUnsafe for ARM Zero alignment.
+Other Aircompressor code and its public API are unchanged.
