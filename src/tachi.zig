@@ -106,19 +106,44 @@ fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
 var g_log_fn: ?LogFn = null;
 var g_log_ud: ?*anyopaque = null;
 
+// ---- bridge method table -------------------------------------------------------
+
+/// Static methods of `dev.tachi.host.Bridge`, with their JNI signatures.
+/// The enum tag is the Java method name, so adding a bridge method is one line.
+pub const BridgeMethod = enum {
+    init,
+    install,
+    uninstall,
+    listExtensions,
+    call,
+    fetchImage,
+    lastImageMime,
+    lastError,
+    shutdown,
+
+    pub fn signature(m: BridgeMethod) [:0]const u8 {
+        return switch (m) {
+            .init, .install, .uninstall => "([B)[B",
+            .listExtensions, .lastImageMime, .lastError => "()[B",
+            .call => "(J[B[B)[B",
+            .fetchImage => "(J[B)[B",
+            .shutdown => "()V",
+        };
+    }
+
+    /// `true` when the method returns `byte[]`, so `invokeBytes` may be used.
+    pub fn returnsBytes(m: BridgeMethod) bool {
+        return std.mem.endsWith(u8, m.signature(), ")[B");
+    }
+};
+
+const MethodIds = std.EnumArray(BridgeMethod, jni.jmethodID);
+
 pub const Runtime = struct {
     gpa: std.mem.Allocator,
     vm: jvm.Vm,
     bridge: jni.jclass,
-    m_init: jni.jmethodID,
-    m_install: jni.jmethodID,
-    m_uninstall: jni.jmethodID,
-    m_list: jni.jmethodID,
-    m_call: jni.jmethodID,
-    m_fetch_image: jni.jmethodID,
-    m_last_image_mime: jni.jmethodID,
-    m_last_error: jni.jmethodID,
-    m_shutdown: jni.jmethodID,
+    methods: MethodIds,
 
     pub fn init(gpa: std.mem.Allocator, opts: Options) Error!*Runtime {
         const self = try gpa.create(Runtime);
@@ -144,23 +169,17 @@ pub const Runtime = struct {
         errdefer self.vm.destroy();
 
         const env = try self.vm.env();
-        const local = env.f.FindClass(env, "dev/tachi/host/Bridge") orelse {
-            describeException(env);
-            return error.BridgeClassNotFound;
-        };
-        self.bridge = env.f.NewGlobalRef(env, local);
-        env.f.DeleteLocalRef(env, local);
+        self.bridge = try findGlobalClass(env, "dev/tachi/host/Bridge");
         errdefer env.f.DeleteGlobalRef(env, self.bridge);
 
-        self.m_init = try staticMethod(env, self.bridge, "init", "([B)[B");
-        self.m_install = try staticMethod(env, self.bridge, "install", "([B)[B");
-        self.m_uninstall = try staticMethod(env, self.bridge, "uninstall", "([B)[B");
-        self.m_list = try staticMethod(env, self.bridge, "listExtensions", "()[B");
-        self.m_call = try staticMethod(env, self.bridge, "call", "(J[B[B)[B");
-        self.m_fetch_image = try staticMethod(env, self.bridge, "fetchImage", "(J[B)[B");
-        self.m_last_image_mime = try staticMethod(env, self.bridge, "lastImageMime", "()[B");
-        self.m_last_error = try staticMethod(env, self.bridge, "lastError", "()[B");
-        self.m_shutdown = try staticMethod(env, self.bridge, "shutdown", "()V");
+        var ids: MethodIds = undefined;
+        inline for (comptime std.enums.values(BridgeMethod)) |m| {
+            ids.set(m, env.f.GetStaticMethodID(env, self.bridge, @tagName(m), m.signature()) orelse {
+                describeException(env);
+                return error.BridgeMethodNotFound;
+            });
+        }
+        self.methods = ids;
 
         if (opts.log_fn) |f| {
             g_log_fn = f;
@@ -183,7 +202,7 @@ pub const Runtime = struct {
         defer gpa.free(config_json);
         if (env.f.PushLocalFrame(env, 16) != jni.JNI_OK) return error.OutOfMemory;
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_init, &.{.{ .l = try newByteArray(env, config_json) }});
+        const reply = try self.invokeBytes(env, self.methods.get(.init), &.{.{ .l = try newByteArray(env, config_json) }});
         defer gpa.free(reply);
         try checkEnvelope(gpa, reply);
         return self;
@@ -191,7 +210,7 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         if (self.vm.env()) |env| {
-            env.f.CallStaticVoidMethodA(env, self.bridge, self.m_shutdown, &[_]jni.jvalue{});
+            env.f.CallStaticVoidMethodA(env, self.bridge, self.methods.get(.shutdown), &[_]jni.jvalue{});
             if (env.f.ExceptionCheck(env) != 0) env.f.ExceptionClear(env);
             env.f.DeleteGlobalRef(env, self.bridge);
         } else |_| {}
@@ -212,7 +231,7 @@ pub const Runtime = struct {
     pub fn installExtension(self: *Runtime, path: []const u8) Error![]u8 {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_install, &.{.{ .l = try newByteArray(env, path) }});
+        const reply = try self.invokeBytes(env, self.methods.get(.install), &.{.{ .l = try newByteArray(env, path) }});
         defer self.gpa.free(reply);
         return unwrapOk(self.gpa, reply);
     }
@@ -220,7 +239,7 @@ pub const Runtime = struct {
     pub fn installExtensionParsed(self: *Runtime, path: []const u8) Error!Result(models.ExtensionInfo) {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_install, &.{.{ .l = try newByteArray(env, path) }});
+        const reply = try self.invokeBytes(env, self.methods.get(.install), &.{.{ .l = try newByteArray(env, path) }});
         defer self.gpa.free(reply);
         return parseEnvelope(models.ExtensionInfo, self.gpa, reply);
     }
@@ -228,7 +247,7 @@ pub const Runtime = struct {
     pub fn uninstallExtension(self: *Runtime, pkg: []const u8) Error!bool {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_uninstall, &.{.{ .l = try newByteArray(env, pkg) }});
+        const reply = try self.invokeBytes(env, self.methods.get(.uninstall), &.{.{ .l = try newByteArray(env, pkg) }});
         defer self.gpa.free(reply);
         const r = try parseEnvelope(bool, self.gpa, reply);
         defer r.deinit();
@@ -239,7 +258,7 @@ pub const Runtime = struct {
     pub fn listExtensions(self: *Runtime) Error![]u8 {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_list, &.{});
+        const reply = try self.invokeBytes(env, self.methods.get(.listExtensions), &.{});
         defer self.gpa.free(reply);
         return unwrapOk(self.gpa, reply);
     }
@@ -247,7 +266,7 @@ pub const Runtime = struct {
     pub fn listExtensionsParsed(self: *Runtime) Error!Result([]const models.ExtensionInfo) {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_list, &.{});
+        const reply = try self.invokeBytes(env, self.methods.get(.listExtensions), &.{});
         defer self.gpa.free(reply);
         return parseEnvelope([]const models.ExtensionInfo, self.gpa, reply);
     }
@@ -259,7 +278,7 @@ pub const Runtime = struct {
     pub fn call(self: *Runtime, source_id: i64, method: []const u8, args_json: []const u8) Error![]u8 {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_call, &.{
+        const reply = try self.invokeBytes(env, self.methods.get(.call), &.{
             .{ .j = source_id },
             .{ .l = try newByteArray(env, method) },
             .{ .l = try newByteArray(env, args_json) },
@@ -271,7 +290,7 @@ pub const Runtime = struct {
     pub fn callParsed(self: *Runtime, comptime T: type, source_id: i64, method: []const u8, args_json: []const u8) Error!Result(T) {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.m_call, &.{
+        const reply = try self.invokeBytes(env, self.methods.get(.call), &.{
             .{ .j = source_id },
             .{ .l = try newByteArray(env, method) },
             .{ .l = try newByteArray(env, args_json) },
@@ -288,13 +307,13 @@ pub const Runtime = struct {
         defer _ = env.f.PopLocalFrame(env, null);
 
         const args = [_]jni.jvalue{ .{ .j = source_id }, .{ .l = try newByteArray(env, page_json) } };
-        const arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.m_fetch_image, &args);
+        const arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.fetchImage), &args);
         if (env.f.ExceptionCheck(env) != 0) {
             describeException(env);
             return error.JavaException;
         }
         if (arr == null) {
-            const err_arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.m_last_error, &[_]jni.jvalue{});
+            const err_arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.lastError), &[_]jni.jvalue{});
             if (err_arr) |e| {
                 const msg = try bytesFromArray(self.gpa, env, e);
                 defer self.gpa.free(msg);
@@ -305,7 +324,7 @@ pub const Runtime = struct {
         const bytes = try bytesFromArray(self.gpa, env, arr.?);
         errdefer self.gpa.free(bytes);
         var mime: ?[]u8 = null;
-        if (env.f.CallStaticObjectMethodA(env, self.bridge, self.m_last_image_mime, &[_]jni.jvalue{})) |m| {
+        if (env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.lastImageMime), &[_]jni.jvalue{})) |m| {
             mime = try bytesFromArray(self.gpa, env, m);
         }
         return .{ .bytes = bytes, .mime = mime };
@@ -336,11 +355,13 @@ pub const Runtime = struct {
     }
 };
 
-fn staticMethod(env: *jni.JNIEnv, cls: jni.jclass, name: [*:0]const u8, sig: [*:0]const u8) Error!jni.jmethodID {
-    return env.f.GetStaticMethodID(env, cls, name, sig) orelse {
+fn findGlobalClass(env: *jni.JNIEnv, name: [*:0]const u8) Error!jni.jclass {
+    const local = env.f.FindClass(env, name) orelse {
         describeException(env);
-        return error.BridgeMethodNotFound;
+        return error.BridgeClassNotFound;
     };
+    defer env.f.DeleteLocalRef(env, local);
+    return env.f.NewGlobalRef(env, local) orelse error.OutOfMemory;
 }
 
 fn newByteArray(env: *jni.JNIEnv, bytes: []const u8) Error!jni.jbyteArray {
@@ -498,4 +519,11 @@ test "last error is truncated, never overflowed" {
     setLastError(&big);
     try std.testing.expectEqual(last_error_buf.len, lastError().len);
     try std.testing.expectEqual(@as(u8, 0), last_error_buf[last_error_buf.len]);
+}
+
+test "every bridge method has a parseable signature" {
+    inline for (comptime std.enums.values(BridgeMethod)) |m| {
+        try std.testing.expect(m.signature()[0] == '(');
+        try std.testing.expect(m.returnsBytes() or m == .shutdown);
+    }
 }
