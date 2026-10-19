@@ -225,6 +225,7 @@ pub const RepoOptions = struct {
 pub fn repoList(rt: *Runtime, arena: Allocator, opts: RepoOptions) Error![]RepoEntry {
     var http: repo.Http = .init(rt.gpa, rt.io);
     defer http.deinit();
+    if (rt.ca_file) |path| try http.useCaFile(path);
     const store = try fetchStore(rt, &http, arena, opts);
 
     rt.lock.lockUncancelable(rt.io);
@@ -253,6 +254,7 @@ pub fn repoInstall(rt: *Runtime, pkg: []const u8, opts: RepoOptions) Error![]u8 
     const arena = arena_state.allocator();
     var http: repo.Http = .init(rt.gpa, rt.io);
     defer http.deinit();
+    if (rt.ca_file) |path| try http.useCaFile(path);
     const store = try fetchStore(rt, &http, arena, opts);
     const ext = store.find(pkg) orelse {
         tachi.setLastErrorFmt("{s} is not in {s}", .{ pkg, opts.url orelse repo.default_index_url });
@@ -281,6 +283,7 @@ pub fn repoUpdate(rt: *Runtime, opts: RepoOptions) Error![]u8 {
     const arena = arena_state.allocator();
     var http: repo.Http = .init(rt.gpa, rt.io);
     defer http.deinit();
+    if (rt.ca_file) |path| try http.useCaFile(path);
     const url = opts.url orelse repo.default_index_url;
     const store = try fetchStore(rt, &http, arena, opts);
 

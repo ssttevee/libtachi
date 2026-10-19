@@ -254,6 +254,13 @@ pub const Http = struct {
         return .{ .client = .{ .allocator = gpa, .io = io } };
     }
 
+    /// Use explicit PEM roots without changing system files or disabling TLS.
+    pub fn useCaFile(h: *Http, path: []const u8) Error!void {
+        const now = Io.Clock.real.now(h.client.io);
+        h.client.ca_bundle.addCertsFromFilePath(h.client.allocator, h.client.io, now, Io.Dir.cwd(), path) catch return error.NetworkError;
+        h.client.now = now;
+    }
+
     pub fn deinit(h: *Http) void {
         h.client.deinit();
     }

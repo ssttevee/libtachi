@@ -42,6 +42,8 @@ pub const LogLevel = enum(c_int) { verbose = 2, debug = 3, info = 4, warn = 5, e
 pub const LogFn = *const fn (level: LogLevel, tag: [*:0]const u8, message: [*:0]const u8, user_data: ?*anyopaque) callconv(.c) void;
 
 pub const Options = struct {
+    /// PEM trust bundle for repository HTTPS; null uses the OS roots.
+    ca_file: ?[]const u8 = null,
     /// Directory where the host persists preferences, cookies and converted APKs.
     data_dir: []const u8,
     cache_dir: ?[]const u8 = null,
@@ -184,6 +186,7 @@ pub const Runtime = struct {
     lock: Io.Mutex = .init,
     /// extensions-lib versions the host jar reported at `init`.
     supported_lib_versions: []const []const u8,
+    ca_file: ?[]u8 = null,
 
     // Management (registry, repositories): see manage.zig.
     pub const installExtension = manage.installExtension;
@@ -214,6 +217,8 @@ pub const Runtime = struct {
         defer gpa.free(default_cache);
         self.cache_dir = try absoluteDir(gpa, io, opts.cache_dir orelse default_cache);
         errdefer gpa.free(self.cache_dir);
+        if (opts.ca_file) |path| self.ca_file = try gpa.dupe(u8, path);
+        errdefer if (self.ca_file) |path| gpa.free(path);
 
         self.vm = if (opts.existing_vm) |vm| jvm.Vm.adopt(vm) else try self.createVm(opts);
         errdefer self.vm.destroy();
@@ -293,6 +298,7 @@ pub const Runtime = struct {
         self.gpa.free(self.supported_lib_versions);
         self.gpa.free(self.data_dir);
         self.gpa.free(self.cache_dir);
+        if (self.ca_file) |path| self.gpa.free(path);
         self.gpa.destroy(self);
     }
 
