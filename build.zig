@@ -11,6 +11,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    tachi_mod.addImport("host_jar", embeddedHostJar(b, b.option(
+        []const u8,
+        "host-jar",
+        "Embed this tachi-host.jar in the library so nothing else needs to be distributed",
+    )));
 
     // Modules that depend on the library share one shape; only the root differs.
     const dependent = struct {
@@ -50,8 +55,32 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 
-    // Kotlin host jar via Gradle
+    // Kotlin host jar via Gradle (`zig build host`, then `zig build -Dhost-jar=host/build/libs/tachi-host.jar`)
     const gradle = b.addSystemCommand(&.{ "./gradlew", "shadowJar", "-q" });
     gradle.setCwd(b.path("host"));
     b.step("host", "Build host/build/libs/tachi-host.jar with Gradle").dependOn(&gradle.step);
+}
+
+/// A module exposing `bytes: ?[]const u8` and `hash: []const u8` for the host
+/// jar. With no `-Dhost-jar`, `bytes` is null and the runtime looks for the
+/// jar on disk. The hash names the extracted copy and its CDS archive, so a
+/// rebuilt jar never collides with a stale cache entry.
+fn embeddedHostJar(b: *std.Build, jar: ?[]const u8) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    const source = if (jar) |path| blk: {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 30)) catch |e|
+            std.debug.panic("-Dhost-jar={s}: {s}", .{ path, @errorName(e) });
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        _ = wf.addCopyFile(b.path(path), "tachi-host.jar");
+        break :blk b.fmt(
+            \\pub const bytes: ?[]const u8 = @embedFile("tachi-host.jar");
+            \\pub const hash = "{x:0>16}";
+            \\
+        , .{hash});
+    } else
+        \\pub const bytes: ?[]const u8 = null;
+        \\pub const hash = "";
+        \\
+    ;
+    return b.createModule(.{ .root_source_file = wf.add("host_jar.zig", source) });
 }

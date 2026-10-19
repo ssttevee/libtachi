@@ -57,7 +57,8 @@ typedef void (*tachi_log_fn)(int level, const char *tag, const char *message, vo
 typedef struct tachi_config {
     const char *data_dir;          /* preferences, cookies, converted APKs */
     const char *cache_dir;         /* default: <data_dir>/cache */
-    const char *host_jar;          /* default: $TACHI_HOST_JAR, ./tachi-host.jar, ./host/build/libs/tachi-host.jar */
+    const char *host_jar;          /* default: $TACHI_HOST_JAR, the copy embedded at build time (extracted
+                                      into cache_dir), ./tachi-host.jar, ./host/build/libs/tachi-host.jar */
     const char *java_home;         /* default: $TACHI_JAVA_HOME, $JAVA_HOME, well-known install dirs */
     const char *libjvm_path;       /* overrides java_home */
     const char *user_agent;
@@ -70,6 +71,8 @@ typedef struct tachi_config {
     void *existing_jvm;            /* JavaVM* to adopt instead of creating one (Android) */
     int app_version_code;          /* default 137 */
     int verbose;                   /* enables debug logging and HTTP header logging */
+    int no_class_data_sharing;     /* skip the JVM class-data-sharing archive kept in cache_dir (JDK 19+;
+                                      written on first exit, roughly halves JVM start-up afterwards) */
 } tachi_config;
 
 int tachi_runtime_new(const tachi_config *config, tachi_runtime **out);

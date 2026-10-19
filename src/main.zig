@@ -81,6 +81,7 @@ const Flags = struct {
     verbose: bool = false,
     /// Skip reloading the installed extensions at startup.
     no_restore: bool = false,
+    no_cds: bool = false,
     // `repo` options
     repo_url: ?[]const u8 = null,
     refresh: bool = false,
@@ -125,6 +126,7 @@ fn usage() noreturn {
         \\  --java-home DIR  JDK to load libjvm from
         \\  --ext FILE       load an extension file for this run only
         \\  --no-restore     do not reload installed extensions
+        \\  --no-cds         do not keep a JVM class-data-sharing archive in the cache dir
         \\  --repo URL       index URL (default keiyoushi)
         \\  --refresh        ignore the cached index
         \\  -v               verbose logging
@@ -164,6 +166,8 @@ pub fn main(init: std.process.Init) !void {
             try exts.append(arena, it.next() orelse usage());
         } else if (std.mem.eql(u8, arg, "--no-restore")) {
             flags.no_restore = true;
+        } else if (std.mem.eql(u8, arg, "--no-cds")) {
+            flags.no_cds = true;
         } else if (std.mem.eql(u8, arg, "--repo")) {
             flags.repo_url = it.next() orelse usage();
         } else if (std.mem.eql(u8, arg, "--refresh")) {
@@ -191,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
         .host_jar = flags.host_jar,
         .java_home = flags.java_home,
         .verbose = flags.verbose,
+        .class_data_sharing = !flags.no_cds,
         .log_fn = logFn,
         .environ = init.minimal.environ,
     }) catch |e| {

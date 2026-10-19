@@ -38,6 +38,10 @@ pub const Vm = struct {
         classpath: []const []const u8 = &.{},
         /// Extra raw JVM options, e.g. "-Xmx512m".
         extra_options: []const []const u8 = &.{},
+        /// Path of a class-data-sharing archive the JVM should use, creating
+        /// it on first exit (`-XX:+AutoCreateSharedArchive`, JDK 19+). Older
+        /// JDKs ignore this. Roughly halves VM start-up on later runs.
+        cds_archive: ?[]const u8 = null,
         /// Environment used for $TACHI_LIBJVM / $JAVA_HOME lookups.
         environ: Environ = .empty,
     };
@@ -50,6 +54,13 @@ pub const Vm = struct {
         "--add-opens=java.base/java.util=ALL-UNNAMED",
         "-Djava.awt.headless=true",
         "-Xss2m",
+    };
+
+    /// Dynamic AppCDS: dump an archive at exit when none is usable, and keep
+    /// the dump's "Skipping ...: Signed JAR" warnings off the host's stdout.
+    const cds_options = [_][*:0]const u8{
+        "-XX:+AutoCreateSharedArchive",
+        "-Xlog:cds=off",
     };
 
     /// Create a new JVM in this process. HotSpot only supports one VM per
@@ -70,7 +81,7 @@ pub const Vm = struct {
 
         var options = try std.ArrayList(jni.JavaVMOption).initCapacity(
             arena,
-            base_options.len + opts.extra_options.len + 1,
+            base_options.len + cds_options.len + 1 + opts.extra_options.len + 1,
         );
         if (opts.classpath.len > 0) {
             const joined = try std.mem.join(arena, &.{std.fs.path.delimiter}, opts.classpath);
@@ -78,6 +89,11 @@ pub const Vm = struct {
             options.appendAssumeCapacity(.{ .optionString = cp });
         }
         for (base_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
+        if (opts.cds_archive) |archive| if (jdkMajorVersion(arena, io, lib_path) orelse 0 >= 19) {
+            for (cds_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
+            const file = try std.fmt.allocPrintSentinel(arena, "-XX:SharedArchiveFile={s}", .{archive}, 0);
+            options.appendAssumeCapacity(.{ .optionString = file });
+        };
         for (opts.extra_options) |o| {
             options.appendAssumeCapacity(.{ .optionString = try arena.dupeSentinel(u8, o, 0) });
         }
@@ -161,6 +177,37 @@ const well_known: struct { homes: []const []const u8, scan: []const ScanRoot } =
     },
     else => .{ .homes = &.{}, .scan = &.{} },
 };
+
+/// Major Java version of the installation containing `libjvm_path`, read from
+/// its `release` file (`JAVA_VERSION="17.0.1"` -> 17, `"1.8.0_292"` -> 8).
+pub fn jdkMajorVersion(gpa: std.mem.Allocator, io: Io, libjvm_path: []const u8) ?u32 {
+    // <home>/lib/server/libjvm.so or <home>/lib/libjvm.so: walk up until a release file appears.
+    var dir = std.fs.path.dirname(libjvm_path);
+    var depth: usize = 0;
+    while (dir) |d| : ({
+        dir = std.fs.path.dirname(d);
+        depth += 1;
+    }) {
+        if (depth > 3) break;
+        const release = std.fs.path.join(gpa, &.{ d, "release" }) catch return null;
+        defer gpa.free(release);
+        const text = Io.Dir.cwd().readFileAlloc(io, release, gpa, .limited(64 << 10)) catch continue;
+        defer gpa.free(text);
+        return parseJavaVersion(text);
+    }
+    return null;
+}
+
+fn parseJavaVersion(release: []const u8) ?u32 {
+    const key = "JAVA_VERSION=\"";
+    const start = (std.mem.indexOf(u8, release, key) orelse return null) + key.len;
+    const end = std.mem.indexOfScalarPos(u8, release, start, '"') orelse return null;
+    var it = std.mem.splitScalar(u8, release[start..end], '.');
+    const first = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    if (first != 1) return first;
+    // Pre-9 scheme: 1.8.0_292
+    return std.fmt.parseInt(u32, it.next() orelse return null, 10) catch null;
+}
 
 /// Returns an owned, NUL-terminated path to libjvm.
 pub fn findLibJvm(gpa: std.mem.Allocator, io: Io, environ: Environ, java_home: ?[]const u8) Error![:0]u8 {

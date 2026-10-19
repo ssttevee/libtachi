@@ -92,6 +92,7 @@ pub const tachi_config = extern struct {
     existing_jvm: ?*anyopaque = null,
     app_version_code: c_int = 0,
     verbose: c_int = 0,
+    no_class_data_sharing: c_int = 0,
 };
 
 fn optSlice(p: ?[*:0]const u8) ?[]const u8 {
@@ -124,6 +125,7 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
         .app_version_code = if (c.app_version_code != 0) c.app_version_code else null,
         .package_name = optSlice(c.package_name),
         .verbose = c.verbose != 0,
+        .class_data_sharing = c.no_class_data_sharing == 0,
         .log_fn = c.log_fn,
         .log_user_data = c.log_user_data,
         .java_home = optSlice(c.java_home),
@@ -250,6 +252,7 @@ pub export fn tachi_fetch_image(
 }
 
 test "config struct stays C-compatible" {
-    // Pointer-sized fields first, then two ints: no padding surprises for the header.
-    try std.testing.expectEqual(13 * @sizeOf(usize) + 2 * @sizeOf(c_int), @sizeOf(tachi_config));
+    // Pointer-sized fields first, then three ints (plus tail padding): matches the header.
+    const expected = std.mem.alignForward(usize, 13 * @sizeOf(usize) + 3 * @sizeOf(c_int), @alignOf(usize));
+    try std.testing.expectEqual(expected, @sizeOf(tachi_config));
 }
