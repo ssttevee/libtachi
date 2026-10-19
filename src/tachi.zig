@@ -80,6 +80,8 @@ pub fn Result(comptime T: type) type {
     };
 }
 
+// ---- last error (per thread) ---------------------------------------------------
+
 /// Kept NUL-terminated so the C API can hand the buffer out without copying.
 threadlocal var last_error_buf: [8192:0]u8 = @splat(0);
 threadlocal var last_error_len: usize = 0;
@@ -150,22 +152,7 @@ pub const Runtime = struct {
         errdefer gpa.destroy(self);
         self.gpa = gpa;
 
-        if (opts.existing_vm) |vm| {
-            self.vm = jvm.Vm.adopt(vm);
-        } else {
-            const host_jar = try findHostJar(gpa, opts.host_jar);
-            defer gpa.free(host_jar);
-            var cp: std.ArrayList([]const u8) = .empty;
-            defer cp.deinit(gpa);
-            try cp.append(gpa, host_jar);
-            try cp.appendSlice(gpa, opts.extra_classpath);
-            self.vm = try jvm.Vm.create(gpa, .{
-                .java_home = opts.java_home,
-                .libjvm_path = opts.libjvm_path,
-                .classpath = cp.items,
-                .extra_options = opts.jvm_options,
-            });
-        }
+        self.vm = if (opts.existing_vm) |vm| jvm.Vm.adopt(vm) else try createVm(gpa, opts);
         errdefer self.vm.destroy();
 
         const env = try self.vm.env();
@@ -188,7 +175,7 @@ pub const Runtime = struct {
         }
 
         // Build the RuntimeConfig JSON the Kotlin side expects.
-        const config = .{
+        const config_json = std.json.Stringify.valueAlloc(gpa, .{
             .dataDir = opts.data_dir,
             .cacheDir = opts.cache_dir,
             .userAgent = opts.user_agent,
@@ -197,15 +184,26 @@ pub const Runtime = struct {
             .packageName = opts.package_name,
             .verbose = opts.verbose,
             .nativeLog = opts.log_fn != null,
-        };
-        const config_json = std.json.Stringify.valueAlloc(gpa, config, .{ .emit_null_optional_fields = false }) catch return error.OutOfMemory;
+        }, .{ .emit_null_optional_fields = false }) catch return error.OutOfMemory;
         defer gpa.free(config_json);
-        if (env.f.PushLocalFrame(env, 16) != jni.JNI_OK) return error.OutOfMemory;
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.init), &.{.{ .l = try newByteArray(env, config_json) }});
+
+        const reply = try self.invokeInFrame(.init, .{config_json});
         defer gpa.free(reply);
         try checkEnvelope(gpa, reply);
         return self;
+    }
+
+    fn createVm(gpa: std.mem.Allocator, opts: Options) Error!jvm.Vm {
+        const host_jar = try findHostJar(gpa, opts.host_jar);
+        defer gpa.free(host_jar);
+        const cp = try std.mem.concat(gpa, []const u8, &.{ &.{host_jar}, opts.extra_classpath });
+        defer gpa.free(cp);
+        return jvm.Vm.create(gpa, .{
+            .java_home = opts.java_home,
+            .libjvm_path = opts.libjvm_path,
+            .classpath = cp,
+            .extra_options = opts.jvm_options,
+        });
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -229,46 +227,26 @@ pub const Runtime = struct {
 
     /// Loads a `.jar` or `.apk` extension. Returns the `ExtensionInfo` JSON (owned by caller).
     pub fn installExtension(self: *Runtime, path: []const u8) Error![]u8 {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.install), &.{.{ .l = try newByteArray(env, path) }});
-        defer self.gpa.free(reply);
-        return unwrapOk(self.gpa, reply);
+        return self.invokeJson(.install, .{path});
     }
 
     pub fn installExtensionParsed(self: *Runtime, path: []const u8) Error!Result(models.ExtensionInfo) {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.install), &.{.{ .l = try newByteArray(env, path) }});
-        defer self.gpa.free(reply);
-        return parseEnvelope(models.ExtensionInfo, self.gpa, reply);
+        return self.invokeParsed(models.ExtensionInfo, .install, .{path});
     }
 
     pub fn uninstallExtension(self: *Runtime, pkg: []const u8) Error!bool {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.uninstall), &.{.{ .l = try newByteArray(env, pkg) }});
-        defer self.gpa.free(reply);
-        const r = try parseEnvelope(bool, self.gpa, reply);
+        const r = try self.invokeParsed(bool, .uninstall, .{pkg});
         defer r.deinit();
         return r.value();
     }
 
     /// JSON array of `ExtensionInfo` (owned by caller).
     pub fn listExtensions(self: *Runtime) Error![]u8 {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.listExtensions), &.{});
-        defer self.gpa.free(reply);
-        return unwrapOk(self.gpa, reply);
+        return self.invokeJson(.listExtensions, .{});
     }
 
     pub fn listExtensionsParsed(self: *Runtime) Error!Result([]const models.ExtensionInfo) {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.listExtensions), &.{});
-        defer self.gpa.free(reply);
-        return parseEnvelope([]const models.ExtensionInfo, self.gpa, reply);
+        return self.invokeParsed([]const models.ExtensionInfo, .listExtensions, .{});
     }
 
     // ---- source calls ------------------------------------------------------------
@@ -276,27 +254,11 @@ pub const Runtime = struct {
     /// Invokes `method` on a source. `args_json` is a JSON object; see docs/API.md
     /// for the method list. Returns the result JSON (owned by caller).
     pub fn call(self: *Runtime, source_id: i64, method: []const u8, args_json: []const u8) Error![]u8 {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.call), &.{
-            .{ .j = source_id },
-            .{ .l = try newByteArray(env, method) },
-            .{ .l = try newByteArray(env, args_json) },
-        });
-        defer self.gpa.free(reply);
-        return unwrapOk(self.gpa, reply);
+        return self.invokeJson(.call, .{ source_id, method, args_json });
     }
 
     pub fn callParsed(self: *Runtime, comptime T: type, source_id: i64, method: []const u8, args_json: []const u8) Error!Result(T) {
-        const env = try self.frame();
-        defer _ = env.f.PopLocalFrame(env, null);
-        const reply = try self.invokeBytes(env, self.methods.get(.call), &.{
-            .{ .j = source_id },
-            .{ .l = try newByteArray(env, method) },
-            .{ .l = try newByteArray(env, args_json) },
-        });
-        defer self.gpa.free(reply);
-        return parseEnvelope(T, self.gpa, reply);
+        return self.invokeParsed(T, .call, .{ source_id, method, args_json });
     }
 
     /// Downloads a page's image through the source's HTTP client.
@@ -306,27 +268,18 @@ pub const Runtime = struct {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
 
-        const args = [_]jni.jvalue{ .{ .j = source_id }, .{ .l = try newByteArray(env, page_json) } };
-        const arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.fetchImage), &args);
-        if (env.f.ExceptionCheck(env) != 0) {
-            describeException(env);
-            return error.JavaException;
-        }
-        if (arr == null) {
-            const err_arr = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.lastError), &[_]jni.jvalue{});
-            if (err_arr) |e| {
+        const arr = try self.callStatic(env, .fetchImage, .{ source_id, page_json }) orelse {
+            // fetchImage reports failure out-of-band so the byte[] stays raw image data.
+            if (try self.callStatic(env, .lastError, .{})) |e| {
                 const msg = try bytesFromArray(self.gpa, env, e);
                 defer self.gpa.free(msg);
                 if (!setErrorFromJson(self.gpa, msg)) setLastError(msg);
             } else setLastError("fetchImage failed");
             return error.ExtensionError;
-        }
-        const bytes = try bytesFromArray(self.gpa, env, arr.?);
+        };
+        const bytes = try bytesFromArray(self.gpa, env, arr);
         errdefer self.gpa.free(bytes);
-        var mime: ?[]u8 = null;
-        if (env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(.lastImageMime), &[_]jni.jvalue{})) |m| {
-            mime = try bytesFromArray(self.gpa, env, m);
-        }
+        const mime = if (try self.callStatic(env, .lastImageMime, .{})) |m| try bytesFromArray(self.gpa, env, m) else null;
         return .{ .bytes = bytes, .mime = mime };
     }
 
@@ -342,16 +295,51 @@ pub const Runtime = struct {
         return env;
     }
 
-    /// Calls a static `byte[]`-returning bridge method. Callers build `args`
-    /// inside a local frame they own (see `callFrame`), so nothing is freed here.
-    fn invokeBytes(self: *Runtime, env: *jni.JNIEnv, mid: jni.jmethodID, args: []const jni.jvalue) Error![]u8 {
-        const result = env.f.CallStaticObjectMethodA(env, self.bridge, mid, args.ptr);
+    /// Marshals a Zig tuple into `jvalue`s: `i64` -> `J`, `[]const u8` -> `byte[]`.
+    /// The arrays are local refs owned by the caller's frame.
+    fn marshal(env: *jni.JNIEnv, args: anytype) Error![args.len]jni.jvalue {
+        var out: [args.len]jni.jvalue = undefined;
+        inline for (args, 0..) |arg, i| {
+            out[i] = switch (@TypeOf(arg)) {
+                i64, comptime_int => .{ .j = arg },
+                else => .{ .l = try newByteArray(env, arg) },
+            };
+        }
+        return out;
+    }
+
+    /// Calls a static object-returning bridge method inside the caller's frame.
+    fn callStatic(self: *Runtime, env: *jni.JNIEnv, comptime method: BridgeMethod, args: anytype) Error!jni.jobject {
+        comptime std.debug.assert(method.returnsBytes());
+        const jargs = try marshal(env, args);
+        const result = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(method), &jargs);
         if (env.f.ExceptionCheck(env) != 0) {
             describeException(env);
             return error.JavaException;
         }
-        const arr = result orelse return error.InvalidResponse;
+        return result;
+    }
+
+    /// Opens a frame, calls a `byte[]`-returning method and copies the reply out.
+    fn invokeInFrame(self: *Runtime, comptime method: BridgeMethod, args: anytype) Error![]u8 {
+        const env = try self.frame();
+        defer _ = env.f.PopLocalFrame(env, null);
+        const arr = try self.callStatic(env, method, args) orelse return error.InvalidResponse;
         return bytesFromArray(self.gpa, env, arr);
+    }
+
+    /// Reply's `ok` payload re-serialised as JSON, owned by the caller.
+    fn invokeJson(self: *Runtime, comptime method: BridgeMethod, args: anytype) Error![]u8 {
+        const reply = try self.invokeInFrame(method, args);
+        defer self.gpa.free(reply);
+        return unwrapOk(self.gpa, reply);
+    }
+
+    /// Reply's `ok` payload decoded as `T`.
+    fn invokeParsed(self: *Runtime, comptime T: type, comptime method: BridgeMethod, args: anytype) Error!Result(T) {
+        const reply = try self.invokeInFrame(method, args);
+        defer self.gpa.free(reply);
+        return parseEnvelope(T, self.gpa, reply);
     }
 };
 
@@ -397,6 +385,8 @@ fn describeException(env: *jni.JNIEnv) void {
     setLastError(std.mem.sliceTo(chars, 0));
 }
 
+// ---- envelope handling ---------------------------------------------------------
+
 /// Returns the `ok` payload re-serialised as JSON, or records the error.
 fn unwrapOk(gpa: std.mem.Allocator, reply: []const u8) Error![]u8 {
     const r = try parseEnvelope(std.json.Value, gpa, reply);
@@ -435,6 +425,14 @@ fn setErrorFromJson(gpa: std.mem.Allocator, json: []const u8) bool {
     return true;
 }
 
+// ---- host jar discovery --------------------------------------------------------
+
+const host_jar_candidates = [_][]const u8{
+    "tachi-host.jar",
+    "host/build/libs/tachi-host.jar",
+    "../host/build/libs/tachi-host.jar",
+};
+
 fn findHostJar(gpa: std.mem.Allocator, explicit: ?[]const u8) Error![]u8 {
     if (explicit) |p| {
         if (!jvm.fileExists(p)) return error.HostJarNotFound;
@@ -443,7 +441,7 @@ fn findHostJar(gpa: std.mem.Allocator, explicit: ?[]const u8) Error![]u8 {
     if (jvm.getenv("TACHI_HOST_JAR")) |p| {
         if (jvm.fileExists(p)) return gpa.dupe(u8, p);
     }
-    for ([_][]const u8{ "tachi-host.jar", "host/build/libs/tachi-host.jar", "../host/build/libs/tachi-host.jar" }) |p| {
+    for (host_jar_candidates) |p| {
         if (jvm.fileExists(p)) return gpa.dupe(u8, p);
     }
     return error.HostJarNotFound;
@@ -456,9 +454,7 @@ fn nativeLog(env: *jni.JNIEnv, cls: jni.jclass, level: jni.jint, tag: jni.jbyteA
     const f = g_log_fn orelse return;
     var tag_buf: [256:0]u8 = undefined;
     var msg_buf: [16384:0]u8 = undefined;
-    const t = copyArray(env, tag, &tag_buf);
-    const m = copyArray(env, msg, &msg_buf);
-    f(@fromBackingInt(@intCast(level)), t, m, g_log_ud);
+    f(@fromBackingInt(@intCast(level)), copyArray(env, tag, &tag_buf), copyArray(env, msg, &msg_buf), g_log_ud);
 }
 
 fn copyArray(env: *jni.JNIEnv, arr: jni.jbyteArray, buf: [:0]u8) [*:0]const u8 {
@@ -488,6 +484,8 @@ fn registerLogHook(env: *jni.JNIEnv) Error!void {
         return error.BridgeMethodNotFound;
     }
 }
+
+// ---- tests ---------------------------------------------------------------------
 
 test "models decode a representative envelope" {
     const sample =
