@@ -80,18 +80,27 @@ pub fn Result(comptime T: type) type {
     };
 }
 
-threadlocal var last_error_buf: [8192]u8 = undefined;
+/// Kept NUL-terminated so the C API can hand the buffer out without copying.
+threadlocal var last_error_buf: [8192:0]u8 = @splat(0);
 threadlocal var last_error_len: usize = 0;
 
 /// Message for the most recent `JavaException` / `ExtensionError` on this thread.
-pub fn lastError() []const u8 {
-    return last_error_buf[0..last_error_len];
+pub fn lastError() [:0]const u8 {
+    return last_error_buf[0..last_error_len :0];
 }
 
-fn setLastError(msg: []const u8) void {
+pub fn setLastError(msg: []const u8) void {
     const n = @min(msg.len, last_error_buf.len);
     @memcpy(last_error_buf[0..n], msg[0..n]);
+    last_error_buf[n] = 0;
     last_error_len = n;
+}
+
+fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
+    var w: std.Io.Writer = .fixed(&last_error_buf);
+    w.print(fmt, args) catch {}; // truncation is fine for a diagnostic
+    last_error_len = w.end;
+    last_error_buf[last_error_len] = 0;
 }
 
 var g_log_fn: ?LogFn = null;
@@ -394,9 +403,7 @@ fn parseEnvelope(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) Er
 }
 
 fn setErrorInfo(e: models.ErrorInfo) void {
-    var buf: [8192]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ e.type, e.message orelse "" }) catch buf[0..];
-    setLastError(msg);
+    setLastErrorFmt("{s}: {s}", .{ e.type, e.message orelse "" });
 }
 
 /// Decodes an ErrorDto JSON blob into lastError. Returns false if it was not one.
@@ -484,4 +491,11 @@ test "unwrapOk re-serialises the ok payload" {
     const out = try unwrapOk(std.testing.allocator, "{\"ok\":{\"a\":[1,2]}}");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("{\"a\":[1,2]}", out);
+}
+
+test "last error is truncated, never overflowed" {
+    const big: [last_error_buf.len * 2]u8 = @splat('x');
+    setLastError(&big);
+    try std.testing.expectEqual(last_error_buf.len, lastError().len);
+    try std.testing.expectEqual(@as(u8, 0), last_error_buf[last_error_buf.len]);
 }

@@ -17,13 +17,7 @@ pub const ErrorCode = enum(c_int) {
     out_of_memory = 9,
 };
 
-threadlocal var last_error_z: [8192:0]u8 = @splat(0);
-
-fn setError(msg: []const u8) void {
-    const n = @min(msg.len, last_error_z.len);
-    @memcpy(last_error_z[0..n], msg[0..n]);
-    last_error_z[n] = 0;
-}
+const setError = tachi.setLastError;
 
 fn mapError(err: tachi.Error) c_int {
     const mapped: ErrorCode = switch (err) {
@@ -37,7 +31,8 @@ fn mapError(err: tachi.Error) c_int {
         error.OutOfMemory => .out_of_memory,
     };
     switch (err) {
-        error.JavaException, error.ExtensionError, error.InvalidResponse => setError(tachi.lastError()),
+        // tachi already recorded a message for these; keep it.
+        error.JavaException, error.ExtensionError, error.InvalidResponse => {},
         else => setError(@errorName(err)),
     }
     return @backingInt(mapped);
@@ -121,7 +116,7 @@ pub export fn tachi_thread_detach(rt: ?*tachi.Runtime) void {
 }
 
 pub export fn tachi_last_error() [*:0]const u8 {
-    return &last_error_z;
+    return tachi.lastError().ptr;
 }
 
 pub export fn tachi_free(p: ?*anyopaque) void {
