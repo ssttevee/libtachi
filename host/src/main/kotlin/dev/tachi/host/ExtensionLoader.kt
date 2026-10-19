@@ -206,7 +206,7 @@ object ExtensionLoader {
             for (i in 0 until list.length) {
                 val el = list.item(i) as Element
                 val name = el.getAttribute("android:name")
-                val value = el.getAttribute("android:value")
+                val value = decodeTypedValue(el.getAttribute("android:value"))
                 if (name.isNotEmpty()) meta[name] = value
             }
         }
@@ -217,6 +217,24 @@ object ExtensionLoader {
             features = features,
             metaData = meta,
         )
+    }
+
+    /**
+     * apk-parser prints non-string binary-XML attributes as `{type:data}`.
+     * extensions declare `tachiyomix.extensionLib` as a float resource, so
+     * 1.6 arrives as `{4:1070386381}` (TYPE_FLOAT, raw IEEE bits).
+     */
+    private val typedValue = Regex("""\{(\d+):(-?\d+)}""")
+
+    private fun decodeTypedValue(raw: String): String {
+        val m = typedValue.matchEntire(raw) ?: return raw
+        val (type, data) = m.destructured
+        return when (type.toInt()) {
+            4 -> Float.fromBits(data.toInt()).toString() // TYPE_FLOAT
+            16 -> data // TYPE_INT_DEC
+            18 -> if (data.toLong() != 0L) "true" else "false" // TYPE_INT_BOOLEAN
+            else -> raw
+        }
     }
 
     /** dex -> class conversion, as Suwayomi does it (PackageTools.dex2jar). */
