@@ -26,9 +26,16 @@ pub const ErrorCode = enum(c_int) {
     extension_error = 7,
     invalid_response = 8,
     out_of_memory = 9,
+
+    fn int(c: ErrorCode) c_int {
+        return @backingInt(c);
+    }
 };
 
-const setError = tachi.setLastError;
+fn fail(c: ErrorCode, msg: []const u8) c_int {
+    tachi.setLastError(msg);
+    return c.int();
+}
 
 fn mapError(err: tachi.Error) c_int {
     const mapped: ErrorCode = switch (err) {
@@ -36,21 +43,17 @@ fn mapError(err: tachi.Error) c_int {
         error.JvmCreateFailed, error.AttachFailed => .jvm_create_failed,
         error.HostJarNotFound => .host_jar_not_found,
         error.BridgeClassNotFound, error.BridgeMethodNotFound => .bridge_missing,
-        error.JavaException => .java_exception,
-        error.ExtensionError => .extension_error,
-        error.InvalidResponse => .invalid_response,
+        error.JavaException, error.ExtensionError, error.InvalidResponse => |e| {
+            // tachi already recorded a message for these; keep it.
+            return @as(ErrorCode, switch (e) {
+                error.JavaException => .java_exception,
+                error.ExtensionError => .extension_error,
+                error.InvalidResponse => .invalid_response,
+            }).int();
+        },
         error.OutOfMemory => .out_of_memory,
     };
-    switch (err) {
-        // tachi already recorded a message for these; keep it.
-        error.JavaException, error.ExtensionError, error.InvalidResponse => {},
-        else => setError(@errorName(err)),
-    }
-    return @backingInt(mapped);
-}
-
-fn code(c: ErrorCode) c_int {
-    return @backingInt(c);
+    return fail(mapped, @errorName(err));
 }
 
 /// Mirrors `tachi_config` in include/tachi.h; keep the two in sync.
@@ -63,8 +66,8 @@ pub const tachi_config = extern struct {
     user_agent: ?[*:0]const u8 = null,
     app_version_name: ?[*:0]const u8 = null,
     package_name: ?[*:0]const u8 = null,
-    extra_classpath: ?[*]const ?[*:0]const u8 = null,
-    jvm_options: ?[*]const ?[*:0]const u8 = null,
+    extra_classpath: ?[*:null]const ?[*:0]const u8 = null,
+    jvm_options: ?[*:null]const ?[*:0]const u8 = null,
     log_fn: ?tachi.LogFn = null,
     log_user_data: ?*anyopaque = null,
     existing_jvm: ?*anyopaque = null,
@@ -73,28 +76,23 @@ pub const tachi_config = extern struct {
 };
 
 fn optSlice(p: ?[*:0]const u8) ?[]const u8 {
-    return if (p) |s| std.mem.sliceTo(s, 0) else null;
+    return std.mem.span(p);
 }
 
-fn collect(gpa: std.mem.Allocator, list: ?[*]const ?[*:0]const u8) ![]const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(gpa);
-    if (list) |l| {
-        var i: usize = 0;
-        while (l[i]) |s| : (i += 1) try out.append(gpa, std.mem.sliceTo(s, 0));
-    }
-    return out.toOwnedSlice(gpa);
+/// Converts a NULL-terminated `char*[]` into a slice of slices.
+fn collect(gpa: std.mem.Allocator, list: ?[*:null]const ?[*:0]const u8) ![]const []const u8 {
+    const ptrs = std.mem.sliceTo(list orelse return &.{}, null);
+    const out = try gpa.alloc([]const u8, ptrs.len);
+    for (out, ptrs) |*dst, src| dst.* = std.mem.span(src.?);
+    return out;
 }
 
 pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtime) c_int {
-    const c = cfg orelse return code(.invalid_argument);
-    const data_dir = optSlice(c.data_dir) orelse {
-        setError("data_dir is required");
-        return code(.invalid_argument);
-    };
-    const extra_cp = collect(c_allocator, c.extra_classpath) catch return code(.out_of_memory);
+    const c = cfg orelse return fail(.invalid_argument, "cfg is NULL");
+    const data_dir = optSlice(c.data_dir) orelse return fail(.invalid_argument, "data_dir is required");
+    const extra_cp = collect(c_allocator, c.extra_classpath) catch return fail(.out_of_memory, "OutOfMemory");
     defer c_allocator.free(extra_cp);
-    const jvm_opts = collect(c_allocator, c.jvm_options) catch return code(.out_of_memory);
+    const jvm_opts = collect(c_allocator, c.jvm_options) catch return fail(.out_of_memory, "OutOfMemory");
     defer c_allocator.free(jvm_opts);
 
     const rt = tachi.Runtime.init(c_allocator, threaded.io(), .{
@@ -112,11 +110,11 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
         .java_home = optSlice(c.java_home),
         .libjvm_path = optSlice(c.libjvm_path),
         .jvm_options = jvm_opts,
-        .existing_vm = if (c.existing_jvm) |p| @ptrCast(@alignCast(p)) else null,
+        .existing_vm = @ptrCast(@alignCast(c.existing_jvm)),
         .environ = processEnviron(),
     }) catch |e| return mapError(e);
     if (out) |o| o.* = rt else rt.deinit();
-    return 0;
+    return ErrorCode.ok.int();
 }
 
 pub export fn tachi_runtime_free(rt: ?*tachi.Runtime) void {
@@ -135,29 +133,31 @@ pub export fn tachi_free(p: ?*anyopaque) void {
     std.c.free(p);
 }
 
+/// Hands a runtime-owned JSON buffer to C as a NUL-terminated string.
 fn returnJson(json: []u8, out: ?*?[*:0]u8) c_int {
     defer c_allocator.free(json);
-    const z = c_allocator.dupeSentinel(u8, json, 0) catch return code(.out_of_memory);
-    if (out) |o| o.* = z.ptr else c_allocator.free(z);
-    return 0;
+    const o = out orelse return ErrorCode.ok.int();
+    const z = c_allocator.dupeSentinel(u8, json, 0) catch return fail(.out_of_memory, "OutOfMemory");
+    o.* = z.ptr;
+    return ErrorCode.ok.int();
 }
 
 pub export fn tachi_install(rt: ?*tachi.Runtime, path: ?[*:0]const u8, out_json: ?*?[*:0]u8) c_int {
-    const r = rt orelse return code(.invalid_argument);
-    const p = optSlice(path) orelse return code(.invalid_argument);
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const p = optSlice(path) orelse return fail(.invalid_argument, "path is NULL");
     const json = r.installExtension(p) catch |e| return mapError(e);
     return returnJson(json, out_json);
 }
 
 pub export fn tachi_uninstall(rt: ?*tachi.Runtime, pkg: ?[*:0]const u8) c_int {
-    const r = rt orelse return code(.invalid_argument);
-    const p = optSlice(pkg) orelse return code(.invalid_argument);
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const p = optSlice(pkg) orelse return fail(.invalid_argument, "pkg is NULL");
     _ = r.uninstallExtension(p) catch |e| return mapError(e);
-    return 0;
+    return ErrorCode.ok.int();
 }
 
 pub export fn tachi_list_extensions(rt: ?*tachi.Runtime, out_json: ?*?[*:0]u8) c_int {
-    const r = rt orelse return code(.invalid_argument);
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
     const json = r.listExtensions() catch |e| return mapError(e);
     return returnJson(json, out_json);
 }
@@ -169,10 +169,9 @@ pub export fn tachi_call(
     args_json: ?[*:0]const u8,
     out_json: ?*?[*:0]u8,
 ) c_int {
-    const r = rt orelse return code(.invalid_argument);
-    const m = optSlice(method) orelse return code(.invalid_argument);
-    const a = optSlice(args_json) orelse "{}";
-    const json = r.call(source_id, m, a) catch |e| return mapError(e);
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const m = optSlice(method) orelse return fail(.invalid_argument, "method is NULL");
+    const json = r.call(source_id, m, optSlice(args_json) orelse "{}") catch |e| return mapError(e);
     return returnJson(json, out_json);
 }
 
@@ -184,8 +183,8 @@ pub export fn tachi_fetch_image(
     out_len: ?*usize,
     out_mime: ?*?[*:0]u8,
 ) c_int {
-    const r = rt orelse return code(.invalid_argument);
-    const p = optSlice(page_json) orelse return code(.invalid_argument);
+    const r = rt orelse return fail(.invalid_argument, "rt is NULL");
+    const p = optSlice(page_json) orelse return fail(.invalid_argument, "page_json is NULL");
     const img = r.fetchImage(source_id, p) catch |e| return mapError(e);
     // The runtime allocated with c_allocator, so the buffer can be handed to the caller as-is.
     if (out_bytes) |o| o.* = img.bytes.ptr else c_allocator.free(img.bytes);
@@ -194,5 +193,10 @@ pub export fn tachi_fetch_image(
         defer c_allocator.free(m);
         if (out_mime) |o| o.* = if (c_allocator.dupeSentinel(u8, m, 0)) |z| z.ptr else |_| null;
     } else if (out_mime) |o| o.* = null;
-    return 0;
+    return ErrorCode.ok.int();
+}
+
+test "config struct stays C-compatible" {
+    // Pointer-sized fields first, then two ints: no padding surprises for the header.
+    try std.testing.expectEqual(13 * @sizeOf(usize) + 2 * @sizeOf(c_int), @sizeOf(tachi_config));
 }
