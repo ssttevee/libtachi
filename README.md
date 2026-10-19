@@ -55,14 +55,20 @@ Requirements: Zig 0.17, a JDK 17+ (to build and to run), and an `android.jar`
 and pass `-Ptachi.androidJar=host/lib/android.jar`.
 
 ```sh
-zig build host        # host/build/libs/tachi-host.jar  (Gradle, ~1 min first time)
-zig build             # zig-out/lib/libtachi.{a,dylib|so}, zig-out/include/tachi.h, zig-out/bin/tachi-cli
+zig build host        # host/build/libs/tachi-host.jar, copied to zig-out/lib  (Gradle, ~1 min first time)
+zig build             # zig-out/lib/libtachi.{a,dylib|so}, zig-out/lib/tachi-host.jar,
+                      # zig-out/include/tachi.h, zig-out/bin/tachi-cli
 zig build test
 
 # For distribution: bake the jar into the library and CLI so they are the only
 # files to ship (plus a JDK). It is written to the cache dir on first run.
-zig build -Dhost-jar=host/build/libs/tachi-host.jar
+zig build -Dembed-host-jar
 ```
+
+`-Dhost-jar=PATH` picks a jar other than `host/build/libs/tachi-host.jar`
+for both modes. Without embedding, `zig build` copies an already built jar to
+`zig-out/lib`, and the runtime looks for it beside the executable and in
+`../lib`, so `zig-out/bin/tachi-cli` works from any directory.
 
 Start-up: the runtime keeps a JVM class-data-sharing archive of the host in
 the cache dir (JDK 19+, created on the first exit). With it a full
@@ -73,7 +79,6 @@ takes about 70 ms on an M-series Mac, against 170 ms without. Disable with
 ## Try it
 
 ```sh
-export TACHI_HOST_JAR=host/build/libs/tachi-host.jar   # not needed when built with -Dhost-jar
 CLI=./zig-out/bin/tachi-cli
 
 $CLI repo list --lang en --grep weeb          # browse the keiyoushi index (cached for an hour)
@@ -131,7 +136,7 @@ Add it as a dependency with `zig fetch --save <url>` and
 ```c
 #include <tachi.h>
 
-tachi_config cfg = { .data_dir = "/path/to/data" };   /* .host_jar = "..." unless built with -Dhost-jar */
+tachi_config cfg = { .data_dir = "/path/to/data" };   /* .host_jar = "..." unless embedded or beside the executable */
 tachi_runtime *rt;
 if (tachi_runtime_new(&cfg, &rt) != 0) { fprintf(stderr, "%s\n", tachi_last_error()); return 1; }
 

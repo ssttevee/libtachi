@@ -11,11 +11,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    tachi_mod.addImport("host_jar", embeddedHostJar(b, b.option(
+    const host_jar = b.option(
         []const u8,
         "host-jar",
-        "Embed this tachi-host.jar in the library so nothing else needs to be distributed",
-    )));
+        "Path to tachi-host.jar (default: host/build/libs/tachi-host.jar)",
+    ) orelse "host/build/libs/tachi-host.jar";
+    const embed_host_jar = b.option(
+        bool,
+        "embed-host-jar",
+        "Embed tachi-host.jar in the library and CLI so nothing else needs to be distributed (default: false)",
+    ) orelse false;
+    tachi_mod.addImport("host_jar", embeddedHostJar(b, if (embed_host_jar) host_jar else null));
 
     // Modules that depend on the library share one shape; only the root differs.
     const dependent = struct {
@@ -55,23 +61,48 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 
-    // Kotlin host jar via Gradle (`zig build host`, then `zig build -Dhost-jar=host/build/libs/tachi-host.jar`)
+    // Kotlin host jar via Gradle. `zig build host` builds it and copies it to
+    // <prefix>/lib, where the runtime looks next to the executable.
     const gradle = b.addSystemCommand(&.{ "./gradlew", "shadowJar", "-q" });
     gradle.setCwd(b.path("host"));
-    b.step("host", "Build host/build/libs/tachi-host.jar with Gradle").dependOn(&gradle.step);
+    const install_built_jar = b.addInstallLibFile(sourcePath(b, host_jar), "tachi-host.jar");
+    install_built_jar.step.dependOn(&gradle.step);
+    b.step("host", "Build tachi-host.jar with Gradle and copy it to <prefix>/lib").dependOn(&install_built_jar.step);
+
+    // A plain `zig build` copies an already built jar too, unless it is embedded.
+    // A missing jar is not an error here: the runtime may be pointed at one.
+    if (!embed_host_jar and fileExists(b, host_jar)) {
+        b.getInstallStep().dependOn(&b.addInstallLibFile(sourcePath(b, host_jar), "tachi-host.jar").step);
+    }
+}
+
+/// `b.path` only takes project-relative paths; `-Dhost-jar` may be absolute.
+fn sourcePath(b: *std.Build, path: []const u8) std.Build.LazyPath {
+    return if (std.fs.path.isAbsolute(path)) .{ .cwd_relative = path } else b.path(path);
+}
+
+/// The same path for reading at configure time, which may run outside the project root.
+fn fsPath(b: *std.Build, path: []const u8) []const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return b.root.joinString(b.allocator, path) catch @panic("OOM");
+}
+
+fn fileExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.cwd().access(b.graph.io, fsPath(b, path), .{}) catch return false;
+    return true;
 }
 
 /// A module exposing `bytes: ?[]const u8` and `hash: []const u8` for the host
-/// jar. With no `-Dhost-jar`, `bytes` is null and the runtime looks for the
-/// jar on disk. The hash names the extracted copy and its CDS archive, so a
+/// jar. Without `-Dembed-host-jar`, `bytes` is null and the runtime looks for
+/// the jar on disk. The hash names the extracted copy and its CDS archive, so a
 /// rebuilt jar never collides with a stale cache entry.
 fn embeddedHostJar(b: *std.Build, jar: ?[]const u8) *std.Build.Module {
     const wf = b.addWriteFiles();
     const source = if (jar) |path| blk: {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 30)) catch |e|
-            std.debug.panic("-Dhost-jar={s}: {s}", .{ path, @errorName(e) });
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, fsPath(b, path), b.allocator, .limited(1 << 30)) catch |e|
+            std.debug.panic("-Dembed-host-jar: cannot read {s} ({s}); run `zig build host` first", .{ path, @errorName(e) });
         const hash = std.hash.Wyhash.hash(0, bytes);
-        _ = wf.addCopyFile(b.path(path), "tachi-host.jar");
+        _ = wf.addCopyFile(sourcePath(b, path), "tachi-host.jar");
         break :blk b.fmt(
             \\pub const bytes: ?[]const u8 = @embedFile("tachi-host.jar");
             \\pub const hash = "{x:0>16}";

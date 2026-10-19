@@ -163,7 +163,7 @@ escape (bridge bug) is caught by `ExceptionCheck`, described via
    threads themselves.
 7. extensions-lib 1.4/1.5 if a repository that still ships them matters.
 8. Slim the host jar (dex2jar + stubs account for most of its 40 MB). It
-   is embedded with `-Dhost-jar` and extracted to the cache dir once, so
+   is embedded with `-Dembed-host-jar` and extracted to the cache dir once, so
    the size costs disk and binary size, not start-up time; the CDS archive
    keyed by the jar hash (`tachi-host-<hash>.jsa`) is what makes start-up
    fast.
