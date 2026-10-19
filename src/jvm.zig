@@ -4,8 +4,14 @@
 //! `JNI_CreateJavaVM` (the JNI Invocation API), the same approach PatchBukkit
 //! uses to run Bukkit plugins inside a Rust server. On Android the host app
 //! already has a VM; pass it to `adopt` instead.
+//!
+//! All filesystem and environment access goes through `std.Io` and
+//! `std.process.Environ` so callers control where the library looks and tests
+//! can run without touching the real process environment.
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
+const Environ = std.process.Environ;
 pub const jni = @import("jni.zig");
 
 pub const Error = error{
@@ -32,6 +38,8 @@ pub const Vm = struct {
         classpath: []const []const u8 = &.{},
         /// Extra raw JVM options, e.g. "-Xmx512m".
         extra_options: []const []const u8 = &.{},
+        /// Environment used for $TACHI_LIBJVM / $JAVA_HOME lookups.
+        environ: Environ = .empty,
     };
 
     /// Options every VM gets. Extensions lean on reflection through
@@ -46,21 +54,19 @@ pub const Vm = struct {
 
     /// Create a new JVM in this process. HotSpot only supports one VM per
     /// process, so call this at most once.
-    pub fn create(gpa: std.mem.Allocator, opts: CreateOptions) Error!Vm {
-        const lib_path = if (opts.libjvm_path) |p|
-            try gpa.dupeSentinel(u8, p, 0)
-        else
-            try findLibJvm(gpa, opts.java_home);
-        defer gpa.free(lib_path);
-
-        var lib = std.DynLib.open(lib_path) catch return error.LibJvmLoadFailed;
-        errdefer lib.close();
-
-        const create_fn = lib.lookup(jni.CreateJavaVMFn, "JNI_CreateJavaVM") orelse return error.SymbolNotFound;
-
+    pub fn create(gpa: std.mem.Allocator, io: Io, opts: CreateOptions) Error!Vm {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+
+        const lib_path = if (opts.libjvm_path) |p|
+            try arena.dupeSentinel(u8, p, 0)
+        else
+            try findLibJvm(arena, io, opts.environ, opts.java_home);
+
+        var lib = std.DynLib.open(lib_path) catch return error.LibJvmLoadFailed;
+        errdefer lib.close();
+        const create_fn = lib.lookup(jni.CreateJavaVMFn, "JNI_CreateJavaVM") orelse return error.SymbolNotFound;
 
         var options = try std.ArrayList(jni.JavaVMOption).initCapacity(
             arena,
@@ -76,7 +82,7 @@ pub const Vm = struct {
             options.appendAssumeCapacity(.{ .optionString = try arena.dupeSentinel(u8, o, 0) });
         }
 
-        var args = jni.JavaVMInitArgs{
+        var args: jni.JavaVMInitArgs = .{
             .version = jni.JNI_VERSION_1_8,
             .nOptions = @intCast(options.items.len),
             .options = options.items.ptr,
@@ -84,9 +90,8 @@ pub const Vm = struct {
         };
         var vm: ?*jni.JavaVM = null;
         var main_env: ?*jni.JNIEnv = null;
-        const rc = create_fn(&vm, &main_env, &args);
-        if (rc != jni.JNI_OK or vm == null) return error.JvmCreateFailed;
-        return .{ .vm = vm.?, .lib = lib, .owned = true };
+        if (create_fn(&vm, &main_env, &args) != jni.JNI_OK) return error.JvmCreateFailed;
+        return .{ .vm = vm orelse return error.JvmCreateFailed, .lib = lib, .owned = true };
     }
 
     /// Use a VM that already exists in the process (Android, or a Java host
@@ -99,13 +104,16 @@ pub const Vm = struct {
     /// Attached threads should call `detach` before they exit.
     pub fn env(self: *const Vm) Error!*jni.JNIEnv {
         var out: ?*anyopaque = null;
-        const rc = self.vm.f.GetEnv(self.vm, &out, jni.JNI_VERSION_1_8);
-        if (rc == jni.JNI_OK and out != null) return @ptrCast(@alignCast(out.?));
-        if (rc != jni.JNI_EDETACHED) return error.AttachFailed;
-        var attach_args = jni.JavaVMAttachArgs{ .version = jni.JNI_VERSION_1_8, .name = "tachi-native" };
-        const arc = self.vm.f.AttachCurrentThreadAsDaemon(self.vm, &out, @ptrCast(&attach_args));
-        if (arc != jni.JNI_OK or out == null) return error.AttachFailed;
-        return @ptrCast(@alignCast(out.?));
+        switch (self.vm.f.GetEnv(self.vm, &out, jni.JNI_VERSION_1_8)) {
+            jni.JNI_OK => {},
+            jni.JNI_EDETACHED => {
+                var attach_args: jni.JavaVMAttachArgs = .{ .version = jni.JNI_VERSION_1_8, .name = "tachi-native" };
+                if (self.vm.f.AttachCurrentThreadAsDaemon(self.vm, &out, @ptrCast(&attach_args)) != jni.JNI_OK)
+                    return error.AttachFailed;
+            },
+            else => return error.AttachFailed,
+        }
+        return @ptrCast(@alignCast(out orelse return error.AttachFailed));
     }
 
     pub fn detach(self: *const Vm) void {
@@ -124,99 +132,114 @@ pub const Vm = struct {
 // libjvm discovery
 // ---------------------------------------------------------------------------
 
+/// Where libjvm lives relative to a Java home, per platform.
 const lib_rel_paths: []const []const u8 = switch (builtin.os.tag) {
     .macos => &.{ "lib/server/libjvm.dylib", "lib/libjvm.dylib", "jre/lib/server/libjvm.dylib" },
     .windows => &.{ "bin/server/jvm.dll", "bin/client/jvm.dll", "jre/bin/server/jvm.dll" },
     else => &.{ "lib/server/libjvm.so", "lib/libjvm.so", "jre/lib/server/libjvm.so", "jre/lib/amd64/server/libjvm.so" },
 };
 
+/// A directory whose children are Java installations; `suffix` turns a child into a Java home.
+const ScanRoot = struct { dir: []const u8, suffix: []const u8 = "" };
+
+/// Well-known install locations, tried after the environment. Fixed homes
+/// first, then directories scanned for the newest-looking JDK.
+const well_known: struct { homes: []const []const u8, scan: []const ScanRoot } = switch (builtin.os.tag) {
+    .macos => .{
+        .homes = &.{
+            "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
+            "/usr/local/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
+        },
+        .scan = &.{
+            .{ .dir = "/Library/Java/JavaVirtualMachines", .suffix = "/Contents/Home" },
+            .{ .dir = "/opt/homebrew/Cellar/openjdk", .suffix = "/libexec/openjdk.jdk/Contents/Home" },
+        },
+    },
+    .linux => .{
+        .homes = &.{},
+        .scan = &.{ .{ .dir = "/usr/lib/jvm" }, .{ .dir = "/usr/lib64/jvm" }, .{ .dir = "/opt" } },
+    },
+    else => .{ .homes = &.{}, .scan = &.{} },
+};
+
 /// Returns an owned, NUL-terminated path to libjvm.
-pub fn findLibJvm(gpa: std.mem.Allocator, java_home: ?[]const u8) Error![:0]u8 {
-    if (getenv("TACHI_LIBJVM")) |p| {
-        if (fileExists(p)) return try gpa.dupeSentinel(u8, p, 0);
+pub fn findLibJvm(gpa: std.mem.Allocator, io: Io, environ: Environ, java_home: ?[]const u8) Error![:0]u8 {
+    if (getenv(environ, "TACHI_LIBJVM")) |p| {
+        if (fileExists(io, p)) return try gpa.dupeSentinel(u8, p, 0);
     }
     if (java_home) |h| {
-        if (try probeHome(gpa, h)) |p| return p;
+        if (try probeHome(gpa, io, h)) |p| return p;
     }
     for ([_][]const u8{ "TACHI_JAVA_HOME", "JAVA_HOME" }) |name| {
-        if (getenv(name)) |h| {
-            if (try probeHome(gpa, h)) |p| return p;
-        }
+        const h = getenv(environ, name) orelse continue;
+        if (try probeHome(gpa, io, h)) |p| return p;
     }
-    switch (builtin.os.tag) {
-        .macos => {
-            for ([_][]const u8{
-                "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
-                "/usr/local/opt/openjdk/libexec/openjdk.jdk/Contents/Home",
-            }) |h| {
-                if (try probeHome(gpa, h)) |p| return p;
-            }
-            if (try scanDir(gpa, "/Library/Java/JavaVirtualMachines", "/Contents/Home")) |p| return p;
-            if (try scanDir(gpa, "/opt/homebrew/Cellar/openjdk", "/libexec/openjdk.jdk/Contents/Home")) |p| return p;
-        },
-        .linux => {
-            if (try scanDir(gpa, "/usr/lib/jvm", "")) |p| return p;
-            if (try scanDir(gpa, "/usr/lib64/jvm", "")) |p| return p;
-            if (try scanDir(gpa, "/opt", "")) |p| return p;
-        },
-        else => {},
+    for (well_known.homes) |h| {
+        if (try probeHome(gpa, io, h)) |p| return p;
+    }
+    for (well_known.scan) |root| {
+        if (try scanDir(gpa, io, root)) |p| return p;
     }
     return error.LibJvmNotFound;
 }
 
-fn probeHome(gpa: std.mem.Allocator, home: []const u8) Error!?[:0]u8 {
+fn probeHome(gpa: std.mem.Allocator, io: Io, home: []const u8) Error!?[:0]u8 {
     for (lib_rel_paths) |rel| {
-        const candidate = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ home, rel }, 0);
-        if (fileExists(candidate)) return candidate;
+        const candidate = try std.fs.path.joinZ(gpa, &.{ home, rel });
+        if (fileExists(io, candidate)) return candidate;
         gpa.free(candidate);
     }
     return null;
 }
 
-/// Looks at every entry of `dir`, treating `<dir>/<entry><suffix>` as a Java home.
-/// Picks the lexicographically greatest match, which tends to be the newest JDK.
-fn scanDir(gpa: std.mem.Allocator, dir: []const u8, suffix: []const u8) Error!?[:0]u8 {
-    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
-    defer gpa.free(dir_z);
-    const d = std.c.opendir(dir_z) orelse return null;
-    defer _ = std.c.closedir(d);
+/// Looks at every entry of `root.dir`, treating `<dir>/<entry><suffix>` as a
+/// Java home. Picks the lexicographically greatest match, which tends to be
+/// the newest JDK.
+fn scanDir(gpa: std.mem.Allocator, io: Io, root: ScanRoot) Error!?[:0]u8 {
+    var dir = Io.Dir.cwd().openDir(io, root.dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
 
     var best: ?[:0]u8 = null;
-    var best_name: ?[]u8 = null;
-    defer if (best_name) |n| gpa.free(n);
+    errdefer if (best) |b| gpa.free(b);
+    var best_name: std.ArrayList(u8) = .empty;
+    defer best_name.deinit(gpa);
 
-    while (std.c.readdir(d)) |ent| {
-        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
-        if (name.len == 0 or name[0] == '.') continue;
-        if (best_name) |bn| {
-            if (std.mem.order(u8, name, bn) != .gt) continue;
-        }
-        const home = try std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ dir, name, suffix });
+    var it = dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        if (ent.name.len == 0 or ent.name[0] == '.') continue;
+        if (best != null and std.mem.order(u8, ent.name, best_name.items) != .gt) continue;
+        const home = try std.mem.concat(gpa, u8, &.{ root.dir, "/", ent.name, root.suffix });
         defer gpa.free(home);
-        if (try probeHome(gpa, home)) |p| {
-            if (best) |b| gpa.free(b);
-            if (best_name) |bn| gpa.free(bn);
-            best = p;
-            best_name = try gpa.dupe(u8, name);
-        }
+        const found = try probeHome(gpa, io, home) orelse continue;
+        if (best) |b| gpa.free(b);
+        best = found;
+        best_name.clearRetainingCapacity();
+        try best_name.appendSlice(gpa, ent.name);
     }
     return best;
 }
 
-pub fn getenv(name: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (name.len >= buf.len) return null;
-    @memcpy(buf[0..name.len], name);
-    buf[name.len] = 0;
-    const v = std.c.getenv(buf[0..name.len :0]) orelse return null;
-    const s = std.mem.sliceTo(v, 0);
-    return if (s.len == 0) null else s;
+/// Environment lookup that treats an empty value as unset.
+pub fn getenv(environ: Environ, name: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) return null; // TODO: WTF-16 lookup via getWindows.
+    const v = environ.getPosix(name) orelse return null;
+    return if (v.len == 0) null else v;
 }
 
-pub fn fileExists(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return std.c.access(buf[0..path.len :0], 0) == 0;
+pub fn fileExists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+test "well-known scan roots exist for the build target" {
+    for (well_known.scan) |root| try std.testing.expect(std.fs.path.isAbsolute(root.dir));
+}
+
+test "getenv ignores empty values" {
+    const block = [_:null]?[*:0]const u8{ "A=1", "EMPTY=", "B=two" };
+    const environ: Environ = .{ .block = .{ .slice = &block } };
+    try std.testing.expectEqualStrings("1", getenv(environ, "A").?);
+    try std.testing.expectEqualStrings("two", getenv(environ, "B").?);
+    try std.testing.expect(getenv(environ, "EMPTY") == null);
+    try std.testing.expect(getenv(environ, "MISSING") == null);
 }

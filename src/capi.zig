@@ -1,8 +1,19 @@
 //! C ABI exported by libtachi. See include/tachi.h for documentation.
 const std = @import("std");
+const builtin = @import("builtin");
 const tachi = @import("tachi");
 
 const c_allocator = std.heap.c_allocator;
+
+/// C callers have no `std.Io` to hand us, so the library owns a
+/// single-threaded instance; discovery only does `access` and `readdir`.
+var threaded: std.Io.Threaded = .init_single_threaded;
+
+/// The libc environment block, viewed through `std.process.Environ`.
+fn processEnviron() std.process.Environ {
+    if (builtin.os.tag == .windows) return .{ .block = .global };
+    return .{ .block = .{ .slice = std.mem.sliceTo(std.c.environ, null) } };
+}
 
 pub const ErrorCode = enum(c_int) {
     ok = 0,
@@ -86,7 +97,7 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
     const jvm_opts = collect(c_allocator, c.jvm_options) catch return code(.out_of_memory);
     defer c_allocator.free(jvm_opts);
 
-    const rt = tachi.Runtime.init(c_allocator, .{
+    const rt = tachi.Runtime.init(c_allocator, threaded.io(), .{
         .data_dir = data_dir,
         .cache_dir = optSlice(c.cache_dir),
         .host_jar = optSlice(c.host_jar),
@@ -102,6 +113,7 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
         .libjvm_path = optSlice(c.libjvm_path),
         .jvm_options = jvm_opts,
         .existing_vm = if (c.existing_jvm) |p| @ptrCast(@alignCast(p)) else null,
+        .environ = processEnviron(),
     }) catch |e| return mapError(e);
     if (out) |o| o.* = rt else rt.deinit();
     return 0;

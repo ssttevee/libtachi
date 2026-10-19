@@ -1,7 +1,7 @@
 //! zig-tachi: run Mihon/Tachiyomi extensions in-process.
 //!
 //! ```zig
-//! var rt = try tachi.Runtime.init(gpa, .{ .data_dir = "/tmp/tachi" });
+//! var rt = try tachi.Runtime.init(gpa, io, .{ .data_dir = "/tmp/tachi", .environ = environ });
 //! defer rt.deinit();
 //! const ext = try rt.installExtensionParsed("tachiyomi-en.weebcentral-v1.6.25.jar");
 //! defer ext.deinit();
@@ -10,6 +10,8 @@
 //! defer page.deinit();
 //! ```
 const std = @import("std");
+const Io = std.Io;
+const Environ = std.process.Environ;
 pub const jvm = @import("jvm.zig");
 pub const jni = jvm.jni;
 pub const models = @import("models.zig");
@@ -53,6 +55,9 @@ pub const Options = struct {
     /// Reuse a VM that already exists (Android: the JavaVM* from JNI_OnLoad).
     /// The host jar/dex must already be loadable by that VM's system class loader.
     existing_vm: ?*jni.JavaVM = null,
+    /// Environment consulted for $TACHI_HOST_JAR, $TACHI_LIBJVM and $JAVA_HOME.
+    /// Pass `init.minimal.environ` from `main`; the default looks nothing up.
+    environ: Environ = .empty,
 };
 
 pub const Image = struct {
@@ -99,7 +104,7 @@ pub fn setLastError(msg: []const u8) void {
 }
 
 fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
-    var w: std.Io.Writer = .fixed(&last_error_buf);
+    var w: Io.Writer = .fixed(&last_error_buf);
     w.print(fmt, args) catch {}; // truncation is fine for a diagnostic
     last_error_len = w.end;
     last_error_buf[last_error_len] = 0;
@@ -147,12 +152,12 @@ pub const Runtime = struct {
     bridge: jni.jclass,
     methods: MethodIds,
 
-    pub fn init(gpa: std.mem.Allocator, opts: Options) Error!*Runtime {
+    pub fn init(gpa: std.mem.Allocator, io: Io, opts: Options) Error!*Runtime {
         const self = try gpa.create(Runtime);
         errdefer gpa.destroy(self);
         self.gpa = gpa;
 
-        self.vm = if (opts.existing_vm) |vm| jvm.Vm.adopt(vm) else try createVm(gpa, opts);
+        self.vm = if (opts.existing_vm) |vm| jvm.Vm.adopt(vm) else try createVm(gpa, io, opts);
         errdefer self.vm.destroy();
 
         const env = try self.vm.env();
@@ -193,16 +198,17 @@ pub const Runtime = struct {
         return self;
     }
 
-    fn createVm(gpa: std.mem.Allocator, opts: Options) Error!jvm.Vm {
-        const host_jar = try findHostJar(gpa, opts.host_jar);
+    fn createVm(gpa: std.mem.Allocator, io: Io, opts: Options) Error!jvm.Vm {
+        const host_jar = try findHostJar(gpa, io, opts.environ, opts.host_jar);
         defer gpa.free(host_jar);
         const cp = try std.mem.concat(gpa, []const u8, &.{ &.{host_jar}, opts.extra_classpath });
         defer gpa.free(cp);
-        return jvm.Vm.create(gpa, .{
+        return jvm.Vm.create(gpa, io, .{
             .java_home = opts.java_home,
             .libjvm_path = opts.libjvm_path,
             .classpath = cp,
             .extra_options = opts.jvm_options,
+            .environ = opts.environ,
         });
     }
 
@@ -433,16 +439,16 @@ const host_jar_candidates = [_][]const u8{
     "../host/build/libs/tachi-host.jar",
 };
 
-fn findHostJar(gpa: std.mem.Allocator, explicit: ?[]const u8) Error![]u8 {
+fn findHostJar(gpa: std.mem.Allocator, io: Io, environ: Environ, explicit: ?[]const u8) Error![]u8 {
     if (explicit) |p| {
-        if (!jvm.fileExists(p)) return error.HostJarNotFound;
+        if (!jvm.fileExists(io, p)) return error.HostJarNotFound;
         return gpa.dupe(u8, p);
     }
-    if (jvm.getenv("TACHI_HOST_JAR")) |p| {
-        if (jvm.fileExists(p)) return gpa.dupe(u8, p);
+    if (jvm.getenv(environ, "TACHI_HOST_JAR")) |p| {
+        if (jvm.fileExists(io, p)) return gpa.dupe(u8, p);
     }
     for (host_jar_candidates) |p| {
-        if (jvm.fileExists(p)) return gpa.dupe(u8, p);
+        if (jvm.fileExists(io, p)) return gpa.dupe(u8, p);
     }
     return error.HostJarNotFound;
 }
@@ -486,6 +492,10 @@ fn registerLogHook(env: *jni.JNIEnv) Error!void {
 }
 
 // ---- tests ---------------------------------------------------------------------
+
+test {
+    _ = jvm;
+}
 
 test "models decode a representative envelope" {
     const sample =

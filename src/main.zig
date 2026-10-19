@@ -81,12 +81,13 @@ pub fn main(init: std.process.Init) !void {
     const cmd = positional.items[0];
     const args = positional.items[1..];
 
-    const rt = tachi.Runtime.init(gpa, .{
+    const rt = tachi.Runtime.init(gpa, io, .{
         .data_dir = data_dir,
         .host_jar = host_jar,
         .java_home = java_home,
         .verbose = verbose,
         .log_fn = logFn,
+        .environ = init.minimal.environ,
     }) catch |e| {
         std.debug.print("error: failed to start runtime: {s}: {s}\n", .{ @errorName(e), tachi.lastError() });
         std.process.exit(1);

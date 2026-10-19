@@ -84,7 +84,13 @@ Data (preferences, cookies, converted APKs) lives in `--data-dir`
 ```zig
 const tachi = @import("tachi");
 
-var rt = try tachi.Runtime.init(gpa, .{ .data_dir = "/path/to/data", .log_fn = myLog });
+// `io` and `environ` come from `std.process.Init` in `main`; the library does
+// all file-system and environment access through them (no hidden libc calls).
+var rt = try tachi.Runtime.init(gpa, init.io, .{
+    .data_dir = "/path/to/data",
+    .log_fn = myLog,
+    .environ = init.minimal.environ, // enables $TACHI_HOST_JAR / $JAVA_HOME lookup
+});
 defer rt.deinit();
 
 const ext = try rt.installExtensionParsed("tachiyomi-en.weebcentral-v1.6.25.jar");
