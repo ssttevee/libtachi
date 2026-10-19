@@ -24,6 +24,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -89,6 +90,20 @@ object SourceCalls {
                 ListSerializer(PageDto.serializer()),
                 source.getPageList(args.chapter("chapter")).map { it.toDto() },
             )
+
+            "imageRequests" -> json.encodeToJsonElement(
+                ListSerializer(ImageRequestDto.serializer()),
+                ImageRequests.plan(http(source), args.chapter("chapter")),
+            )
+
+            "imageCookies" -> {
+                val url = args.string("url")!!.toHttpUrl()
+                val cookies = args["cookies"]!!.jsonArray.mapNotNull { okhttp3.Cookie.parse(url, it.jsonPrimitive.content) }
+                http(source).client.cookieJar.saveFromResponse(url, cookies)
+                JsonPrimitive(true)
+            }
+
+            "cancel" -> { http(source).client.dispatcher.cancelAll(); JsonPrimitive(true) }
 
             "imageUrl" -> JsonPrimitive(http(source).getImageUrl(args.page("page")))
 

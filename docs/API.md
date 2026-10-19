@@ -181,3 +181,12 @@ bytes plus the `Content-Type`.
 `android.util.Log` → `dev.tachi.host.TachiLog` → (if a `log_fn` was given)
 the native callback, called from whatever JVM thread logged. Levels follow
 Android: 2 verbose … 7 assert.
+
+
+### Native image planning (PocketManga host bridge)
+
+`call(source, "imageRequests", {"chapter": Chapter})` returns one request per page:
+`{page, url, method, headers:[{name,value}], rates:[{key,spacingMs,initialWaitMs}], cookies:[Set-Cookie-string], fallback:null|string}`.
+It resolves null imageUrl with getImageUrl, uses the source's virtual imageRequest, exports URL-matched jar cookies, recognized rate limits and Keiyoushi cookie injection. Unknown interceptors/client policies conservatively require fetchImage. A native caller must preserve the limits, handle redirects/challenges through the original client, retain partial pages and never forward headers to an unexamined redirect target.
+
+`call(source, "imageCookies", {"url": URL, "cookies": [...]})` restores the exported matching cookies into a restarted source client before JVM fallback; it returns true. `call(source, "cancel", {})` calls the source client's dispatcher.cancelAll and returns true. Process owners must still terminate an unresponsive host; extension code need not cooperate with cancellation.

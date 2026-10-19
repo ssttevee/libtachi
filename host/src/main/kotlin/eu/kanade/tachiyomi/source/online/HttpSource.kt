@@ -70,6 +70,9 @@ abstract class HttpSource : CatalogueSource {
     /** Returns the request for getting the image. Override to send different headers or request method. */
     protected open fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
+    /** Host bridge: retains virtual dispatch to extension imageRequest overrides. */
+    fun imageRequestForHost(page: Page): Request = imageRequest(page)
+
     /** Assigns the url of the chapter without the scheme and domain. */
     fun SChapter.setUrlWithoutDomain(url: String) {
         this.url = getUrlWithoutDomain(url)

@@ -81,7 +81,6 @@ dependencies {
     implementation(libs.serialization.protobuf)
     implementation(libs.okhttp.core)
     implementation(libs.okhttp.brotli)
-    implementation(libs.okhttp.zstd)
     implementation(libs.okhttp.logging)
     implementation(libs.jsoup)
     implementation(libs.injekt.core)
