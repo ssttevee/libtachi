@@ -367,23 +367,16 @@ fn describeException(env: *jni.JNIEnv) void {
     setLastError(std.mem.sliceTo(chars, 0));
 }
 
-const RawEnvelope = struct { ok: ?std.json.Value = null, @"error": ?models.ErrorInfo = null };
-
 /// Returns the `ok` payload re-serialised as JSON, or records the error.
 fn unwrapOk(gpa: std.mem.Allocator, reply: []const u8) Error![]u8 {
-    const parsed = std.json.parseFromSlice(RawEnvelope, gpa, reply, models.parse_options) catch return error.InvalidResponse;
-    defer parsed.deinit();
-    if (parsed.value.@"error") |e| {
-        setErrorInfo(e);
-        return error.ExtensionError;
-    }
-    const ok = parsed.value.ok orelse return error.InvalidResponse;
-    return std.json.Stringify.valueAlloc(gpa, ok, .{}) catch return error.OutOfMemory;
+    const r = try parseEnvelope(std.json.Value, gpa, reply);
+    defer r.deinit();
+    return std.json.Stringify.valueAlloc(gpa, r.value(), .{}) catch return error.OutOfMemory;
 }
 
 fn checkEnvelope(gpa: std.mem.Allocator, reply: []const u8) Error!void {
-    const v = try unwrapOk(gpa, reply);
-    gpa.free(v);
+    const r = try parseEnvelope(std.json.Value, gpa, reply);
+    r.deinit();
 }
 
 fn parseEnvelope(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) Error!Result(T) {
@@ -391,15 +384,12 @@ fn parseEnvelope(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) Er
         setLastError(@errorName(e));
         return error.InvalidResponse;
     };
+    errdefer parsed.deinit();
     if (parsed.value.@"error") |e| {
         setErrorInfo(e);
-        parsed.deinit();
         return error.ExtensionError;
     }
-    if (parsed.value.ok == null) {
-        parsed.deinit();
-        return error.InvalidResponse;
-    }
+    if (parsed.value.ok == null) return error.InvalidResponse;
     return .{ .parsed = parsed };
 }
 
