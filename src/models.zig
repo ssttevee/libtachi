@@ -109,6 +109,13 @@ pub const Preference = struct {
     visible: bool = true,
 };
 
+/// What `Bridge.init` reports about the host.
+pub const InitInfo = struct {
+    apiVersion: i32,
+    javaVersion: []const u8 = "",
+    supportedLibVersions: []const []const u8 = &.{},
+};
+
 pub const ErrorInfo = struct {
     type: []const u8,
     message: ?[]const u8 = null,

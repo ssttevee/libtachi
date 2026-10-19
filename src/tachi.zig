@@ -15,8 +15,10 @@ const Environ = std.process.Environ;
 pub const jvm = @import("jvm.zig");
 pub const jni = jvm.jni;
 pub const models = @import("models.zig");
+pub const repo = @import("repo.zig");
+pub const manage = @import("manage.zig");
 
-pub const Error = jvm.Error || error{
+pub const Error = jvm.Error || repo.Error || error{
     HostJarNotFound,
     BridgeClassNotFound,
     BridgeMethodNotFound,
@@ -25,6 +27,12 @@ pub const Error = jvm.Error || error{
     /// The bridge returned `{"error": ...}`; see `lastError()`.
     ExtensionError,
     InvalidResponse,
+    /// The package is not listed in the repository index.
+    ExtensionNotInRepo,
+    /// The downloaded package is not signed with the repository's key.
+    SignatureMismatch,
+    /// The package targets an extensions-lib version the host does not implement.
+    UnsupportedExtension,
 };
 
 pub const LogLevel = enum(c_int) { verbose = 2, debug = 3, info = 4, warn = 5, err = 6, assert = 7, _ };
@@ -103,7 +111,7 @@ pub fn setLastError(msg: []const u8) void {
     last_error_len = n;
 }
 
-fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
+pub fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
     var w: Io.Writer = .fixed(&last_error_buf);
     w.print(fmt, args) catch {}; // truncation is fine for a diagnostic
     last_error_len = w.end;
@@ -112,6 +120,16 @@ fn setLastErrorFmt(comptime fmt: []const u8, args: anytype) void {
 
 var g_log_fn: ?LogFn = null;
 var g_log_ud: ?*anyopaque = null;
+
+/// Routes a native-side message through the embedder's `log_fn`, tagged "tachi".
+pub fn log(level: LogLevel, comptime fmt: []const u8, args: anytype) void {
+    const f = g_log_fn orelse return;
+    var buf: [1024:0]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    w.print(fmt, args) catch {};
+    buf[w.end] = 0;
+    f(level, "tachi", buf[0..w.end :0], g_log_ud);
+}
 
 // ---- bridge method table -------------------------------------------------------
 
@@ -148,14 +166,41 @@ const MethodIds = std.EnumArray(BridgeMethod, jni.jmethodID);
 
 pub const Runtime = struct {
     gpa: std.mem.Allocator,
+    io: Io,
     vm: jvm.Vm,
     bridge: jni.jclass,
     methods: MethodIds,
+    /// Absolute `Options.data_dir`; the registry and downloads live under it.
+    data_dir: [:0]u8,
+    /// Serialises registry read-modify-write cycles across threads.
+    lock: Io.Mutex = .init,
+    /// extensions-lib versions the host jar reported at `init`.
+    supported_lib_versions: []const []const u8,
+
+    // Management (registry, repositories): see manage.zig.
+    pub const installExtension = manage.installExtension;
+    pub const uninstallExtension = manage.uninstallExtension;
+    pub const restore = manage.restore;
+    pub const repoList = manage.repoList;
+    pub const repoListJson = manage.repoListJson;
+    pub const repoInstall = manage.repoInstall;
+    pub const repoUpdate = manage.repoUpdate;
+    pub const RepoOptions = manage.RepoOptions;
+    pub const RepoEntry = manage.RepoEntry;
 
     pub fn init(gpa: std.mem.Allocator, io: Io, opts: Options) Error!*Runtime {
         const self = try gpa.create(Runtime);
         errdefer gpa.destroy(self);
-        self.gpa = gpa;
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .vm = undefined,
+            .bridge = undefined,
+            .methods = undefined,
+            .data_dir = try absoluteDir(gpa, io, opts.data_dir),
+            .supported_lib_versions = &.{},
+        };
+        errdefer gpa.free(self.data_dir);
 
         self.vm = if (opts.existing_vm) |vm| jvm.Vm.adopt(vm) else try createVm(gpa, io, opts);
         errdefer self.vm.destroy();
@@ -194,7 +239,9 @@ pub const Runtime = struct {
 
         const reply = try self.invokeInFrame(.init, .{config_json});
         defer gpa.free(reply);
-        try checkEnvelope(gpa, reply);
+        const info = try parseEnvelope(models.InitInfo, gpa, reply);
+        defer info.deinit();
+        self.supported_lib_versions = try dupeStrings(gpa, info.value().supportedLibVersions);
         return self;
     }
 
@@ -220,6 +267,9 @@ pub const Runtime = struct {
         } else |_| {}
         g_log_fn = null;
         self.vm.destroy();
+        for (self.supported_lib_versions) |v| self.gpa.free(v);
+        self.gpa.free(self.supported_lib_versions);
+        self.gpa.free(self.data_dir);
         self.gpa.destroy(self);
     }
 
@@ -231,16 +281,21 @@ pub const Runtime = struct {
 
     // ---- extensions ------------------------------------------------------------
 
-    /// Loads a `.jar` or `.apk` extension. Returns the `ExtensionInfo` JSON (owned by caller).
-    pub fn installExtension(self: *Runtime, path: []const u8) Error![]u8 {
+    /// `installExtension` with the `ExtensionInfo` decoded.
+    pub fn installExtensionParsed(self: *Runtime, path: []const u8) Error!Result(models.ExtensionInfo) {
+        const json = try self.installExtension(path);
+        defer self.gpa.free(json);
+        return parseValue(models.ExtensionInfo, self.gpa, json);
+    }
+
+    /// Loads a package into the JVM without touching the registry. Prefer
+    /// `installExtension`, which also remembers it for `restore`.
+    pub fn loadPackage(self: *Runtime, path: []const u8) Error![]u8 {
         return self.invokeJson(.install, .{path});
     }
 
-    pub fn installExtensionParsed(self: *Runtime, path: []const u8) Error!Result(models.ExtensionInfo) {
-        return self.invokeParsed(models.ExtensionInfo, .install, .{path});
-    }
-
-    pub fn uninstallExtension(self: *Runtime, pkg: []const u8) Error!bool {
+    /// Unloads a package from the JVM without touching the registry.
+    pub fn unloadPackage(self: *Runtime, pkg: []const u8) Error!bool {
         const r = try self.invokeParsed(bool, .uninstall, .{pkg});
         defer r.deinit();
         return r.value();
@@ -348,6 +403,44 @@ pub const Runtime = struct {
         return parseEnvelope(T, self.gpa, reply);
     }
 };
+
+/// `dir` made to exist and resolved to an absolute path (owned by caller).
+fn absoluteDir(gpa: std.mem.Allocator, io: Io, dir: []const u8) Error![:0]u8 {
+    const cwd = Io.Dir.cwd();
+    cwd.createDirPath(io, dir) catch |e| {
+        setLastErrorFmt("{s}: {s}", .{ dir, @errorName(e) });
+        return error.FileSystemError;
+    };
+    return cwd.realPathFileAlloc(io, dir, gpa) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => {
+            setLastErrorFmt("{s}: {s}", .{ dir, @errorName(e) });
+            return error.FileSystemError;
+        },
+    };
+}
+
+fn dupeStrings(gpa: std.mem.Allocator, list: []const []const u8) Error![]const []const u8 {
+    const out = try gpa.alloc([]const u8, list.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |s| gpa.free(s);
+        gpa.free(out);
+    }
+    for (list) |s| {
+        out[n] = try gpa.dupe(u8, s);
+        n += 1;
+    }
+    return out;
+}
+
+/// Decodes a bare (non-envelope) JSON document into a `Result`.
+fn parseValue(comptime T: type, gpa: std.mem.Allocator, json: []const u8) Error!Result(T) {
+    // Wrap so `Result` keeps its single representation.
+    const wrapped = std.mem.concat(gpa, u8, &.{ "{\"ok\":", json, "}" }) catch return error.OutOfMemory;
+    defer gpa.free(wrapped);
+    return parseEnvelope(T, gpa, wrapped);
+}
 
 fn findGlobalClass(env: *jni.JNIEnv, name: [*:0]const u8) Error!jni.jclass {
     const local = env.f.FindClass(env, name) orelse {
@@ -495,6 +588,8 @@ fn registerLogHook(env: *jni.JNIEnv) Error!void {
 
 test {
     _ = jvm;
+    _ = repo;
+    _ = manage;
 }
 
 test "models decode a representative envelope" {
