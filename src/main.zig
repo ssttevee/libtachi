@@ -2,7 +2,9 @@
 //!
 //!   tachi-cli [--data-dir DIR] [--host-jar JAR] [--java-home DIR] [--ext FILE]... [-v] <command> [args]
 //!
-//! See `Command` for the list of commands and their arguments.
+//! Extensions installed with `install` or `repo install` are remembered in
+//! the data dir and reloaded on every run, so `--ext` is only needed for
+//! one-off files. See `Command` for the list of commands and their arguments.
 const std = @import("std");
 const Io = std.Io;
 const tachi = @import("tachi");
@@ -11,7 +13,9 @@ const tachi = @import("tachi");
 /// positional arguments become the JSON argument object.
 const Command = enum {
     install,
+    uninstall,
     list,
+    repo,
     popular,
     latest,
     search,
@@ -29,8 +33,10 @@ const Command = enum {
 
     fn help(c: Command) []const u8 {
         return switch (c) {
-            .install => "install FILE                 load an extension and print its info",
-            .list => "list                         list loaded extensions (use --ext to load some first)",
+            .install => "install FILE                 install an extension file and print its info",
+            .uninstall => "uninstall PKG                unload and forget an extension",
+            .list => "list                         list installed extensions",
+            .repo => "repo list|install|update     browse and install from a repository (see --repo, --lang, --grep)",
             .popular => "popular ID [PAGE]            popular manga",
             .latest => "latest ID [PAGE]             latest updates",
             .search => "search ID QUERY [PAGE]       search by text",
@@ -73,6 +79,28 @@ const Flags = struct {
     host_jar: ?[]const u8 = null,
     java_home: ?[]const u8 = null,
     verbose: bool = false,
+    /// Skip reloading the installed extensions at startup.
+    no_restore: bool = false,
+    // `repo` options
+    repo_url: ?[]const u8 = null,
+    refresh: bool = false,
+    lang: ?[]const u8 = null,
+    grep: ?[]const u8 = null,
+    json: bool = false,
+};
+
+const RepoCommand = enum {
+    list,
+    install,
+    update,
+
+    fn help(c: RepoCommand) []const u8 {
+        return switch (c) {
+            .list => "repo list [--lang L] [--grep S] [--json]   extensions in the index (* installed, ^ update available)",
+            .install => "repo install PKG...                        download, verify and install packages",
+            .update => "repo update                                upgrade every repo-installed package",
+        };
+    }
 };
 
 fn logFn(level: tachi.LogLevel, tag: [*:0]const u8, message: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
@@ -88,8 +116,24 @@ fn logFn(level: tachi.LogLevel, tag: [*:0]const u8, message: [*:0]const u8, _: ?
 }
 
 fn usage() noreturn {
-    std.debug.print("usage: tachi-cli [--data-dir DIR] [--host-jar JAR] [--java-home DIR] [--ext FILE]... [-v] <command> [args]\n\ncommands:\n", .{});
+    std.debug.print(
+        \\usage: tachi-cli [options] <command> [args]
+        \\
+        \\options:
+        \\  --data-dir DIR   registry, downloads, preferences (default .tachi-data)
+        \\  --host-jar JAR   tachi-host.jar (default $TACHI_HOST_JAR)
+        \\  --java-home DIR  JDK to load libjvm from
+        \\  --ext FILE       load an extension file for this run only
+        \\  --no-restore     do not reload installed extensions
+        \\  --repo URL       index URL (default keiyoushi)
+        \\  --refresh        ignore the cached index
+        \\  -v               verbose logging
+        \\
+        \\commands:
+        \\
+    , .{});
     inline for (comptime std.enums.values(Command)) |c| std.debug.print("  {s}\n", .{c.help()});
+    inline for (comptime std.enums.values(RepoCommand)) |c| std.debug.print("  {s}\n", .{c.help()});
     std.process.exit(2);
 }
 
@@ -118,6 +162,18 @@ pub fn main(init: std.process.Init) !void {
             flags.java_home = it.next() orelse usage();
         } else if (std.mem.eql(u8, arg, "--ext")) {
             try exts.append(arena, it.next() orelse usage());
+        } else if (std.mem.eql(u8, arg, "--no-restore")) {
+            flags.no_restore = true;
+        } else if (std.mem.eql(u8, arg, "--repo")) {
+            flags.repo_url = it.next() orelse usage();
+        } else if (std.mem.eql(u8, arg, "--refresh")) {
+            flags.refresh = true;
+        } else if (std.mem.eql(u8, arg, "--lang")) {
+            flags.lang = it.next() orelse usage();
+        } else if (std.mem.eql(u8, arg, "--grep")) {
+            flags.grep = it.next() orelse usage();
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            flags.json = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             flags.verbose = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -143,12 +199,21 @@ pub fn main(init: std.process.Init) !void {
     };
     defer rt.deinit();
 
-    for (exts.items) |path| gpa.free(rt.installExtension(path) catch |e| fail(e));
+    if (!flags.no_restore) {
+        const json = rt.restore() catch |e| fail(e);
+        defer gpa.free(json);
+        const r = try std.json.parseFromSlice(tachi.manage.RestoreResult, arena, json, tachi.models.parse_options);
+        for (r.value.failed) |f| std.debug.print("warning: {s} not restored: {s}\n", .{ f.pkg, f.@"error" });
+    }
+    // One-off files bypass the registry.
+    for (exts.items) |path| gpa.free(rt.loadPackage(path) catch |e| fail(e));
 
     var out_buf: [8192]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &out_buf);
     const w = &stdout.interface;
     defer w.flush() catch {};
+
+    const repo_opts: tachi.Runtime.RepoOptions = .{ .url = flags.repo_url, .refresh = flags.refresh };
 
     switch (cmd) {
         .install => {
@@ -156,6 +221,30 @@ pub fn main(init: std.process.Init) !void {
             const json = rt.installExtension(args[0]) catch |e| fail(e);
             defer gpa.free(json);
             try printJson(gpa, w, json);
+        },
+        .uninstall => {
+            if (args.len < 1) usage();
+            const removed = rt.uninstallExtension(args[0]) catch |e| fail(e);
+            try w.print("{s}\n", .{if (removed) "removed" else "not installed"});
+        },
+        .repo => {
+            if (args.len < 1) usage();
+            switch (std.meta.stringToEnum(RepoCommand, args[0]) orelse usage()) {
+                .list => try repoList(rt, arena, w, flags, repo_opts),
+                .install => {
+                    if (args.len < 2) usage();
+                    for (args[1..]) |pkg| {
+                        const json = rt.repoInstall(pkg, repo_opts) catch |e| fail(e);
+                        defer gpa.free(json);
+                        try printJson(gpa, w, json);
+                    }
+                },
+                .update => {
+                    const json = rt.repoUpdate(repo_opts) catch |e| fail(e);
+                    defer gpa.free(json);
+                    try printJson(gpa, w, json);
+                },
+            }
         },
         .list => {
             const json = rt.listExtensions() catch |e| fail(e);
@@ -183,6 +272,30 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// `repo list`: a filtered table, or the raw entries with `--json`.
+fn repoList(rt: *tachi.Runtime, arena: std.mem.Allocator, w: *Io.Writer, flags: Flags, opts: tachi.Runtime.RepoOptions) !void {
+    const all = rt.repoList(arena, opts) catch |e| fail(e);
+    var shown: std.ArrayList(tachi.Runtime.RepoEntry) = .empty;
+    for (all) |e| {
+        if (flags.lang) |l| if (!std.mem.eql(u8, e.lang, l) and !std.mem.eql(u8, e.lang, "all")) continue;
+        if (flags.grep) |g| if (std.ascii.findIgnoreCase(e.name, g) == null and std.ascii.findIgnoreCase(e.pkg, g) == null) continue;
+        try shown.append(arena, e);
+    }
+    if (flags.json) {
+        try std.json.Stringify.value(shown.items, .{ .whitespace = .indent_2 }, w);
+        try w.writeByte('\n');
+        return;
+    }
+    for (shown.items) |e| {
+        const mark: u8 = if (e.hasUpdate) '^' else if (e.installed) '*' else ' ';
+        try w.print("{c} {s: <56} {s: <8} {s: <4} {s}{s}\n", .{
+            mark,                         e.pkg,  e.versionName, e.lang,
+            if (e.nsfw) "[18+] " else "", e.name,
+        });
+    }
+    try w.print("{d} of {d} extension(s)\n", .{ shown.items.len, all.len });
+}
+
 /// JSON argument object for a source call, from the positional args after the id.
 fn buildArgs(arena: std.mem.Allocator, cmd: Command, rest: []const []const u8) ![]const u8 {
     const S = std.json.Stringify;
@@ -194,7 +307,7 @@ fn buildArgs(arena: std.mem.Allocator, cmd: Command, rest: []const []const u8) !
         .setpref => try std.fmt.allocPrint(arena, "{{\"key\":{f},\"value\":{s}}}", .{ std.json.fmt(rest[0], .{}), rest[1] }),
         .call => if (rest.len > 1) rest[1] else "{}",
         .filters, .info, .prefs => "{}",
-        .install, .list, .image => unreachable, // handled by the caller
+        .install, .uninstall, .list, .repo, .image => unreachable, // handled by the caller
     };
 }
 
