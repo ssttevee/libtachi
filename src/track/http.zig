@@ -50,6 +50,15 @@ pub const Http = struct {
     /// fails with `error.AuthenticationExpired`; other statuses are the
     /// caller's to judge.
     pub fn send(self: *Http, arena: std.mem.Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: Body) !Response {
+        return self.sendWithRedirects(arena, method, url, headers, body, true);
+    }
+
+    /// Sends server credentials only to the configured URL, without redirects.
+    pub fn sendPrivate(self: *Http, arena: std.mem.Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: Body) !Response {
+        return self.sendWithRedirects(arena, method, url, headers, body, false);
+    }
+
+    fn sendWithRedirects(self: *Http, arena: std.mem.Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: Body, follow_redirects: bool) !Response {
         var all: std.ArrayList(std.http.Header) = .empty;
         try all.appendSlice(arena, headers);
         const explicit_content_type = for (headers) |header| {
@@ -70,10 +79,38 @@ pub const Http = struct {
             },
             .headers = .{ .user_agent = .{ .override = self.user_agent } },
             .extra_headers = all.items,
+            .redirect_behavior = if (follow_redirects) null else .unhandled,
             .response_writer = &out.writer,
         });
         if (result.status == .unauthorized) return error.AuthenticationExpired;
         return .{ .status = result.status, .body = out.written() };
+    }
+
+    /// Exchanges a simple-login form for cookies without following its redirect.
+    pub fn loginCookies(self: *Http, arena: std.mem.Allocator, url: []const u8, body: []const u8) ![]const u8 {
+        var request = try (try self.get()).request(.POST, try std.Uri.parse(url), .{
+            .redirect_behavior = .unhandled,
+            .keep_alive = false,
+            .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
+        });
+        defer request.deinit();
+        request.transfer_encoding = .{ .content_length = body.len };
+        var writer = try request.sendBodyUnflushed(&.{});
+        try writer.writer.writeAll(body);
+        try writer.end();
+        try request.connection.?.flush();
+        const response = try request.receiveHead(&.{});
+        if (response.head.status != .found and response.head.status != .see_other) return error.AuthenticationExpired;
+        var cookies: std.ArrayList(u8) = .empty;
+        var headers = response.head.iterateHeaders();
+        while (headers.next()) |header| {
+            if (!std.ascii.eqlIgnoreCase(header.name, "Set-Cookie")) continue;
+            const end = std.mem.indexOfScalar(u8, header.value, ';') orelse header.value.len;
+            if (cookies.items.len > 0) try cookies.appendSlice(arena, "; ");
+            try cookies.appendSlice(arena, header.value[0..end]);
+        }
+        if (cookies.items.len == 0) return error.AuthenticationExpired;
+        return cookies.items;
     }
 
     /// `name=value&...`, percent-encoded.

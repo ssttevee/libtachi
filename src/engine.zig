@@ -101,6 +101,8 @@ pub const Request = union(enum) {
 
     /// Browser login URL or credential/code/token exchange, or a provider call.
     tracker: struct { id: i32, operation: tracking.Operation },
+    /// Match and bind logged-in enhanced trackers accepted by this title's source.
+    track_match: struct { manga_id: []const u8 },
     track_bind: struct { manga_id: []const u8, track: library.Track },
     track_unbind: struct { manga_id: []const u8, tracker_id: i32, delete_remote: bool = false },
     track_set: struct { manga_id: []const u8, tracker_id: i32, value: tracking.Setter },
@@ -111,7 +113,7 @@ pub const Request = union(enum) {
 
     fn usesBackend(self: Request) bool {
         return switch (self) {
-            .tracker, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending, .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads, .add_store, .refresh_stores => false,
+            .tracker, .track_match, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending, .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads, .add_store, .refresh_stores => false,
             else => true,
         };
     }
@@ -1641,7 +1643,15 @@ pub const Engine = struct {
                 }
                 if (edit.flags.categories) t.categories = o.categories;
                 if (edit.flags.notes) t.notes = o.notes;
-                t.tracks = o.tracks;
+                var tracks: std.ArrayList(library.Track) = .empty;
+                const enhanced = @import("track/enhanced.zig");
+                for (o.tracks) |track| {
+                    if (if (tracking.get(track.tracker_id)) |service| service.enhanced else false) {
+                        if (!enhanced.isTrackFrom(track, o, enhanced.sourcePackage(lib, o))) continue;
+                        if (enhanced.migrate(track, t.*, enhanced.sourcePackage(lib, t.*))) |moved| try tracks.append(arena, moved);
+                    } else try tracks.append(arena, track);
+                }
+                t.tracks = try tracks.toOwnedSlice(arena);
                 t.chapter_flags = o.chapter_flags;
                 t.reader_flags = o.reader_flags;
                 t.favorite = true;
@@ -1874,6 +1884,24 @@ pub const Engine = struct {
                 }
                 job.result.tracking_reply = try self.trackerCall(job, state, c.id, c.operation);
             },
+            .track_match => |c| {
+                const lib = try self.store.load(a);
+                const manga = lib.manga[lib.find(c.manga_id) orelse return error.UnknownManga];
+                const enhanced = @import("track/enhanced.zig");
+                const pkg = enhanced.sourcePackage(lib, manga);
+                for ([_]i32{ 6, 8, 9 }) |id| {
+                    if (!state.loggedIn(id) or !enhanced.accepts(id, pkg)) continue;
+                    for (manga.tracks) |t| {
+                        if (t.tracker_id == id) break;
+                    } else {
+                        const reply = try self.trackerCall(job, state, id, .{ .search = (manga.remote orelse return error.LocalManga).url });
+                        if (reply.matches.len == 0) continue;
+                        const bound = (try self.trackerCall(job, state, id, .{ .bind = .{ .track = reply.matches[0].track, .has_read_chapters = false } })).track orelse return error.InvalidTrackerResponse;
+                        try self.syncEnhanced(job, state, manga.id, bound);
+                        job.result.tracking_reply = .{ .track = bound, .matches = reply.matches };
+                    }
+                }
+            },
             .track_chapter => |c| try self.trackChapter(job, state, c.manga_id, c.chapter),
             .track_set => |c| {
                 if (!state.loggedIn(c.tracker_id)) return error.TrackerLoggedOut;
@@ -1974,7 +2002,7 @@ pub const Engine = struct {
     pub fn execute(self: *Engine, job: *Job) !void {
         try self.io.checkCancel();
         switch (job.request) {
-            .tracker, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending => return self.executeTracking(job),
+            .tracker, .track_match, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending => return self.executeTracking(job),
             .sources => {
                 job.result.sources = (try job.call(.sources)).sources;
                 try self.rememberSources(job, job.result.sources);
@@ -3348,4 +3376,66 @@ test "tracking jobs bind prefixes, preserve automatic semantics, retry and gate 
     try std.testing.expectEqual(@as(f64, 8), (try engine.stats(a)).mean_score);
     try engine.trackerLogout(2);
     try std.testing.expectEqual(@as(usize, 0), (try engine.stats(a)).tracked);
+}
+
+test "enhanced matching binds accepted sources only and updates server before local reads" {
+    const test_http = @import("track/testing_enhanced.zig");
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const item = "{\"metadata\":{\"title\":\"Series\"}}";
+    const progress = "{\"booksCount\":4,\"booksReadCount\":2,\"booksUnreadCount\":2,\"lastReadContinuousNumberSort\":2.5,\"maxNumberSort\":4}";
+    var fixture = try test_http.Fixture.init(&.{
+        try test_http.ok(a, item),                                                              try test_http.ok(a, progress),
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", try test_http.ok(a, item),
+        try test_http.ok(a, progress),                                                          try test_http.ok(a, "{}"),
+        try test_http.ok(a, item),                                                              try test_http.ok(a, progress),
+    });
+    defer fixture.deinit();
+    fixture.expected = &.{ &.{}, &.{}, &.{"\"lastBookNumberSortRead\":2.5"}, &.{}, &.{}, &.{"\"lastBookNumberSortRead\":2.5"} };
+    try fixture.start();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try fixture.url(a, "");
+    const url = try fixture.url(a, "/api/v1/series/abc");
+    const host = try test_http.prefs(a, tmp.dir, 123, .{ .Address = .{ .t = "s", .v = base }, .Username = .{ .t = "s", .v = "u" }, .Password = .{ .t = "s", .v = "p" } });
+    var engine: Engine = .init(t.allocator, t.io, undefined, .{ .dir = host });
+    defer engine.deinit();
+    try engine.store.save(a, .{ .sources = &.{ .{ .id = 123, .name = "Komga", .pkg = "eu.kanade.tachiyomi.extension.all.komga" }, .{ .id = 456, .name = "Other", .pkg = "other" } }, .manga = &.{
+        .{ .id = "m", .title = "Series", .source_id = 123, .remote = .{ .url = url, .title = "Series" }, .chapters = &.{
+            .{ .id = "c1", .title = "1", .number = 1, .read = true },
+            .{ .id = "c2", .title = "2", .number = 2 },
+            .{ .id = "c3", .title = "3", .number = 3, .read = true },
+            .{ .id = "c4", .title = "4", .number = 4 },
+        } },
+        .{ .id = "other", .title = "Other", .source_id = 456, .remote = .{ .url = url, .title = "Other" } },
+    } });
+    const login = try Job.start(&engine, .{ .tracker = .{ .id = 6, .operation = .{ .login = .{ .username = "", .password = "" } } } });
+    defer login.deinit();
+    login.join();
+    try t.expect(login.failure == null);
+    const rejected = try Job.start(&engine, .{ .track_match = .{ .manga_id = "m" } });
+    defer rejected.deinit();
+    rejected.join();
+    try t.expect(rejected.failure != null);
+    const unchanged = (try engine.loadLibrary(a)).manga[0];
+    try t.expectEqual(@as(usize, 0), unchanged.tracks.len);
+    try t.expect(!unchanged.chapters[1].read);
+    const matched = try Job.start(&engine, .{ .track_match = .{ .manga_id = "m" } });
+    defer matched.deinit();
+    matched.join();
+    try t.expect(matched.failure == null);
+    const bound = (try engine.loadLibrary(a)).manga[0];
+    try t.expectEqual(@as(usize, 1), bound.tracks.len);
+    try t.expectEqual(@as(f64, 2.5), bound.tracks[0].last_chapter_read);
+    try t.expect(bound.chapters[1].read);
+    try t.expect(!bound.chapters[3].read);
+    for ([_][]const u8{ "m", "other" }) |id| {
+        const again = try Job.start(&engine, .{ .track_match = .{ .manga_id = id } });
+        defer again.deinit();
+        again.join();
+        try t.expect(again.failure == null);
+    }
+    try fixture.finish();
 }

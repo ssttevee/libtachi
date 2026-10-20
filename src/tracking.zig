@@ -229,6 +229,7 @@ pub fn scoreView(state: *const State) @import("views.zig").TrackScore {
 pub const Operation = union(enum) {
     login_url: struct { redirect_uri: []const u8, state: []const u8 },
     login: struct { username: []const u8, password: []const u8, redirect_uri: []const u8 = "", verifier: []const u8 = "" },
+    /// Enhanced trackers match source URLs; they do not support textual search.
     search: []const u8,
     bind: struct { track: Track, has_read_chapters: bool },
     update: struct { track: Track, did_read_chapter: bool = false },

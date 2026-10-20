@@ -68,12 +68,12 @@ pub const Fixture = struct {
             }
             const received = try request.toOwnedSlice(std.testing.allocator);
             try self.captured.append(std.testing.allocator, received);
-            if (self.expected_requests.len > 0) {
+            if (self.requests < self.expected_requests.len) {
                 for (self.expected_requests[self.requests]) |expected| {
                     try std.testing.expect(std.mem.indexOf(u8, received, expected) != null);
                 }
             }
-            if (self.expected.len > 0) {
+            if (self.requests < self.expected.len) {
                 for (self.expected[self.requests]) |needle| {
                     if (std.mem.indexOf(u8, received, needle) == null) {
                         std.debug.print("Missing request text: {s}\nRequest: {s}\n", .{ needle, received });

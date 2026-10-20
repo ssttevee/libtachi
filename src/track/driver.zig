@@ -2,6 +2,8 @@
 //! service, each with `default_base_url` and `call`, Mihon's wire formats
 //! and rules (mihonapp/mihon 487c313, app/.../data/track/<service>).
 const std = @import("std");
+/// Enhanced source acceptance, identity and migration helpers.
+pub const enhanced = @import("enhanced.zig");
 const Io = std.Io;
 const tracking = @import("../tracking.zig");
 const Http = @import("http.zig").Http;
