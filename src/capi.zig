@@ -49,30 +49,29 @@ fn mapError(err: tachi.Error) c_int {
         error.JvmCreateFailed, error.AttachFailed => .jvm_create_failed,
         error.HostJarNotFound => .host_jar_not_found,
         error.BridgeClassNotFound, error.BridgeMethodNotFound => .bridge_missing,
-        error.JavaException,
-        error.ExtensionError,
-        error.InvalidResponse,
-        error.FileSystemError,
-        error.ExtensionNotInRepo,
-        error.SignatureMismatch,
-        error.UnsupportedExtension,
-        => |e| {
-            // tachi already recorded a message for these; keep it.
-            return @as(ErrorCode, switch (e) {
-                error.JavaException => .java_exception,
-                error.ExtensionError => .extension_error,
-                error.InvalidResponse => .invalid_response,
-                error.FileSystemError => .file_system_error,
-                error.ExtensionNotInRepo => .extension_not_in_repo,
-                error.SignatureMismatch => .signature_mismatch,
-                error.UnsupportedExtension => .unsupported_extension,
-            }).int();
-        },
+        error.JavaException => .java_exception,
+        error.ExtensionError => .extension_error,
+        error.InvalidResponse => .invalid_response,
+        error.FileSystemError => .file_system_error,
+        error.ExtensionNotInRepo => .extension_not_in_repo,
+        error.SignatureMismatch => .signature_mismatch,
+        error.UnsupportedExtension => .unsupported_extension,
         error.NetworkError => .network_error,
         error.InvalidIndex => .invalid_index,
         error.OutOfMemory => .out_of_memory,
     };
-    return fail(mapped, @errorName(err));
+    switch (mapped) {
+        // These errors already have a detailed runtime diagnostic.
+        .java_exception,
+        .extension_error,
+        .invalid_response,
+        .file_system_error,
+        .extension_not_in_repo,
+        .signature_mismatch,
+        .unsupported_extension,
+        => return mapped.int(),
+        else => return fail(mapped, @errorName(err)),
+    }
 }
 
 /// Mirrors `tachi_config` in include/tachi.h; keep the two in sync.
@@ -257,4 +256,32 @@ test "config struct stays C-compatible" {
     // Pointer-sized fields first, then three ints (plus tail padding): matches the header.
     const expected = std.mem.alignForward(usize, 13 * @sizeOf(usize) + 3 * @sizeOf(c_int), @alignOf(usize));
     try std.testing.expectEqual(expected, @sizeOf(tachi_config));
+}
+
+test "error mapping preserves runtime diagnostics only for detailed errors" {
+    const cases = .{
+        .{ error.LibJvmNotFound, ErrorCode.jvm_not_found, false },
+        .{ error.LibJvmLoadFailed, ErrorCode.jvm_not_found, false },
+        .{ error.SymbolNotFound, ErrorCode.jvm_not_found, false },
+        .{ error.JvmCreateFailed, ErrorCode.jvm_create_failed, false },
+        .{ error.AttachFailed, ErrorCode.jvm_create_failed, false },
+        .{ error.HostJarNotFound, ErrorCode.host_jar_not_found, false },
+        .{ error.BridgeClassNotFound, ErrorCode.bridge_missing, false },
+        .{ error.BridgeMethodNotFound, ErrorCode.bridge_missing, false },
+        .{ error.JavaException, ErrorCode.java_exception, true },
+        .{ error.ExtensionError, ErrorCode.extension_error, true },
+        .{ error.InvalidResponse, ErrorCode.invalid_response, true },
+        .{ error.FileSystemError, ErrorCode.file_system_error, true },
+        .{ error.ExtensionNotInRepo, ErrorCode.extension_not_in_repo, true },
+        .{ error.SignatureMismatch, ErrorCode.signature_mismatch, true },
+        .{ error.UnsupportedExtension, ErrorCode.unsupported_extension, true },
+        .{ error.NetworkError, ErrorCode.network_error, false },
+        .{ error.InvalidIndex, ErrorCode.invalid_index, false },
+        .{ error.OutOfMemory, ErrorCode.out_of_memory, false },
+    };
+    inline for (cases) |case| {
+        tachi.setLastError("runtime detail");
+        try std.testing.expectEqual(case[1].int(), mapError(case[0]));
+        try std.testing.expectEqualStrings(if (case[2]) "runtime detail" else @errorName(case[0]), tachi.lastError());
+    }
 }
