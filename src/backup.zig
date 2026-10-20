@@ -256,13 +256,14 @@ fn appendInt64(arena: std.mem.Allocator, list: *std.ArrayList(i64), field: Field
 }
 
 const Writer = struct {
-    arena: std.mem.Allocator,
-    out: std.ArrayList(u8) = .empty,
+    out: std.Io.Writer.Allocating,
+
+    fn init(gpa: std.mem.Allocator) Writer {
+        return .{ .out = .init(gpa) };
+    }
 
     fn varint(self: *Writer, value: u64) !void {
-        var v = value;
-        while (v >= 0x80) : (v >>= 7) try self.out.append(self.arena, @as(u8, @truncate(v)) | 0x80);
-        try self.out.append(self.arena, @truncate(v));
+        try self.out.writer.writeUleb128(value);
     }
     fn key(self: *Writer, number: u32, wire: Wire) !void {
         try self.varint(@as(u64, number) << 3 | @backingInt(wire));
@@ -281,14 +282,12 @@ const Writer = struct {
     }
     fn float(self: *Writer, number: u32, value: f32) !void {
         try self.key(number, .fixed32);
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, @bitCast(value), .little);
-        try self.out.appendSlice(self.arena, &buf);
+        try self.out.writer.writeInt(u32, @bitCast(value), .little);
     }
     fn bytes(self: *Writer, number: u32, value: []const u8) !void {
         try self.key(number, .len);
         try self.varint(value.len);
-        try self.out.appendSlice(self.arena, value);
+        try self.out.writer.writeAll(value);
     }
     // Defaults are left out, as kotlinx.serialization does with encodeDefaults off.
     fn int64Opt(self: *Writer, number: u32, value: i64, default: i64) !void {
@@ -310,9 +309,10 @@ const Writer = struct {
         if (value) |v| try self.bytes(number, v);
     }
     fn message(self: *Writer, number: u32, value: anytype, comptime encodeFn: anytype) !void {
-        var inner: Writer = .{ .arena = self.arena };
+        var inner: Writer = .init(self.out.allocator);
+        defer inner.out.deinit();
         try encodeFn(&inner, value);
-        try self.bytes(number, inner.out.items);
+        try self.bytes(number, inner.out.written());
     }
 };
 
@@ -576,15 +576,23 @@ fn decodeTracking(bytes: []const u8) !Tracking {
 // ---- encoding ---------------------------------------------------------------------
 
 /// The backup as protobuf, without compression.
-pub fn encode(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
-    var w: Writer = .{ .arena = arena };
+pub fn encode(gpa: std.mem.Allocator, backup: Backup) ![]const u8 {
+    return encodeInner(gpa, backup) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => return err,
+    };
+}
+
+fn encodeInner(gpa: std.mem.Allocator, backup: Backup) ![]const u8 {
+    var w: Writer = .init(gpa);
+    defer w.out.deinit();
     for (backup.manga) |m| try w.message(1, m, encodeManga);
     for (backup.categories) |c| try w.message(2, c, encodeCategory);
     for (backup.sources) |s| try w.message(101, s, encodeSource);
     for (backup.preferences) |p| try w.message(104, p, encodePreference);
     for (backup.source_preferences) |p| try w.message(105, p, encodeSourcePreferences);
     for (backup.extension_stores) |p| try w.message(106, p, encodeExtensionStore);
-    return w.out.items;
+    return w.out.toOwnedSlice();
 }
 
 /// The backup as a `.tachibk` file: gzip around the protobuf.
@@ -1306,4 +1314,23 @@ test "protobuf reader rejects overflow, truncation and invalid field numbers" {
     try t.expectEqual(@as(?Field, null), try reader.next());
     var legacy: Reader = .init("\x02\x01x");
     try t.expectEqualStrings("x", try (try nextLegacy(&legacy, true)).?.bytes());
+}
+
+test "protobuf encoding releases nested messages on every allocation failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const encoded = try encode(gpa, .{
+                .manga = &.{.{ .source = std.math.minInt(i64), .url = "/m", .chapters = &.{.{ .url = "/c", .name = "C", .chapter_number = 1.5 }} }},
+                .preferences = &.{.{ .key = "negative", .value = .{ .int = -1 } }},
+            });
+            defer gpa.free(encoded);
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const decoded = try decode(arena.allocator(), encoded);
+            try std.testing.expectEqual(std.math.minInt(i64), decoded.manga[0].source);
+            try std.testing.expectEqual(@as(f32, 1.5), decoded.manga[0].chapters[0].chapter_number);
+            try std.testing.expectEqual(@as(i32, -1), decoded.preferences[0].value.int);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
