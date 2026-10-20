@@ -86,9 +86,7 @@ fn equal(a: []const u8, b: []const u8) bool {
 
 // ASCII case folding; non-ASCII UTF-8 bytes match literally.
 fn contains(text: []const u8, value: []const u8) bool {
-    if (value.len > text.len) return false;
-    for (0..text.len - value.len + 1) |i| if (equal(text[i..][0..value.len], value)) return true;
-    return false;
+    return std.ascii.findIgnoreCase(text, value) != null;
 }
 
 fn optionalContains(text: ?[]const u8, value: []const u8) bool {
@@ -178,15 +176,13 @@ fn dateDays(value: []const u8) ?i64 {
 }
 
 fn fieldNamed(name: []const u8) ?Field {
-    const aliases = .{ .{ "title", Field.title }, .{ "author", Field.author }, .{ "artist", Field.artist }, .{ "description", Field.description }, .{ "desc", Field.description }, .{ "genre", Field.genre }, .{ "tag", Field.genre }, .{ "source", Field.source }, .{ "src", Field.source }, .{ "notes", Field.notes }, .{ "note", Field.notes }, .{ "language", Field.language }, .{ "lang", Field.language }, .{ "source_id", Field.source_id }, .{ "sourceid", Field.source_id }, .{ "src_id", Field.source_id }, .{ "srcid", Field.source_id } };
-    inline for (aliases) |a| if (equal(name, a[0])) return a[1];
-    return null;
+    const aliases = std.StaticStringMapWithEql(Field, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{ .{ "title", .title }, .{ "author", .author }, .{ "artist", .artist }, .{ "description", .description }, .{ "desc", .description }, .{ "genre", .genre }, .{ "tag", .genre }, .{ "source", .source }, .{ "src", .source }, .{ "notes", .notes }, .{ "note", .notes }, .{ "language", .language }, .{ "lang", .language }, .{ "source_id", .source_id }, .{ "sourceid", .source_id }, .{ "src_id", .source_id }, .{ "srcid", .source_id } });
+    return aliases.get(name);
 }
 
 fn comparisonNamed(name: []const u8) ?Comparison {
-    const aliases = .{ .{ "id", Comparison.id }, .{ "added", Comparison.added }, .{ "fetchinterval", Comparison.fetch_interval }, .{ "fi", Comparison.fetch_interval }, .{ "nextupdate", Comparison.next_update }, .{ "nu", Comparison.next_update }, .{ "unread", Comparison.unread }, .{ "read", Comparison.read }, .{ "total", Comparison.total } };
-    inline for (aliases) |a| if (equal(name, a[0])) return a[1];
-    return null;
+    const aliases = std.StaticStringMapWithEql(Comparison, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{ .{ "id", .id }, .{ "added", .added }, .{ "fetchinterval", .fetch_interval }, .{ "fi", .fetch_interval }, .{ "nextupdate", .next_update }, .{ "nu", .next_update }, .{ "unread", .unread }, .{ "read", .read }, .{ "total", .total } });
+    return aliases.get(name);
 }
 
 const Token = struct {
@@ -489,4 +485,11 @@ test "query owns its input and only allocation errors escape parsing" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "long searches fold ASCII and preserve literal UTF-8 matching" {
+    const s: Subject = .{ .description = "A long description with enough text to use the optimized substring search: ÉCLAIR at the end" };
+    try check("description:Éclair", s, 0, true);
+    try check("description:éclair", s, 0, false);
+    try check("description:missing", s, 0, false);
 }
