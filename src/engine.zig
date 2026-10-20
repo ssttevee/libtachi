@@ -238,11 +238,13 @@ pub const Engine = struct {
 
     const covers_dir = "covers";
 
-    /// A title's cover on disk, relative to the library directory: its
-    /// custom cover, else its cached thumbnail. Null if neither is there yet;
-    /// fetch the thumbnail with a `cover` request.
+    /// A title's cover on disk, relative to the library directory (see
+    /// `pagePath`): its custom cover, a local title's own, else its cached
+    /// thumbnail. Null if none is there yet; fetch the thumbnail with a
+    /// `cover` request.
     pub fn coverPath(self: *Engine, arena: std.mem.Allocator, manga: library.Manga) !?[]const u8 {
         if (try self.customCover(arena, manga.id)) |path| return path;
+        if (manga.cover) |path| return path;
         const remote = manga.remote orelse return null;
         const url = remote.thumbnailUrl orelse return null;
         if (url.len == 0) return null;
