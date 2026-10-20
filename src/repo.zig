@@ -215,16 +215,18 @@ fn parseExtension(arena: Allocator, bytes: []const u8) Error!Extension {
         7 => e.content_warning = @fromBackingInt(std.math.cast(u8, f.int()) orelse return error.InvalidIndex),
         8 => {
             var s: Source = .{ .id = 0 };
+            var mirrors: std.ArrayList([]const u8) = .empty;
             var sd: Decoder = .init(f.str());
             while (try sd.next()) |sf| switch (sf.num) {
                 1 => s.id = sf.int(),
                 2 => s.name = sf.str(),
                 3 => s.lang = sf.str(),
                 4 => s.base_url = sf.str(),
-                5 => s.mirror_urls = try std.mem.concat(arena, []const u8, &.{ s.mirror_urls, &.{sf.str()} }),
+                5 => try mirrors.append(arena, sf.str()),
                 7 => s.message = sf.str(),
                 else => {},
             };
+            s.mirror_urls = mirrors.items;
             try sources.append(arena, s);
         },
         else => {},
@@ -605,6 +607,9 @@ test "parseIndex decodes a store with one extension" {
     try src.bytes(2, "Weeb Central");
     try src.bytes(3, "en");
     try src.bytes(4, "https://weebcentral.com");
+    try src.bytes(5, "https://mirror-one.example");
+    try src.bytes(5, "https://mirror-two.example");
+    try src.bytes(5, "https://mirror-one.example");
 
     var res: Pb = .{};
     defer res.deinit();
@@ -646,6 +651,10 @@ test "parseIndex decodes a store with one extension" {
     try testing.expectEqualStrings("en", e.lang());
     try testing.expectEqual(2131019126180322627, e.sources[0].id);
     try testing.expectEqualStrings("https://weebcentral.com", e.sources[0].base_url);
+    try testing.expectEqual(3, e.sources[0].mirror_urls.len);
+    try testing.expectEqualStrings("https://mirror-one.example", e.sources[0].mirror_urls[0]);
+    try testing.expectEqualStrings("https://mirror-two.example", e.sources[0].mirror_urls[1]);
+    try testing.expectEqualStrings("https://mirror-one.example", e.sources[0].mirror_urls[2]);
 }
 
 test "parseIndex rejects truncated input" {
