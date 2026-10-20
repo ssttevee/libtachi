@@ -63,6 +63,13 @@ pub const Queue = struct {
         if (item.failure) |f| gpa.free(f);
     }
 
+    /// Transfers the ID to the queue only once the list owns the item.
+    fn append(self: *Queue, gpa: std.mem.Allocator, id: []const u8, source: i64) !void {
+        const owned_id = try gpa.dupe(u8, id);
+        errdefer gpa.free(owned_id);
+        try self.items.append(gpa, .{ .chapter_id = owned_id, .source = source });
+    }
+
     fn path(engine: *Engine, a: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(a, &.{ engine.options.dir, "downloads", "queue.json" });
     }
@@ -86,7 +93,7 @@ pub const Queue = struct {
                 source = m.source_id orelse 0;
                 break :find;
             };
-            try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, id), .source = source });
+            try self.append(engine.gpa, id, source);
         }
     }
 
@@ -130,7 +137,7 @@ pub const Queue = struct {
                 if (std.mem.eql(u8, item.chapter_id, found.chapter.id)) break true;
             } else false;
             if (queued) continue;
-            try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, found.chapter.id), .source = found.source });
+            try self.append(engine.gpa, found.chapter.id, found.source);
             added += 1;
         }
         if (added > 0) try self.persist(engine);
@@ -374,4 +381,23 @@ test "the queue waits for Wi-Fi when downloads are Wi-Fi only" {
     try std.testing.expect(engine.queue.waitingForWifi());
     const entries = try engine.queue.snapshot(&engine, a);
     try std.testing.expectEqual(Status.queued, entries[0].status);
+}
+
+test "queue append releases owned IDs when list growth fails" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var queue: Queue = .{};
+            defer {
+                for (queue.items.items) |item| Queue.freeItem(gpa, item);
+                queue.items.deinit(gpa);
+            }
+            for (0..20) |i| {
+                try queue.append(gpa, "chapter", @intCast(i));
+                try std.testing.expectEqual(i + 1, queue.items.items.len);
+                try std.testing.expectEqualStrings("chapter", queue.items.items[i].chapter_id);
+                try std.testing.expectEqual(@as(i64, @intCast(i)), queue.items.items[i].source);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
