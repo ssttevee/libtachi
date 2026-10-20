@@ -21,6 +21,7 @@ extern "c" fn tachi_reap(pid: c_int, block: c_int) c_int;
 extern "c" fn tachi_eof(fd: c_int) void;
 pub extern "c" fn tachi_now_ms() u64;
 pub extern "c" fn tachi_rss_kib() usize;
+pub extern "c" fn tachi_free_bytes(path: [*:0]const u8) i64;
 
 // ---- protocol --------------------------------------------------------------------
 

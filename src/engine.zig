@@ -435,6 +435,24 @@ pub const Engine = struct {
         });
     }
 
+    /// New chapters library updates found since the updates feed was last
+    /// seen (Mihon's badge count).
+    pub fn unseenUpdates(self: *Engine) !u32 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        return (try self.loadSettings(arena_state.allocator())).updates.unseen;
+    }
+
+    /// Clears `unseenUpdates`, as opening Mihon's updates screen does.
+    pub fn markUpdatesSeen(self: *Engine) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        var s = try self.loadSettings(arena_state.allocator());
+        if (s.updates.unseen == 0) return;
+        s.updates.unseen = 0;
+        try self.saveSettings(s);
+    }
+
     /// Each title's latest read chapter, latest first.
     pub fn history(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.FeedItem {
         return views.history(arena, try self.store.load(arena), search);
@@ -1425,7 +1443,7 @@ pub const Engine = struct {
         const started = millis(self.io);
         var known: std.ArrayList(models.Chapter) = .empty;
         for (existing) |ch| if (ch.remote) |r| try known.append(a, r);
-        const update = (try job.call(.{ .update = .{ .source = source, .manga = remote, .chapters = known.items } })).update orelse return error.InvalidReply;
+        const update = (try job.call(.{ .update = .{ .source = source, .manga = remote, .chapters = known.items, .details = schedule.details } })).update orelse return error.InvalidReply;
         const fetched = millis(self.io);
         try self.io.checkCancel();
         const Edit = struct {
@@ -1521,7 +1539,7 @@ pub const Engine = struct {
         job.pages_total.store(queue.items.len, .release);
         for (queue.items, 1..) |book, done| {
             try self.io.checkCancel();
-            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters, .{ .window = window })) |fetched| {
+            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters, .{ .window = window, .details = s.update.metadata })) |fetched| {
                 updated += 1;
                 try new_chapters.appendSlice(a, fetched.new_chapters);
             } else |err| switch (err) {
@@ -1535,6 +1553,11 @@ pub const Engine = struct {
             job.pages_done.store(done, .release);
         }
         try self.autoDownload(job, new_chapters.items);
+        if (new_chapters.items.len > 0) {
+            var latest = try self.loadSettings(a);
+            latest.updates.unseen += @intCast(new_chapters.items.len);
+            try self.saveSettings(latest);
+        }
         job.result = .{
             .library_changed = updated > 0,
             .new_chapters = new_chapters.items,
@@ -1652,8 +1675,11 @@ fn sortByOrder(categories: []library.Category) void {
 }
 const Fetched = struct { manga_id: []const u8, new_chapters: []const []const u8 };
 
-/// How a fetch reschedules the title's next update.
+/// How a fetch reschedules the title's next update, and what it fetches.
 const Schedule = struct {
+    /// Details as well as chapters; library updates fetch details only
+    /// with `auto_update_metadata`.
+    details: bool = true,
     /// The user asked for it, so the schedule is estimated again.
     manual: bool = false,
     /// A library update's window, kept across its titles.

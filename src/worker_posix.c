@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -142,4 +143,13 @@ size_t tachi_rss_kib(void) {
     }
     fclose(f);
     return n;
+}
+
+/* Bytes free for an unprivileged writer on the filesystem holding `path`,
+ * or -1 if unknown. */
+int64_t tachi_free_bytes(const char *path) {
+    struct statvfs st;
+    if (statvfs(path, &st))
+        return -1;
+    return (int64_t)st.f_bavail * (int64_t)st.f_frsize;
 }

@@ -26,8 +26,12 @@ pub const Entry = struct {
 
 const Item = struct {
     chapter_id: []u8,
+    /// The chapter's source, which only one worker downloads from at a time.
+    source: i64 = 0,
     status: Status = .queued,
     failure: ?[]u8 = null,
+    /// The download running now, for its page progress.
+    job: ?*Job = null,
 };
 
 const Saved = struct { chapters: []const []const u8 = &.{} };
@@ -40,8 +44,6 @@ pub const Queue = struct {
     runner: ?Io.Future(void) = null,
     /// The runner ran out of work and returned; it still has to be awaited.
     runner_done: bool = false,
-    /// The download running now, for its page progress.
-    current: ?*Job = null,
 
     fn acquire(self: *Queue) void {
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
@@ -74,7 +76,15 @@ pub const Queue = struct {
             else => return err,
         };
         const saved = try std.json.parseFromSliceLeaky(Saved, a, bytes, models.parse_options);
-        for (saved.chapters) |id| try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, id) });
+        const lib = try engine.store.load(a);
+        for (saved.chapters) |id| {
+            var source: i64 = 0;
+            find: for (lib.manga) |m| for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id)) {
+                source = m.source_id orelse 0;
+                break :find;
+            };
+            try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, id), .source = source });
+        }
     }
 
     /// Saves the queue; the caller holds the lock.
@@ -96,27 +106,28 @@ pub const Queue = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const lib = try engine.store.load(a);
-        var chapters: std.ArrayList(library.Chapter) = .empty;
+        const Found = struct { chapter: library.Chapter, source: i64 };
+        var chapters: std.ArrayList(Found) = .empty;
         for (chapter_ids) |id| for (lib.manga) |m| {
-            if (m.local()) continue;
-            for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id) and !ch.downloaded()) try chapters.append(a, ch);
+            const source = m.source_id orelse continue;
+            for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id) and !ch.downloaded()) try chapters.append(a, .{ .chapter = ch, .source = source });
         };
         // Oldest first: the source lists newest first.
-        std.mem.sort(library.Chapter, chapters.items, {}, struct {
-            fn less(_: void, x: library.Chapter, y: library.Chapter) bool {
-                return x.source_order > y.source_order;
+        std.mem.sort(Found, chapters.items, {}, struct {
+            fn less(_: void, x: Found, y: Found) bool {
+                return x.chapter.source_order > y.chapter.source_order;
             }
         }.less);
         self.acquire();
         defer self.lock.unlock();
         try self.ensureLoaded(engine);
         var added: usize = 0;
-        for (chapters.items) |ch| {
+        for (chapters.items) |found| {
             const queued = for (self.items.items) |item| {
-                if (std.mem.eql(u8, item.chapter_id, ch.id)) break true;
+                if (std.mem.eql(u8, item.chapter_id, found.chapter.id)) break true;
             } else false;
             if (queued) continue;
-            try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, ch.id) });
+            try self.items.append(engine.gpa, .{ .chapter_id = try engine.gpa.dupe(u8, found.chapter.id), .source = found.source });
             added += 1;
         }
         if (added > 0) try self.persist(engine);
@@ -219,10 +230,10 @@ pub const Queue = struct {
         const out = try arena.alloc(Entry, self.items.items.len);
         for (self.items.items, out) |item, *e| {
             e.* = .{ .chapter_id = try arena.dupe(u8, item.chapter_id), .status = item.status, .failure = if (item.failure) |f| try arena.dupe(u8, f) else null };
-            if (item.status == .downloading) if (self.current) |job| {
+            if (item.job) |job| {
                 e.pages_done = job.pages_done.load(.acquire);
                 e.pages_total = job.pages_total.load(.acquire);
-            };
+            }
         }
         return out;
     }
@@ -234,37 +245,60 @@ pub const Queue = struct {
         return self.runner != null and !self.runner_done and !self.paused;
     }
 
+    /// Mihon's scheduling: up to `parallel_sources` sources at once, each
+    /// working through its own chapters in queue order.
     fn run(self: *Queue, engine: *Engine) void {
+        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+        defer arena.deinit();
+        const limit = blk: {
+            const s = engine.loadSettings(arena.allocator()) catch break :blk 1;
+            break :blk @max(1, s.downloads.parallel_sources);
+        };
+        var group: Io.Group = .init;
+        for (0..limit) |_| group.concurrent(engine.io, work, .{ self, engine }) catch {
+            // No more threads: the workers already started share the queue.
+            break;
+        };
+        group.await(engine.io) catch {};
+        self.acquire();
+        self.runner_done = true;
+        self.lock.unlock();
+    }
+
+    /// One worker: takes the first queued chapter whose source no other
+    /// worker is downloading from, until none is left.
+    fn work(self: *Queue, engine: *Engine) Io.Cancelable!void {
         while (true) {
             self.acquire();
             const next = for (self.items.items) |*item| {
-                if (item.status == .queued) break item;
+                if (item.status != .queued) continue;
+                const busy = for (self.items.items) |other| {
+                    if (other.status == .downloading and other.source == item.source) break true;
+                } else false;
+                if (!busy) break item;
             } else null;
             if (self.paused or next == null) {
-                self.runner_done = true;
                 self.lock.unlock();
                 return;
             }
-            next.?.status = .downloading;
             const id = engine.gpa.dupe(u8, next.?.chapter_id) catch {
-                next.?.status = .queued;
-                self.runner_done = true;
                 self.lock.unlock();
                 return;
             };
             defer engine.gpa.free(id);
             var job: Job = .{ .arena = .init(engine.gpa), .engine = engine, .request = .{ .download = id } };
             defer job.arena.deinit();
-            self.current = &job;
+            next.?.status = .downloading;
+            next.?.job = &job;
             self.lock.unlock();
-            const outcome = engine.downloadChapter(&job, id);
+            const outcome = if (enoughSpace(engine)) engine.downloadChapter(&job, id) else error.NotEnoughSpace;
             self.acquire();
-            self.current = null;
             const index = for (self.items.items, 0..) |item, i| {
                 if (std.mem.eql(u8, item.chapter_id, id)) break i;
             } else null;
             if (index) |i| {
                 const item = &self.items.items[i];
+                item.job = null;
                 if (outcome) |_| {
                     freeItem(engine.gpa, self.items.orderedRemove(i));
                     self.persist(engine) catch |err| log.warn("download queue not saved: {s}", .{@errorName(err)});
@@ -278,10 +312,19 @@ pub const Queue = struct {
                     },
                 }
             }
-            const canceled = if (outcome) |_| false else |err| err == error.Canceled;
-            if (canceled) self.runner_done = true;
             self.lock.unlock();
-            if (canceled) return;
+            if (outcome) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
         }
     }
+
+    /// Mihon refuses to start a chapter with less than 200 MiB free; an
+    /// unknown amount doesn't stop it.
+    fn enoughSpace(engine: *Engine) bool {
+        var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        const dir = std.fmt.bufPrintSentinel(&buf, "{s}", .{engine.options.dir}, 0) catch return true;
+        const free = @import("worker.zig").tachi_free_bytes(dir.ptr);
+        return free < 0 or free >= min_free_bytes;
+    }
+
+    pub const min_free_bytes = 200 << 20;
 };

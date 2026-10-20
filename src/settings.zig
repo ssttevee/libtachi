@@ -133,6 +133,9 @@ pub const Settings = struct {
         /// Categories for the upcoming feed (`pref_filter_upcoming_*_categories`).
         upcoming_categories: []const u32 = &.{},
         upcoming_exclude_categories: []const u32 = &.{},
+        /// New chapters found since the feed was last seen
+        /// (`library_unseen_updates_count`).
+        unseen: u32 = 0,
     };
 
     pub const file_name = "settings.json";
