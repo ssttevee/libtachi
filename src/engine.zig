@@ -50,6 +50,11 @@ pub const Request = union(enum) {
     update_library: struct { category: ?u32 = null },
     /// Downloads a library chapter, resuming pages an earlier attempt saved.
     download: []const u8,
+    /// Loads a chapter for reading as Mihon's online reader does: pages into
+    /// the chapter cache from `page` (it, the one before, then forward, then
+    /// backward), a failed page not stopping the rest. Downloaded and local
+    /// chapters are ready at once. Watch pages with `Job.pageStates`.
+    read: struct { chapter: []const u8, page: u32 = 0 },
     /// Deletes a chapter's downloaded pages, unless the deletion settings
     /// protect it; see `Engine.deleteDownloads`.
     delete_download: []const u8,
@@ -99,6 +104,9 @@ pub const Result = struct {
     update_errors: []const UpdateError = &.{},
     /// Titles a library update skipped by its rules.
     update_skipped: usize = 0,
+    /// A `read` chapter's page paths, relative to the library directory;
+    /// empty for a page that failed.
+    pages: []const []const u8 = &.{},
     /// A global search's results, in Mihon's order: sources with results
     /// first, then pinned ones, then by name.
     search: []const SearchResult = &.{},
@@ -219,6 +227,121 @@ pub const Engine = struct {
             .random_seed = s.library.random_seed,
             .match = try views.search(arena, lib, search, self.options.utc_offset_s),
         });
+    }
+
+    // ---- chapter cache -------------------------------------------------------------
+
+    /// Bytes the chapter cache (pages read online) holds.
+    pub fn chapterCacheBytes(self: *Engine) !u64 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        var total: u64 = 0;
+        for (try self.cachedChapters(arena_state.allocator())) |c| total += c.bytes;
+        return total;
+    }
+
+    /// Empties the chapter cache, as Mihon's "clear chapter cache" (and its
+    /// `auto_clear_chapter_cache` at launch).
+    pub fn clearChapterCache(self: *Engine) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        try Io.Dir.cwd().deleteTree(self.io, try std.fs.path.join(a, &.{ self.options.dir, cache_root }));
+    }
+
+    const cache_root = "cache/chapters";
+    const cache_pages = cache_root ++ "/pages";
+    /// Mihon's chapter cache size.
+    pub const chapter_cache_limit = 100 << 20;
+
+    const CachedChapter = struct { path: []const u8, bytes: u64, newest: i96 };
+
+    fn cachedChapters(self: *Engine, a: std.mem.Allocator) ![]CachedChapter {
+        const root = try std.fs.path.join(a, &.{ self.options.dir, cache_pages });
+        var dir = Io.Dir.cwd().openDir(self.io, root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        defer dir.close(self.io);
+        var list: std.ArrayList(CachedChapter) = .empty;
+        var walker = try dir.walk(a);
+        defer walker.deinit();
+        while (try walker.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            const top = entry.path[0 .. std.mem.indexOfScalar(u8, entry.path, std.fs.path.sep) orelse continue];
+            const st = try entry.dir.statFile(self.io, entry.basename, .{});
+            const chapter = for (list.items) |*c| {
+                if (std.mem.eql(u8, std.fs.path.basename(c.path), top)) break c;
+            } else blk: {
+                try list.append(a, .{ .path = try std.fs.path.join(a, &.{ root, top }), .bytes = 0, .newest = 0 });
+                break :blk &list.items[list.items.len - 1];
+            };
+            chapter.bytes += st.size;
+            chapter.newest = @max(chapter.newest, st.mtime.nanoseconds);
+        }
+        return list.items;
+    }
+
+    /// Deletes the least recently written chapters until the cache fits,
+    /// never `keep` (a chapter id being read).
+    fn trimChapterCache(self: *Engine, a: std.mem.Allocator, keep: []const u8) !void {
+        const chapters = try self.cachedChapters(a);
+        var total: u64 = 0;
+        for (chapters) |c| total += c.bytes;
+        if (total <= chapter_cache_limit) return;
+        std.mem.sort(CachedChapter, chapters, {}, struct {
+            fn less(_: void, x: CachedChapter, y: CachedChapter) bool {
+                return x.newest < y.newest;
+            }
+        }.less);
+        const kept = try std.fmt.allocPrint(a, "{x}", .{std.hash.Wyhash.hash(0, keep)});
+        for (chapters) |c| {
+            if (total <= chapter_cache_limit) break;
+            if (std.mem.eql(u8, std.fs.path.basename(c.path), kept)) continue;
+            Io.Dir.cwd().deleteTree(self.io, c.path) catch continue;
+            total -= c.bytes;
+        }
+    }
+
+    fn readChapter(self: *Engine, job: *Job, chapter_id: []const u8, start: u32) !void {
+        const a = job.arena.allocator();
+        const current = try self.store.load(a);
+        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
+        if (found.manga.local() or found.chapter.downloaded()) {
+            job.setPages(found.chapter.pages.len);
+            for (found.chapter.pages, 0..) |path, i| job.pageReady(i, path);
+            job.result = .{ .manga_id = found.manga.id, .pages = found.chapter.pages, .message = "Chapter ready" };
+            return;
+        }
+        const source = found.manga.source_id orelse return error.LocalChapter;
+        const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
+        job.fallback_source = source;
+        // Mihon keeps a chapter's page list in its cache.
+        const plan_path = try std.fmt.allocPrint(a, "{s}/{s}/plans/{x}.json", .{ self.options.dir, cache_root, std.hash.Wyhash.hash(0, chapter_id) });
+        const plan: []const models.ImageRequest = if (Io.Dir.cwd().readFileAlloc(self.io, plan_path, a, .limited(16 << 20))) |bytes|
+            try std.json.parseFromSliceLeaky([]const models.ImageRequest, a, bytes, models.parse_options)
+        else |_| blk: {
+            const fetched = (try job.call(.{ .image_requests = .{ .source = source, .chapter = remote } })).image_requests;
+            Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(plan_path).?) catch {};
+            library.writeJsonAtomic(a, self.io, plan_path, fetched) catch |err| log.warn("page list not cached: {s}", .{@errorName(err)});
+            break :blk fetched;
+        };
+        if (plan.len == 0) return error.EmptyChapter;
+        job.setPages(plan.len);
+        const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
+            .dir = self.options.dir,
+            .chapter_id = chapter_id,
+            .ca_file = self.options.ca_file,
+            .fallback = .{ .context = job, .fetch = Job.fetchFallback },
+            .progress = .{ .context = job, .report = Job.reportPages, .page = Job.reportReady, .failed = Job.reportFailed },
+            .root = cache_pages,
+            .order = try downloads.readingOrder(a, plan.len, start),
+            // Mihon's reader has no retry loop; a failed page is retried by hand.
+            .retry_ms = &.{},
+            .keep_going = true,
+        });
+        self.trimChapterCache(a, chapter_id) catch |err| log.warn("chapter cache not trimmed: {s}", .{@errorName(err)});
+        job.result = .{ .manga_id = found.manga.id, .pages = chapter.pages, .message = "Chapter ready" };
     }
 
     /// A title's chapters as its chapter list flags show them.
@@ -1114,6 +1237,7 @@ pub const Engine = struct {
             .global_search => |c| try self.globalSearch(job, c.query, c.pinned_only, c.sources),
             .migrate => |c| try self.migrate(job, c.from, c.source, c.manga, c.replace),
             .download => |id| try self.downloadChapter(job, id),
+            .read => |r| try self.readChapter(job, r.chapter, r.page),
             .delete_download => |id| {
                 const deleted = try self.deleteDownloads(&.{id});
                 job.result = .{ .library_changed = deleted > 0, .message = if (deleted > 0) "Download deleted" else "Download kept by the deletion settings" };
@@ -1355,6 +1479,7 @@ pub const Engine = struct {
         const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
         const source = found.manga.source_id orelse return error.LocalChapter;
         const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
+        job.fallback_source = source;
         const plan = (job.call(.{ .image_requests = .{ .source = source, .chapter = remote } }) catch |err| {
             if (err == error.ExtensionError and std.mem.endsWith(u8, tachi.lastError(), "HTTP error 404")) {
                 job.failure = "This chapter is no longer on the source. Refresh chapters to update the list.";
@@ -1374,6 +1499,7 @@ pub const Engine = struct {
             .ca_file = self.options.ca_file,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages },
+            .reuse = cache_pages,
         });
         const s = chapter.stats;
         log.info("chapter pages={d}/{d} resumed={d} native={d} bytes={d} network_ms={d} disk_ms={d} elapsed_ms={d} planning_ms={d} worker_start_ms={d} total_elapsed_ms={d}", .{ job.pages_done.load(.acquire), plan.len, s.resumed, s.native, s.bytes, s.network_ms, s.disk_ms, s.elapsed_ms, planning_ms, job.start_ms, millis(self.io) - chapter_started });
@@ -1484,6 +1610,11 @@ pub const Job = struct {
     extension_len: usize = 0,
     pages_done: std.atomic.Value(usize) = .init(0),
     pages_total: std.atomic.Value(usize) = .init(0),
+    /// A `read` job's pages so far; read them with `pageStates`.
+    page_lock: std.atomic.Mutex = .unlocked,
+    page_states: []PageState = &.{},
+    /// The source pages that need the JVM are fetched through.
+    fallback_source: i64 = 0,
     /// A global search's results so far; read them with `searchResults`.
     search_lock: std.atomic.Mutex = .unlocked,
     search_partial: std.ArrayList(SearchResult) = .empty,
@@ -1568,12 +1699,53 @@ pub const Job = struct {
     fn fetchFallback(context: *anyopaque, gpa: std.mem.Allocator, request: models.ImageRequest, reason: []const u8) anyerror![]u8 {
         _ = reason;
         const self: *Job = @ptrCast(@alignCast(context));
-        const source = switch (self.request) {
-            .download => |id| (findChapter(try self.engine.store.load(self.arena.allocator()), id) orelse return error.UnknownChapter).manga.source_id.?,
-            else => unreachable,
-        };
-        const reply = try self.call(.{ .image = .{ .source = source, .page = request.page, .url = request.url, .cookies = request.cookies } });
+        const reply = try self.call(.{ .image = .{ .source = self.fallback_source, .page = request.page, .url = request.url, .cookies = request.cookies } });
         return gpa.dupe(u8, reply.image orelse return error.InvalidImageResponse);
+    }
+
+    pub const PageState = union(enum) {
+        loading,
+        /// Path relative to the library directory; see `Engine.pagePath`.
+        ready: []const u8,
+        failed: []const u8,
+    };
+
+    /// A `read` job's pages so far; valid until `deinit`.
+    pub fn pageStates(self: *Job, arena: std.mem.Allocator) ![]PageState {
+        while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.page_lock.unlock();
+        return arena.dupe(PageState, self.page_states);
+    }
+
+    fn setPages(self: *Job, count: usize) void {
+        const states = self.arena.allocator().alloc(PageState, count) catch return;
+        @memset(states, .loading);
+        while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.page_lock.unlock();
+        self.page_states = states;
+    }
+
+    fn pageReady(self: *Job, index: usize, path: []const u8) void {
+        while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.page_lock.unlock();
+        if (index < self.page_states.len) self.page_states[index] = .{ .ready = path };
+    }
+
+    fn reportReady(context: *anyopaque, index: usize, path: []const u8) void {
+        const self: *Job = @ptrCast(@alignCast(context));
+        self.pageReady(index, path);
+    }
+
+    fn reportFailed(context: *anyopaque, index: usize, err: anyerror) void {
+        const self: *Job = @ptrCast(@alignCast(context));
+        const detail = tachi.lastError();
+        const message = (if (detail.len > 0)
+            std.fmt.allocPrint(self.arena.allocator(), "{s}: {s}", .{ @errorName(err), detail })
+        else
+            std.fmt.allocPrint(self.arena.allocator(), "{s}", .{@errorName(err)})) catch @errorName(err);
+        while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.page_lock.unlock();
+        if (index < self.page_states.len) self.page_states[index] = .{ .failed = message };
     }
 
     fn reportPages(context: *anyopaque, done: usize, total: usize) void {
@@ -1885,4 +2057,74 @@ test "engine searches sources globally and migrates a title as Mihon does" {
         try std.testing.expectEqual(ch.number <= 2, ch.read);
         try std.testing.expectEqual(ch.number == 2, ch.bookmark);
     }
+}
+
+test "engine reads a chapter online through the chapter cache" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+
+    const Fake = struct {
+        plans: usize = 0,
+        images: usize = 0,
+        fail_page: ?i32 = 1,
+        fn run(ptr: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (status) |s| s.ready(s.context);
+            return switch (c) {
+                .image_requests => blk: {
+                    self.plans += 1;
+                    const plan = try arena.alloc(models.ImageRequest, 3);
+                    for (plan, 0..) |*r, i| r.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(arena, "/p{d}", .{i}) }, .url = "jvm://only", .method = "GET", .headers = &.{} };
+                    break :blk .{ .image_requests = plan };
+                },
+                .image => |img| blk: {
+                    if (self.fail_page) |f| if (img.page.index == f) break :blk error.ExtensionError;
+                    self.images += 1;
+                    break :blk .{ .image = try arena.dupe(u8, "\x89PNG\r\n\x1a\nfake") };
+                },
+                else => error.Unexpected,
+            };
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+    };
+    var fake: Fake = .{};
+    const backend: be.Backend = .{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .warm = Fake.yes, .cancel = Fake.none, .release = Fake.none, .idle = Fake.none } };
+    var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "7:/m", .title = "M", .source_id = 7, .remote = .{ .url = "/m", .title = "M" }, .chapters = &.{
+        .{ .id = "7:/c", .title = "Chapter 1", .remote = .{ .url = "/c", .name = "Chapter 1" } },
+    } }} });
+
+    const read = try Job.start(&engine, .{ .read = .{ .chapter = "7:/c", .page = 2 } });
+    read.join();
+    try std.testing.expect(read.failure == null);
+    const states = try read.pageStates(a);
+    try std.testing.expect(states[0] == .ready and states[1] == .failed and states[2] == .ready);
+    try std.testing.expectEqual(0, read.result.pages[1].len);
+    read.deinit();
+    try std.testing.expect(try engine.chapterCacheBytes() > 0);
+
+    // The page list is cached; a retry fetches only the missing page, and
+    // a download copies the cached pages.
+    fake.fail_page = null;
+    const again = try Job.start(&engine, .{ .read = .{ .chapter = "7:/c" } });
+    again.join();
+    again.deinit();
+    try std.testing.expectEqual(1, fake.plans);
+    try std.testing.expectEqual(3, fake.images);
+    const download = try Job.start(&engine, .{ .download = "7:/c" });
+    download.join();
+    try std.testing.expect(download.failure == null);
+    download.deinit();
+    try std.testing.expectEqual(3, fake.images);
+    try engine.clearChapterCache();
+    try std.testing.expectEqual(0, try engine.chapterCacheBytes());
 }

@@ -73,6 +73,11 @@ pub const PageStore = struct {
     folder: []const u8,
 
     pub fn init(arena: std.mem.Allocator, io: Io, dir: []const u8, chapter_id: []const u8, plan: []const ImageRequest) !PageStore {
+        return initIn(arena, io, dir, "downloads", chapter_id, plan);
+    }
+
+    /// A store under `root` (relative to `dir`) instead of `downloads`.
+    pub fn initIn(arena: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8, plan: []const ImageRequest) !PageStore {
         var identity = std.hash.Wyhash.init(0);
         identity.update(std.mem.asBytes(&plan.len));
         for (plan) |request| {
@@ -88,7 +93,7 @@ pub const PageStore = struct {
             }
             identity.update(&.{0});
         }
-        const folder = try std.fmt.allocPrint(arena, "downloads/{x}/{x}", .{ std.hash.Wyhash.hash(0, chapter_id), identity.final() });
+        const folder = try std.fmt.allocPrint(arena, "{s}/{x}/{x}", .{ root, std.hash.Wyhash.hash(0, chapter_id), identity.final() });
         const store: PageStore = .{ .arena = arena, .io = io, .dir = dir, .folder = folder };
         try Io.Dir.cwd().createDirPath(io, try store.absolute(folder));
         return store;
@@ -259,7 +264,14 @@ pub const Fallback = struct {
 pub const Progress = struct {
     context: *anyopaque,
     report: *const fn (context: *anyopaque, done: usize, total: usize) void,
+    /// Each page as it is saved: its index and path relative to the library directory.
+    page: ?*const fn (context: *anyopaque, index: usize, path: []const u8) void = null,
+    /// Each page that failed for good, with `keep_going`.
+    failed: ?*const fn (context: *anyopaque, index: usize, err: anyerror) void = null,
 };
+
+/// Mihon's waits before retrying a page: three retries, 2, 4 and 8 seconds.
+pub const mihon_retry_ms: []const u32 = &.{ 2000, 4000, 8000 };
 
 pub const Options = struct {
     /// The library directory; pages are saved under its `downloads/`.
@@ -272,6 +284,18 @@ pub const Options = struct {
     progress: ?Progress = null,
     /// Deadline for each native page.
     page_timeout: Io.Duration = .fromSeconds(120),
+    /// Where pages go, relative to `dir`.
+    root: []const u8 = "downloads",
+    /// The order to fetch pages in, as indexes; null is first to last.
+    order: ?[]const usize = null,
+    /// Waits before each retry of a failed page.
+    retry_ms: []const u32 = mihon_retry_ms,
+    /// Another store whose complete pages are copied instead of fetched, as
+    /// Mihon's downloader reuses the reader's cache.
+    reuse: ?[]const u8 = null,
+    /// Go on past a page that failed for good, as a reader does; its path
+    /// is left empty.
+    keep_going: bool = false,
 };
 
 pub const Stats = struct {
@@ -291,77 +315,146 @@ pub const Chapter = struct {
     stats: Stats,
 };
 
-/// Downloads every page of `plan`, resuming pages an earlier attempt saved.
-/// Cancel through `io`: pages saved so far stay for the next attempt.
+/// Downloads every page of `plan`, resuming pages an earlier attempt saved
+/// and retrying a failed page as Mihon does. Cancel through `io`: pages
+/// saved so far stay for the next attempt.
 pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, plan: []const ImageRequest, options: Options) !Chapter {
     if (plan.len == 0) return error.EmptyChapter;
-    const store = try PageStore.init(arena, io, options.dir, options.chapter_id, plan);
+    const store = try PageStore.initIn(arena, io, options.dir, options.root, options.chapter_id, plan);
+    const reuse: ?PageStore = if (options.reuse) |root| try PageStore.initIn(arena, io, options.dir, root, options.chapter_id, plan) else null;
     const paths = try arena.alloc([]const u8, plan.len);
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-    var https_ready = false;
-    var limiter = Limiter.init(gpa);
-    defer limiter.deinit();
+    var fetcher: Fetcher = .{ .gpa = gpa, .io = io, .store = store, .options = options, .client = .{ .allocator = gpa, .io = io }, .limiter = .init(gpa) };
+    defer fetcher.client.deinit();
+    defer fetcher.limiter.deinit();
     const started = millis(io);
     var stats: Stats = .{};
-    for (plan, 0..) |request, i| {
+    const order = options.order orelse blk: {
+        const all = try arena.alloc(usize, plan.len);
+        for (all, 0..) |*i, n| i.* = n;
+        break :blk all;
+    };
+    for (order, 1..) |i, done| {
         try io.checkCancel();
         if (try store.complete(i)) |path| {
             paths[i] = path;
             stats.resumed += 1;
+        } else if (if (reuse) |r| try r.complete(i) else null) |cached| {
+            const bytes = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ options.dir, cached }), gpa, .limited(max_image));
+            defer gpa.free(bytes);
+            paths[i] = try store.put(i, bytes);
+            stats.resumed += 1;
         } else {
-            try limiter.wait(io, request.rates);
-            var transfer: ?Transfer = null;
-            var reason = request.fallback orelse "unsupported URI or method";
-            if (nativeEligible(request)) {
-                if (!https_ready and std.mem.startsWith(u8, request.url, "https://")) {
-                    // A given CA file is the only trust source: setting `now`
-                    // stops the client rescanning the system's roots.
-                    if (options.ca_file) |ca| {
-                        const now = Io.Clock.real.now(io);
-                        try client.ca_bundle.addCertsFromFilePath(gpa, io, now, Io.Dir.cwd(), ca);
-                        client.now = now;
-                    }
-                    https_ready = true;
-                }
-                transfer = fetchTimed(&client, store, i, request, options.page_timeout) catch |err| switch (err) {
-                    error.JvmRedirect, error.JvmChallengeOrAuthentication, error.JvmContentEncoding, error.JvmImageResponse => blk: {
-                        reason = @errorName(err);
-                        break :blk null;
+            var attempt: usize = 0;
+            const t = while (true) : (attempt += 1) {
+                break fetcher.page(plan, i, &stats) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => {
+                        if (attempt >= options.retry_ms.len or err == error.NeedsJvm) {
+                            if (!options.keep_going) return err;
+                            paths[i] = "";
+                            if (options.progress) |progress| if (progress.failed) |report| report(progress.context, i, err);
+                            break null;
+                        }
+                        log.info("page {d}/{d} failed ({s}); retrying in {d} ms", .{ i + 1, plan.len, @errorName(err), options.retry_ms[attempt] });
+                        try io.sleep(.fromMilliseconds(options.retry_ms[attempt]), .awake);
+                        continue;
                     },
-                    else => return err,
                 };
-                if (transfer != null) stats.native += 1;
-            }
-            if (transfer == null) {
-                const fallback = options.fallback orelse return error.NeedsJvm;
-                log.info("page {d}/{d} JVM fallback: {s}", .{ i + 1, plan.len, reason });
-                // Native requests are outside the JVM client's rate window:
-                // drain it before switching clients, and again before returning.
-                var drain: u64 = 0;
-                for (request.rates) |rate| drain = @max(drain, rate.initialWaitMs);
-                if (drain > 0) try io.sleep(.fromMilliseconds(@intCast(drain)), .awake);
-                const network_start = millis(io);
-                const bytes = try fallback.fetch(fallback.context, gpa, request, reason);
-                defer gpa.free(bytes);
-                if (bytes.len > max_image) return error.ImageTooLarge;
-                const disk_start = millis(io);
-                const path = try store.put(i, bytes);
-                transfer = .{ .path = path, .bytes = bytes.len, .network_ms = disk_start - network_start, .disk_ms = millis(io) - disk_start };
-                if (drain > 0) try io.sleep(.fromMilliseconds(@intCast(drain)), .awake);
-            }
-            const t = transfer.?;
-            paths[i] = t.path;
-            stats.bytes += t.bytes;
-            stats.network_ms += t.network_ms;
-            stats.disk_ms += t.disk_ms;
-            log.info("page {d}/{d} bytes={d} network_ms={d} head_ms={d} body_ms={d} disk_ms={d}", .{ i + 1, plan.len, t.bytes, t.network_ms, t.head_ms, t.network_ms - t.head_ms, t.disk_ms });
+            };
+            const transfer = t orelse continue;
+            paths[i] = transfer.path;
+            stats.bytes += transfer.bytes;
+            stats.network_ms += transfer.network_ms;
+            stats.disk_ms += transfer.disk_ms;
+            log.info("page {d}/{d} bytes={d} network_ms={d} head_ms={d} body_ms={d} disk_ms={d}", .{ i + 1, plan.len, transfer.bytes, transfer.network_ms, transfer.head_ms, transfer.network_ms - transfer.head_ms, transfer.disk_ms });
         }
-        if (options.progress) |progress| progress.report(progress.context, i + 1, plan.len);
+        if (options.progress) |progress| {
+            if (progress.page) |report| report(progress.context, i, paths[i]);
+            progress.report(progress.context, done, plan.len);
+        }
     }
     try io.checkCancel();
     stats.elapsed_ms = millis(io) - started;
     return .{ .pages = paths, .stats = stats };
+}
+
+const Fetcher = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: PageStore,
+    options: Options,
+    client: std.http.Client,
+    limiter: Limiter,
+    https_ready: bool = false,
+
+    /// One attempt at page `i`: natively if it can be, else through the JVM.
+    fn page(self: *Fetcher, plan: []const ImageRequest, i: usize, stats: *Stats) !Transfer {
+        const io = self.io;
+        const request = plan[i];
+        try self.limiter.wait(io, request.rates);
+        var reason = request.fallback orelse "unsupported URI or method";
+        if (nativeEligible(request)) {
+            if (!self.https_ready and std.mem.startsWith(u8, request.url, "https://")) {
+                // A given CA file is the only trust source: setting `now`
+                // stops the client rescanning the system's roots.
+                if (self.options.ca_file) |ca| {
+                    const now = Io.Clock.real.now(io);
+                    try self.client.ca_bundle.addCertsFromFilePath(self.gpa, io, now, Io.Dir.cwd(), ca);
+                    self.client.now = now;
+                }
+                self.https_ready = true;
+            }
+            if (fetchTimed(&self.client, self.store, i, request, self.options.page_timeout)) |transfer| {
+                stats.native += 1;
+                return transfer;
+            } else |err| switch (err) {
+                error.JvmRedirect, error.JvmChallengeOrAuthentication, error.JvmContentEncoding, error.JvmImageResponse => reason = @errorName(err),
+                else => return err,
+            }
+        }
+        const fallback = self.options.fallback orelse return error.NeedsJvm;
+        log.info("page {d}/{d} JVM fallback: {s}", .{ i + 1, plan.len, reason });
+        // Native requests are outside the JVM client's rate window:
+        // drain it before switching clients, and again before returning.
+        var drain: u64 = 0;
+        for (request.rates) |rate| drain = @max(drain, rate.initialWaitMs);
+        if (drain > 0) try io.sleep(.fromMilliseconds(@intCast(drain)), .awake);
+        const network_start = millis(io);
+        const bytes = try fallback.fetch(fallback.context, self.gpa, request, reason);
+        defer self.gpa.free(bytes);
+        if (bytes.len > max_image) return error.ImageTooLarge;
+        const disk_start = millis(io);
+        const path = try self.store.put(i, bytes);
+        const transfer: Transfer = .{ .path = path, .bytes = bytes.len, .network_ms = disk_start - network_start, .disk_ms = millis(io) - disk_start };
+        if (drain > 0) try io.sleep(.fromMilliseconds(@intCast(drain)), .awake);
+        return transfer;
+    }
+};
+
+/// Mihon's reader order from page `start`: it, the one before, then the
+/// rest forward, then the earlier ones backward.
+pub fn readingOrder(arena: std.mem.Allocator, len: usize, start: usize) ![]usize {
+    const order = try arena.alloc(usize, len);
+    if (len == 0) return order;
+    const s = @min(start, len - 1);
+    var n: usize = 0;
+    order[n] = s;
+    n += 1;
+    if (s > 0) {
+        order[n] = s - 1;
+        n += 1;
+    }
+    for (s + 1..len) |i| {
+        order[n] = i;
+        n += 1;
+    }
+    var i = s;
+    while (i > 1) {
+        i -= 1;
+        order[n] = i - 1;
+        n += 1;
+    }
+    return order;
 }
 
 // ---- tests ---------------------------------------------------------------------
@@ -571,4 +664,13 @@ test "downloadChapter sends pages natively, hands redirects to the JVM and resum
     // Every page is saved now, so a retry sends nothing.
     const again = try downloadChapter(std.testing.allocator, a, io, plan, .{ .dir = root, .chapter_id = "1:/c" });
     try std.testing.expectEqual(3, again.stats.resumed);
+}
+
+test "reading order starts at the page, goes back one, forward, then back" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualSlices(usize, &.{ 3, 2, 4, 5, 1, 0 }, try readingOrder(a, 6, 3));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, try readingOrder(a, 3, 0));
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, try readingOrder(a, 3, 9));
 }
