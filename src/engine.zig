@@ -50,6 +50,9 @@ pub const Request = union(enum) {
     update_library: struct { category: ?u32 = null },
     /// Downloads a library chapter, resuming pages an earlier attempt saved.
     download: []const u8,
+    /// Fetches a thumbnail through its source into the cover cache, as for
+    /// a title's cover or a browse result; `Result.cover` is its path.
+    cover: struct { source: i64, url: []const u8 },
     /// Loads a chapter for reading as Mihon's online reader does: pages into
     /// the chapter cache from `page` (it, the one before, then forward, then
     /// backward), a failed page not stopping the rest. Downloaded and local
@@ -104,6 +107,8 @@ pub const Result = struct {
     update_errors: []const UpdateError = &.{},
     /// Titles a library update skipped by its rules.
     update_skipped: usize = 0,
+    /// A `cover` request's image, relative to the library directory.
+    cover: ?[]const u8 = null,
     /// A `read` chapter's page paths, relative to the library directory;
     /// empty for a page that failed.
     pages: []const []const u8 = &.{},
@@ -227,6 +232,60 @@ pub const Engine = struct {
             .random_seed = s.library.random_seed,
             .match = try views.search(arena, lib, search, self.options.utc_offset_s),
         });
+    }
+
+    // ---- covers ------------------------------------------------------------------
+
+    const covers_dir = "covers";
+
+    /// A title's cover on disk, relative to the library directory: its
+    /// custom cover, else its cached thumbnail. Null if neither is there yet;
+    /// fetch the thumbnail with a `cover` request.
+    pub fn coverPath(self: *Engine, arena: std.mem.Allocator, manga: library.Manga) !?[]const u8 {
+        if (try self.customCover(arena, manga.id)) |path| return path;
+        const remote = manga.remote orelse return null;
+        const url = remote.thumbnailUrl orelse return null;
+        if (url.len == 0) return null;
+        return self.cachedCover(arena, url);
+    }
+
+    /// Sets a title's custom cover, as Mihon's "edit cover".
+    pub fn setCustomCover(self: *Engine, manga_id: []const u8, image: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const ext = downloads.imageExtension(image) orelse return error.UnsupportedImageFormat;
+        try self.removeCustomCover(manga_id);
+        const path = try std.fmt.allocPrint(a, "{s}/{s}/custom/{x}.{s}", .{ self.options.dir, covers_dir, std.hash.Wyhash.hash(0, manga_id), ext });
+        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
+        try library.writeAtomic(a, self.io, path, image);
+    }
+
+    pub fn removeCustomCover(self: *Engine, manga_id: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        while (try self.customCover(a, manga_id)) |path| {
+            try Io.Dir.cwd().deleteFile(self.io, try std.fs.path.join(a, &.{ self.options.dir, path }));
+        }
+    }
+
+    fn customCover(self: *Engine, a: std.mem.Allocator, manga_id: []const u8) !?[]const u8 {
+        return self.findImage(a, try std.fmt.allocPrint(a, "{s}/custom/{x}", .{ covers_dir, std.hash.Wyhash.hash(0, manga_id) }));
+    }
+
+    fn cachedCover(self: *Engine, a: std.mem.Allocator, url: []const u8) !?[]const u8 {
+        return self.findImage(a, try std.fmt.allocPrint(a, "{s}/{x}", .{ covers_dir, std.hash.Wyhash.hash(0, url) }));
+    }
+
+    /// `stem` plus whichever image extension exists, relative to the library directory.
+    fn findImage(self: *Engine, a: std.mem.Allocator, stem: []const u8) !?[]const u8 {
+        for (downloads.image_extensions) |ext| {
+            const path = try std.fmt.allocPrint(a, "{s}.{s}", .{ stem, ext });
+            Io.Dir.cwd().access(self.io, try std.fs.path.join(a, &.{ self.options.dir, path }), .{}) catch continue;
+            return path;
+        }
+        return null;
     }
 
     // ---- chapter cache -------------------------------------------------------------
@@ -1238,6 +1297,21 @@ pub const Engine = struct {
             .migrate => |c| try self.migrate(job, c.from, c.source, c.manga, c.replace),
             .download => |id| try self.downloadChapter(job, id),
             .read => |r| try self.readChapter(job, r.chapter, r.page),
+            .cover => |c| {
+                const a = job.arena.allocator();
+                if (try self.cachedCover(a, c.url)) |path| {
+                    job.result = .{ .cover = path, .message = "Cover ready" };
+                    return;
+                }
+                job.fallback_source = c.source;
+                const bytes = try Job.fetchFallback(job, a, .{ .page = .{ .index = 0, .imageUrl = c.url }, .url = c.url, .method = "GET", .headers = &.{} }, "cover");
+                const ext = downloads.imageExtension(bytes) orelse return error.UnsupportedImageFormat;
+                const path = try std.fmt.allocPrint(a, "{s}/{x}.{s}", .{ covers_dir, std.hash.Wyhash.hash(0, c.url), ext });
+                const absolute = try std.fs.path.join(a, &.{ self.options.dir, path });
+                try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(absolute).?);
+                try library.writeAtomic(a, self.io, absolute, bytes);
+                job.result = .{ .cover = path, .message = "Cover ready" };
+            },
             .delete_download => |id| {
                 const deleted = try self.deleteDownloads(&.{id});
                 job.result = .{ .library_changed = deleted > 0, .message = if (deleted > 0) "Download deleted" else "Download kept by the deletion settings" };
@@ -2127,4 +2201,49 @@ test "engine reads a chapter online through the chapter cache" {
     try std.testing.expectEqual(3, fake.images);
     try engine.clearChapterCache();
     try std.testing.expectEqual(0, try engine.chapterCacheBytes());
+}
+
+test "engine caches thumbnails and prefers a custom cover" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Fake = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (status) |s| s.ready(s.context);
+            self.calls += 1;
+            return switch (c) {
+                .image => .{ .image = try arena.dupe(u8, "RIFF\x10\x00\x00\x00WEBPVP8 fake") },
+                else => error.Unexpected,
+            };
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+    };
+    var fake: Fake = .{};
+    const backend: be.Backend = .{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .warm = Fake.yes, .cancel = Fake.none, .release = Fake.none, .idle = Fake.none } };
+    var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    const manga: library.Manga = .{ .id = "7:/m", .title = "M", .source_id = 7, .remote = .{ .url = "/m", .title = "M", .thumbnailUrl = "https://x/c.webp" } };
+    try std.testing.expect(try engine.coverPath(a, manga) == null);
+    for (0..2) |_| {
+        const job = try Job.start(&engine, .{ .cover = .{ .source = 7, .url = "https://x/c.webp" } });
+        job.join();
+        try std.testing.expect(job.failure == null);
+        try std.testing.expect(std.mem.endsWith(u8, job.result.cover.?, ".webp"));
+        job.deinit();
+    }
+    try std.testing.expectEqual(1, fake.calls);
+    const cached = (try engine.coverPath(a, manga)).?;
+    try engine.setCustomCover("7:/m", "\x89PNG\r\n\x1a\ncustom");
+    try std.testing.expect(std.mem.indexOf(u8, (try engine.coverPath(a, manga)).?, "custom") != null);
+    try engine.removeCustomCover("7:/m");
+    try std.testing.expectEqualStrings(cached, (try engine.coverPath(a, manga)).?);
 }

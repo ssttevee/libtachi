@@ -107,14 +107,14 @@ pub const PageStore = struct {
     }
     /// The saved page, if a complete image is there.
     pub fn complete(self: PageStore, index: usize) !?[]const u8 {
-        for ([_][]const u8{ "png", "jpg" }) |ext| {
+        for (image_extensions) |ext| {
             const relative_path = try self.relative(index, ext);
             const file = Io.Dir.cwd().openFile(self.io, try self.absolute(relative_path), .{}) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
             };
             defer file.close(self.io);
-            var header: [8]u8 = undefined;
+            var header: [16]u8 = undefined;
             const n = try file.readPositionalAll(self.io, &header, 0);
             if (imageExtension(header[0..n])) |actual| {
                 if (std.mem.eql(u8, actual, ext) and try file.length(self.io) > 8) return relative_path;
@@ -142,12 +142,24 @@ pub const PageStore = struct {
     }
 };
 
-/// "png" or "jpg" from an image's signature; other formats are not supported.
+/// The file extension for an image's signature: the formats Mihon's
+/// reader decodes. Null for anything else (an HTML error page, say).
 pub fn imageExtension(bytes: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return "png";
     if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return "jpg";
+    if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) return "gif";
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "webp";
+    if (std.mem.startsWith(u8, bytes, "\xff\x0a") or std.mem.startsWith(u8, bytes, "\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")) return "jxl";
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[4..8], "ftyp")) {
+        const brand = bytes[8..12];
+        if (std.mem.eql(u8, brand, "avif") or std.mem.eql(u8, brand, "avis")) return "avif";
+        if (std.mem.eql(u8, brand, "heic") or std.mem.eql(u8, brand, "heix") or std.mem.eql(u8, brand, "mif1")) return "heif";
+    }
     return null;
 }
+
+/// Every extension `imageExtension` gives.
+pub const image_extensions = [_][]const u8{ "png", "jpg", "gif", "webp", "jxl", "avif", "heif" };
 
 fn millis(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
