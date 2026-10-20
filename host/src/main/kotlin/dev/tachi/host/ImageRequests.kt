@@ -31,11 +31,27 @@ data class ImageRequestDto(
 
 /** Probe request behavior without opening a connection or executing limiter waits. */
 object ImageRequests {
-    suspend fun plan(source: HttpSource, chapter: SChapter): List<ImageRequestDto> =
-        source.getPageList(chapter).map { page ->
-            if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
+    suspend fun plan(source: HttpSource, chapter: SChapter): List<ImageRequestDto> {
+        val started = System.nanoTime()
+        val pages = source.getPageList(chapter)
+        val listed = System.nanoTime()
+        var imageUrlNanos = 0L
+        val plans = pages.map { page ->
+            if (page.imageUrl == null) {
+                val before = System.nanoTime()
+                page.imageUrl = source.getImageUrl(page)
+                imageUrlNanos += System.nanoTime() - before
+            }
             planRequest(source.client, page.toDto(), source.imageRequestForHost(page))
         }
+        val probeNanos = System.nanoTime() - listed - imageUrlNanos
+        TachiLog.i(
+            "tachi",
+            "image plan pages=${pages.size} fallback=${plans.count { it.fallback != null }} " +
+                "page_list_ms=${(listed - started) / 1_000_000} image_url_ms=${imageUrlNanos / 1_000_000} probe_ms=${probeNanos / 1_000_000}",
+        )
+        return plans
+    }
 
     // Also used by the offline tests against real extension clients.
     fun planRequest(client: OkHttpClient, page: PageDto, request: Request): ImageRequestDto {
