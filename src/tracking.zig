@@ -172,24 +172,25 @@ pub const State = struct {
         return get(id) != null and self.credential(id).loggedIn();
     }
     pub fn putCredential(self: *State, a: std.mem.Allocator, c: Credential) !void {
-        const copy = try a.dupe(Credential, self.credentials);
-        for (copy) |*old| if (old.tracker_id == c.tracker_id) {
-            old.* = c;
+        for (self.credentials, 0..) |old, i| if (old.tracker_id == c.tracker_id) {
+            const copy = try a.dupe(Credential, self.credentials);
+            copy[i] = c;
             self.credentials = copy;
             return;
         };
-        self.credentials = try std.mem.concat(a, Credential, &.{ copy, &.{c} });
+        self.credentials = try std.mem.concat(a, Credential, &.{ self.credentials, &.{c} });
     }
     pub fn enqueue(self: *State, a: std.mem.Allocator, p: Pending) !void {
         if (!std.math.isFinite(p.chapter) or p.chapter <= 0) return;
-        const copy = try a.dupe(Pending, self.pending);
-        for (copy) |*old| if (old.tracker_id == p.tracker_id and std.mem.eql(u8, old.manga_id, p.manga_id)) {
-            old.chapter = @max(old.chapter, p.chapter);
+        for (self.pending, 0..) |old, i| if (old.tracker_id == p.tracker_id and std.mem.eql(u8, old.manga_id, p.manga_id)) {
+            const copy = try a.dupe(Pending, self.pending);
+            copy[i].chapter = @max(old.chapter, p.chapter);
             self.pending = copy;
             return;
         };
-        self.pending = try std.mem.concat(a, Pending, &.{ copy, &.{p} });
+        self.pending = try std.mem.concat(a, Pending, &.{ self.pending, &.{p} });
     }
+
     pub fn remove(self: *State, a: std.mem.Allocator, manga_id: []const u8, id: i32) !void {
         var list: std.ArrayList(Pending) = .empty;
         for (self.pending) |p| if (p.tracker_id != id or !std.mem.eql(u8, p.manga_id, manga_id)) try list.append(a, p);
@@ -400,4 +401,33 @@ test "queue keeps maximum and persists credentials, formats and retries" {
     try std.testing.expectEqualStrings("json", loaded.credential(2).token);
     try state.remove(a, "m", 2);
     try std.testing.expectEqual(@as(usize, 0), state.pending.len);
+}
+
+test "tracking upserts allocate only the final copy and preserve input on failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const credentials: []const Credential = &.{.{ .tracker_id = 2, .username = "old" }};
+            const pending: []const Pending = &.{.{ .manga_id = "m", .tracker_id = 2, .chapter = 5 }};
+            for ([_]i32{ 2, 3 }) |id| {
+                var state: State = .{ .credentials = credentials, .pending = pending };
+                state.putCredential(gpa, .{ .tracker_id = id, .username = "new" }) catch |err| {
+                    try std.testing.expect(state.credentials.ptr == credentials.ptr);
+                    return err;
+                };
+                defer gpa.free(state.credentials);
+                try std.testing.expectEqualStrings("old", credentials[0].username);
+                try std.testing.expectEqualStrings("new", state.credential(id).username);
+                try std.testing.expectEqual(@as(usize, if (id == 2) 1 else 2), state.credentials.len);
+                state.enqueue(gpa, .{ .manga_id = "m", .tracker_id = id, .chapter = 3 }) catch |err| {
+                    try std.testing.expect(state.pending.ptr == pending.ptr);
+                    return err;
+                };
+                defer gpa.free(state.pending);
+                try std.testing.expectEqual(@as(f64, 5), pending[0].chapter);
+                try std.testing.expectEqual(@as(usize, if (id == 2) 1 else 2), state.pending.len);
+                try std.testing.expectEqual(@as(f64, if (id == 2) 5 else 3), state.pending[state.pending.len - 1].chapter);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
