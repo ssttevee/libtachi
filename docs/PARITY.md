@@ -34,7 +34,7 @@ differs on purpose.
 | Download queue: oldest first, persisted, failed entries stay, per-source parallelism, 200 MiB check | Same |
 | Page retries 2/4/8 s | Same |
 | Downloader reuses the reader's cache | Same |
-| Online reading through a 100 MiB chapter cache, Mihon's page order | Same; eviction is per chapter, least recently written |
+| Online reading through a 100 MiB chapter cache, Mihon's page order | Same; eviction is per chapter, least recently written; cleared at launch with `auto_clear_chapter_cache` (`Engine.launched`) |
 | Download deletion protections (bookmarks, excluded categories) | Same, explicit deletes included |
 | Download storage | **Deviation:** libtachi keeps its own layout (`downloads/`), and imports and exports Mihon's (`import_downloads`, `export_downloads`) with Mihon's names, legacy names, CBZ and ComicInfo.xml |
 | Image formats | Saves every format Mihon decodes (PNG, JPEG, GIF, WebP, JPEG XL, AVIF, HEIF); whether the app can show them is the app's concern |
@@ -62,7 +62,9 @@ differs on purpose.
 | Mihon | libtachi |
 |---|---|
 | Manga, chapters, categories, tracking, history, sources, read entries | Same, byte-identical to kotlinx.serialization's encoding |
-| App settings, source settings, extension stores | Kept through a round trip; mapping onto libtachi's settings in progress |
+| App settings | Same keys and types; mapped onto libtachi's settings, category ids matched by name on restore; Mihon settings libtachi has no use for are kept for the next backup; app state never, private values on request |
+| Source settings | Same; read from and written to the runtime's preference files |
+| Extension stores | Kept through a round trip; restoring them pending the store work |
 
 ## Tracking
 
