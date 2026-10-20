@@ -269,11 +269,28 @@ pub const Http = struct {
 
     /// GETs `url` into memory. Follows redirects; non-2xx is `NetworkError`.
     pub fn getAlloc(h: *Http, gpa: Allocator, url: []const u8, limit: usize) Error![]u8 {
-        var out: Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        try h.get(url, &out.writer);
-        if (out.written().len > limit) return error.NetworkError;
-        return out.toOwnedSlice();
+        const uri = std.Uri.parse(url) catch return error.NetworkError;
+        var request = h.client.request(.GET, uri, .{
+            .headers = .{ .user_agent = .{ .override = h.user_agent } },
+        }) catch |err| return httpError(err);
+        defer request.deinit();
+        request.sendBodiless() catch |err| return httpError(err);
+        var redirect_buffer: [8 << 10]u8 = undefined;
+        var response = request.receiveHead(&redirect_buffer) catch |err| return httpError(err);
+        if (response.head.status.class() != .success) return error.NetworkError;
+
+        const window_len: usize = switch (response.head.content_encoding) {
+            .identity => 0,
+            .gzip, .deflate => std.compress.flate.max_window_len,
+            .zstd => std.compress.zstd.default_window_len,
+            .compress => return error.NetworkError,
+        };
+        const window = try gpa.alloc(u8, window_len);
+        defer gpa.free(window);
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, window);
+        return reader.allocRemaining(gpa, .limited(limit)) catch |err| return httpError(err);
     }
 
     /// GETs `url` straight into `dir/sub_path`, replacing any existing file.
@@ -312,6 +329,13 @@ pub fn fetchIndex(h: *Http, arena: Allocator, url: []const u8) Error!Store {
         store.extensions = try parseExtensionList(arena, list_bytes);
     };
     return store;
+}
+
+fn httpError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.NetworkError,
+    };
 }
 
 // ---- signature ---------------------------------------------------------------------
@@ -530,4 +554,50 @@ test "parseExtension preserves unknown content warnings within the backing type"
     try testing.expectEqual(@as(u8, 255), @backingInt(ext.content_warning));
     try testing.expect(!ext.nsfw());
     try testing.expectError(error.InvalidIndex, parseExtension(arena.allocator(), &.{ 0x38, 0x80, 2 }));
+}
+
+test "HTTP allocation limits apply to decoded bodies and preserve redirects" {
+    const Fixture = @import("testing_http.zig").Fixture;
+    const gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\x4b\x4c\x4a\x06\x00\xc2\x41\x24\x35\x03\x00\x00\x00";
+    const cases = .{
+        .{ "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 3, "abc" },
+        .{ "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 2, null },
+        .{ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, "" },
+        .{ "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na", 0, null },
+        .{ "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", 2, null },
+        .{ "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 23\r\n\r\n" ++ gzip, 3, "abc" },
+        .{ "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 23\r\n\r\n" ++ gzip, 2, null },
+        .{ "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabc", 3, null },
+    };
+    inline for (cases) |case| {
+        var fixture = try Fixture.init(&.{case[0]});
+        defer fixture.deinit();
+        try fixture.start();
+        var http = Http.init(testing.allocator, testing.io);
+        defer http.deinit();
+        const url = try fixture.url(testing.allocator, "/");
+        defer testing.allocator.free(url);
+        if (@as(?[]const u8, case[2])) |expected| {
+            const body = try http.getAlloc(testing.allocator, url, case[1]);
+            defer testing.allocator.free(body);
+            try testing.expectEqualStrings(expected, body);
+        } else {
+            try testing.expectError(error.NetworkError, http.getAlloc(testing.allocator, url, case[1]));
+        }
+        try fixture.finish();
+    }
+    var fixture = try Fixture.init(&.{
+        "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+    });
+    defer fixture.deinit();
+    try fixture.start();
+    var http = Http.init(testing.allocator, testing.io);
+    defer http.deinit();
+    const url = try fixture.url(testing.allocator, "/redirect");
+    defer testing.allocator.free(url);
+    const body = try http.getAlloc(testing.allocator, url, 3);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("abc", body);
+    try fixture.finish();
 }
