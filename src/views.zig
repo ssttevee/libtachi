@@ -686,6 +686,58 @@ pub fn stats(lib: Library, update: settings.Settings.Update, track_score: ?*cons
     return s;
 }
 
+// ---- duplicates ----------------------------------------------------------------
+
+/// Library titles Mihon calls duplicates of `manga`: other favorites whose
+/// title contains its title (any case, `%` and `_` acting as SQL wildcards,
+/// as Mihon's query lets them) or that share a tracker entry with it.
+pub fn duplicates(arena: std.mem.Allocator, lib: Library, manga: Manga) ![]*const Manga {
+    const pattern = try std.ascii.allocLowerString(arena, std.mem.trim(u8, manga.title, " \t\r\n"));
+    var found: std.ArrayList(*const Manga) = .empty;
+    for (lib.manga) |*m| {
+        if (!m.favorite or std.mem.eql(u8, m.id, manga.id)) continue;
+        const by_title = pattern.len > 0 and likeContains(try std.ascii.allocLowerString(arena, m.title), pattern);
+        var by_track = false;
+        for (manga.tracks) |t| for (m.tracks) |other| {
+            if (t.remote_id != 0 and other.tracker_id == t.tracker_id and other.remote_id == t.remote_id) by_track = true;
+        };
+        if (by_title or by_track) try found.append(arena, m);
+    }
+    return found.items;
+}
+
+/// SQL `LIKE '%' || pattern || '%'`: `%` any run, `_` any one byte.
+fn likeContains(text: []const u8, pattern: []const u8) bool {
+    var start: usize = 0;
+    while (start <= text.len) : (start += 1) if (likeAt(text[start..], pattern)) return true;
+    return false;
+}
+
+/// Whether `pattern` matches a prefix of `text`.
+fn likeAt(text: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return true;
+    switch (pattern[0]) {
+        '%' => {
+            var i: usize = 0;
+            while (i <= text.len) : (i += 1) if (likeAt(text[i..], pattern[1..])) return true;
+            return false;
+        },
+        '_' => return text.len > 0 and likeAt(text[1..], pattern[1..]),
+        else => return text.len > 0 and text[0] == pattern[0] and likeAt(text[1..], pattern[1..]),
+    }
+}
+
+/// The stored title for a source's `url`, as for marking browse results
+/// already in the library.
+pub fn findTitle(lib: Library, source_id: i64, url: []const u8) ?*const Manga {
+    for (lib.manga) |*m| {
+        if (m.source_id != source_id) continue;
+        const remote = m.remote orelse continue;
+        if (std.mem.eql(u8, remote.url, url)) return m;
+    }
+    return null;
+}
+
 // ---- sources -------------------------------------------------------------------
 
 /// Mihon's local source, which `sourceList` always includes.
@@ -1030,4 +1082,19 @@ test "source list keeps enabled languages, pins and the last used source" {
     try testing.expectEqual(2, list.languages.len);
     try testing.expectEqualStrings("en", list.languages[0].lang);
     try testing.expectEqualStrings("other", list.languages[1].lang);
+}
+
+test "duplicates match titles like Mihon's query and shared tracker entries" {
+    var a_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+    const lib: Library = .{ .manga = &.{
+        .{ .id = "1:/a", .title = "Solo Leveling: Ragnarok", .source_id = 1 },
+        .{ .id = "2:/b", .title = "Other", .source_id = 2, .tracks = &.{.{ .tracker_id = 2, .remote_id = 77 }} },
+        .{ .id = "3:/c", .title = "Solo Leveling", .source_id = 3, .favorite = false },
+    } };
+    const found = try duplicates(a, lib, .{ .id = "9:/x", .title = "solo leveling", .tracks = &.{.{ .tracker_id = 2, .remote_id = 77 }} });
+    try testing.expectEqual(2, found.len);
+    try testing.expectEqual(1, (try duplicates(a, lib, .{ .id = "9:/x", .title = "s_lo%rok" })).len);
+    try testing.expectEqual(0, (try duplicates(a, lib, .{ .id = "9:/x", .title = "  " })).len);
 }

@@ -463,6 +463,25 @@ pub const Engine = struct {
         try self.saveSettings(s);
     }
 
+    /// Other library titles Mihon would warn are the same as `manga`.
+    pub fn duplicates(self: *Engine, arena: std.mem.Allocator, manga: library.Manga) ![]*const library.Manga {
+        return views.duplicates(arena, try self.store.load(arena), manga);
+    }
+
+    pub const Device = struct { wifi: bool, unmetered: bool, charging: bool };
+
+    /// Whether an automatic library update is due now on a device in this
+    /// state, as Mihon's periodic update decides; start one with
+    /// `update_library` if so.
+    pub fn libraryUpdateDue(self: *Engine, device: Device) !bool {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const u = (try self.loadSettings(arena_state.allocator())).update;
+        if (u.interval_hours == 0) return false;
+        if ((u.only_wifi and !device.wifi) or (u.only_unmetered and !device.unmetered) or (u.only_charging and !device.charging)) return false;
+        return wallMillis(self.io) - u.last_run >= @as(i64, u.interval_hours) * std.time.ms_per_hour;
+    }
+
     /// Each title's latest read chapter, latest first.
     pub fn history(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.FeedItem {
         return views.history(arena, try self.store.load(arena), search);
@@ -1634,7 +1653,9 @@ pub const Engine = struct {
     fn updateLibrary(self: *Engine, job: *Job, category: ?u32) !void {
         const a = job.arena.allocator();
         const current = try self.store.load(a);
-        const s = try self.loadSettings(a);
+        var s = try self.loadSettings(a);
+        s.update.last_run = wallMillis(self.io);
+        try self.saveSettings(s);
         const window = fetch_interval.window(wallMillis(self.io), self.options.utc_offset_s);
         var queue: std.ArrayList(library.Manga) = .empty;
         var skipped: usize = 0;

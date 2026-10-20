@@ -39,6 +39,15 @@ pub const Settings = struct {
         /// Mark other chapters with a just-read chapter's number read
         /// (`mark_duplicate_read_chapter_read` "existing").
         mark_existing_duplicates_read: bool = false,
+        /// Hours between automatic library updates; 0 never (`pref_library_update_interval_key`).
+        interval_hours: u16 = 0,
+        /// Automatic updates only on Wi-Fi, an unmetered network, or while
+        /// charging (`library_update_restriction`).
+        only_wifi: bool = true,
+        only_unmetered: bool = false,
+        only_charging: bool = false,
+        /// When the last library update started (`library_update_last_timestamp`).
+        last_run: i64 = 0,
     };
 
     pub const Downloads = struct {
