@@ -69,7 +69,15 @@ pub const Tags = struct {
 };
 
 pub fn decode(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    return decodeInner(a, text) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => return err,
+    };
+}
+
+fn decodeInner(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == '&') {
@@ -180,4 +188,21 @@ pub fn dateFields(w: *std.Io.Writer, milliseconds: i64) !void {
     var parts: [3]c_int = undefined;
     if (tachi_date_parts(milliseconds, &parts) == 0) return;
     try w.print("<Year>{d}</Year><Month>{d}</Month><Day>{d}</Day>", .{ parts[0], parts[1], parts[2] });
+}
+
+test "XML decoding releases buffers on invalid entities and allocation failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const decoded = try decode(gpa, "text &amp; &#65; &#x1f600; &unknown;");
+            defer gpa.free(decoded);
+            try std.testing.expectEqualStrings("text & A 😀 &unknown;", decoded);
+            _ = decode(gpa, "allocated prefix &#xD800;") catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.InvalidXmlEntity => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
