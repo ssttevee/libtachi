@@ -44,6 +44,9 @@ pub const Queue = struct {
     runner: ?Io.Future(void) = null,
     /// The runner ran out of work and returned; it still has to be awaited.
     runner_done: bool = false,
+    /// The queue stopped because downloads are Wi-Fi only and the device
+    /// isn't on Wi-Fi; `start` it again once it is.
+    waiting_for_wifi: bool = false,
 
     fn acquire(self: *Queue) void {
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
@@ -238,6 +241,13 @@ pub const Queue = struct {
         return out;
     }
 
+    /// Whether the queue stopped to wait for Wi-Fi.
+    pub fn waitingForWifi(self: *Queue) bool {
+        self.acquire();
+        defer self.lock.unlock();
+        return self.waiting_for_wifi;
+    }
+
     /// Whether the queue is working through its entries.
     pub fn running(self: *Queue) bool {
         self.acquire();
@@ -269,7 +279,14 @@ pub const Queue = struct {
     /// worker is downloading from, until none is left.
     fn work(self: *Queue, engine: *Engine) Io.Cancelable!void {
         while (true) {
+            // Off Wi-Fi with Wi-Fi-only downloads, Mihon stops and keeps the queue.
+            const allowed = networkAllowed(engine);
             self.acquire();
+            self.waiting_for_wifi = !allowed;
+            if (!allowed) {
+                self.lock.unlock();
+                return;
+            }
             const next = for (self.items.items) |*item| {
                 if (item.status != .queued) continue;
                 const busy = for (self.items.items) |other| {
@@ -317,6 +334,13 @@ pub const Queue = struct {
         }
     }
 
+    fn networkAllowed(engine: *Engine) bool {
+        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+        defer arena.deinit();
+        const s = engine.loadSettings(arena.allocator()) catch return true;
+        return engine.downloadsAllowed(s);
+    }
+
     /// Mihon refuses to start a chapter with less than 200 MiB free; an
     /// unknown amount doesn't stop it.
     fn enoughSpace(engine: *Engine) bool {
@@ -328,3 +352,26 @@ pub const Queue = struct {
 
     pub const min_free_bytes = 200 << 20;
 };
+
+test "the queue waits for Wi-Fi when downloads are Wi-Fi only" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, io, @import("backend.zig").none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "1:/m", .title = "M", .source_id = 1, .chapters = &.{.{ .id = "1:/c", .title = "C" }} }} });
+    engine.setNetwork(.other);
+    _ = try engine.queue.enqueue(&engine, &.{"1:/c"}, true);
+    var waited: usize = 0;
+    while (engine.queue.running()) : (waited += 1) {
+        if (waited > 5000) return error.QueueStuck;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(engine.queue.waitingForWifi());
+    const entries = try engine.queue.snapshot(&engine, a);
+    try std.testing.expectEqual(Status.queued, entries[0].status);
+}

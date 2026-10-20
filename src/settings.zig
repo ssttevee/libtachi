@@ -70,6 +70,9 @@ pub const Settings = struct {
         remove_bookmarked: bool = false,
         /// Titles in these categories keep their read downloads (`remove_exclude_categories`).
         remove_exclude_categories: []const u32 = &.{},
+        /// Download only on Wi-Fi (`pref_download_only_over_wifi_key`); the
+        /// app reports the network with `Engine.setNetwork`.
+        only_wifi: bool = true,
         /// Sources downloading at once (`download_parallel_source_limit`).
         parallel_sources: u8 = 5,
         /// Pages downloading at once per source (`download_parallel_page_limit`).

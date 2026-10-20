@@ -142,6 +142,7 @@ pub fn fromSettings(a: std.mem.Allocator, s: Settings) ![]const Preference {
     try P.add(&out, a, "mark_duplicate_read_chapter_read", .{ .string_set = duplicates.items });
 
     const d = s.downloads;
+    try P.add(&out, a, "pref_download_only_over_wifi_key", .{ .boolean = d.only_wifi });
     try P.add(&out, a, "download_new", .{ .boolean = d.new_chapters });
     try P.add(&out, a, "download_new_unread_chapters_only", .{ .boolean = d.new_unread_only });
     try P.add(&out, a, "download_new_categories", .{ .string_set = try idSet(a, d.new_categories) });
@@ -293,6 +294,8 @@ fn applyOne(a: std.mem.Allocator, s: *Settings, p: Preference, categories: []con
         if (v != .string_set) return true;
         s.update.mark_new_duplicates_read = has(v.string_set, "new");
         s.update.mark_existing_duplicates_read = has(v.string_set, "existing");
+    } else if (eql(u8, key, "pref_download_only_over_wifi_key")) {
+        if (v == .boolean) s.downloads.only_wifi = v.boolean;
     } else if (eql(u8, key, "download_new")) {
         if (v == .boolean) s.downloads.new_chapters = v.boolean;
     } else if (eql(u8, key, "download_new_unread_chapters_only")) {

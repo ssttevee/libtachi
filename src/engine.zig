@@ -170,6 +170,8 @@ pub const Engine = struct {
     paused: std.atomic.Value(bool) = .init(false),
     /// Mihon's download queue; see `queue.Queue`.
     queue: queue_mod.Queue = .{},
+    /// The network the app last reported; see `setNetwork`.
+    network: std.atomic.Value(Network) = .init(.unknown),
     /// The chapter `pageShown` last checked for downloading ahead (a hash;
     /// 32 bits, as 32-bit ARM has no 64-bit atomics).
     ahead_checked: std.atomic.Value(u32) = .init(0),
@@ -213,6 +215,23 @@ pub const Engine = struct {
 
     pub fn @"resume"(self: *Engine) void {
         self.paused.store(false, .release);
+    }
+
+    pub const Network = enum(u8) { unknown, none, wifi, other };
+
+    /// Tells the engine what network the device is on, so the download
+    /// queue keeps to Wi-Fi when the settings ask; unknown doesn't stop it.
+    pub fn setNetwork(self: *Engine, network: Network) void {
+        self.network.store(network, .release);
+    }
+
+    /// Whether downloads may run on the network the app last reported.
+    pub fn downloadsAllowed(self: *Engine, s: settings.Settings) bool {
+        return switch (self.network.load(.acquire)) {
+            .unknown, .wifi => true,
+            .none => false,
+            .other => !s.downloads.only_wifi,
+        };
     }
 
     /// Call once when the app starts: does what Mihon does at launch,
