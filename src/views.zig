@@ -6,6 +6,7 @@ const std = @import("std");
 const library = @import("library.zig");
 const settings = @import("settings.zig");
 const query = @import("query.zig");
+const models = @import("models.zig");
 
 const Library = library.Library;
 const Manga = library.Manga;
@@ -340,7 +341,7 @@ pub fn search(arena: std.mem.Allocator, lib: Library, text: []const u8, utc_offs
             for (self.sources) |known| if (known.id == id) {
                 source = known;
             };
-            const remote = m.remote orelse @import("models.zig").Manga{ .url = "", .title = "" };
+            const remote = m.remote orelse models.Manga{ .url = "", .title = "" };
             return .{
                 .title = m.title,
                 .author = if (m.author.len > 0) m.author else remote.author,
@@ -685,6 +686,79 @@ pub fn stats(lib: Library, update: settings.Settings.Update, track_score: ?*cons
     return s;
 }
 
+// ---- sources -------------------------------------------------------------------
+
+/// Mihon's local source, which `sourceList` always includes.
+pub const local_source: models.SourceInfo = .{ .id = "0", .name = "Local source", .lang = "other", .supportsLatest = true, .isConfigurable = false, .className = "", .extensionPkg = "" };
+
+pub const SourceList = struct {
+    /// The source browsed last, if enabled; it also stays in its group.
+    last_used: ?models.SourceInfo = null,
+    pinned: []const models.SourceInfo,
+    /// The other enabled sources by language, languages in code order.
+    languages: []const LanguageGroup,
+};
+
+pub const LanguageGroup = struct { lang: []const u8, sources: []const models.SourceInfo };
+
+/// Whether a source shows in lists and global search: in an enabled
+/// language (the local source always is) and not hidden.
+pub fn sourceEnabled(source: models.SourceInfo, browse: settings.Settings.Browse) bool {
+    const id = source.idInt() catch return false;
+    if (std.mem.indexOfScalar(i64, browse.hidden_sources, id) != null) return false;
+    if (id == 0) return true;
+    for (browse.languages) |lang| if (std.mem.eql(u8, lang, source.lang)) return true;
+    return false;
+}
+
+pub fn sourcePinned(source: models.SourceInfo, browse: settings.Settings.Browse) bool {
+    const id = source.idInt() catch return false;
+    return std.mem.indexOfScalar(i64, browse.pinned_sources, id) != null;
+}
+
+/// Mihon's sources screen: enabled sources by name, pinned ones in their
+/// own group, the rest by language, plus the source used last.
+pub fn sourceList(arena: std.mem.Allocator, sources: []const models.SourceInfo, browse: settings.Settings.Browse) !SourceList {
+    var enabled: std.ArrayList(models.SourceInfo) = .empty;
+    try enabled.append(arena, local_source);
+    for (sources) |source| {
+        if ((source.idInt() catch continue) == 0) continue;
+        try enabled.append(arena, source);
+    }
+    var kept: std.ArrayList(models.SourceInfo) = .empty;
+    for (enabled.items) |source| if (sourceEnabled(source, browse)) try kept.append(arena, source);
+    std.mem.sort(models.SourceInfo, kept.items, {}, struct {
+        fn less(_: void, a: models.SourceInfo, b: models.SourceInfo) bool {
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        }
+    }.less);
+    var list: SourceList = .{ .pinned = &.{}, .languages = &.{} };
+    var pinned: std.ArrayList(models.SourceInfo) = .empty;
+    var groups: std.ArrayList(LanguageGroup) = .empty;
+    for (kept.items) |source| {
+        if ((source.idInt() catch 0) == browse.last_source) list.last_used = source;
+        if (sourcePinned(source, browse)) {
+            try pinned.append(arena, source);
+            continue;
+        }
+        const group = for (groups.items) |*g| {
+            if (std.mem.eql(u8, g.lang, source.lang)) break g;
+        } else blk: {
+            try groups.append(arena, .{ .lang = source.lang, .sources = &.{} });
+            break :blk &groups.items[groups.items.len - 1];
+        };
+        group.sources = try std.mem.concat(arena, models.SourceInfo, &.{ group.sources, &.{source} });
+    }
+    std.mem.sort(LanguageGroup, groups.items, {}, struct {
+        fn less(_: void, a: LanguageGroup, b: LanguageGroup) bool {
+            return std.mem.lessThan(u8, a.lang, b.lang);
+        }
+    }.less);
+    list.pinned = pinned.items;
+    list.languages = groups.items;
+    return list;
+}
+
 // ---- dates ---------------------------------------------------------------------
 
 /// Midnight before `ms` in the zone `utc_offset_s` from UTC, as UTC milliseconds.
@@ -926,4 +1000,34 @@ test "library search uses Mihon's syntax over titles, genres and sources" {
         const groups = try libraryView(a, lib, .{ .match = try search(a, lib, case.text, 0) });
         try testing.expectEqual(case.count, groups[0].entries.len);
     }
+}
+
+test "source list keeps enabled languages, pins and the last used source" {
+    var a_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+    const base: models.SourceInfo = .{ .id = "", .name = "", .lang = "", .supportsLatest = true, .isConfigurable = false, .className = "", .extensionPkg = "" };
+    var dex = base;
+    dex.id = "1";
+    dex.name = "mangadex";
+    dex.lang = "en";
+    var other = base;
+    other.id = "2";
+    other.name = "Batoto";
+    other.lang = "en";
+    var french = base;
+    french.id = "3";
+    french.name = "Japscan";
+    french.lang = "fr";
+    var hidden = base;
+    hidden.id = "4";
+    hidden.name = "Hidden";
+    hidden.lang = "en";
+    const list = try sourceList(a, &.{ dex, other, french, hidden }, .{ .pinned_sources = &.{1}, .hidden_sources = &.{4}, .last_source = 2 });
+    try testing.expectEqual(1, list.pinned.len);
+    try testing.expectEqualStrings("mangadex", list.pinned[0].name);
+    try testing.expectEqualStrings("Batoto", list.last_used.?.name);
+    try testing.expectEqual(2, list.languages.len);
+    try testing.expectEqualStrings("en", list.languages[0].lang);
+    try testing.expectEqualStrings("other", list.languages[1].lang);
 }

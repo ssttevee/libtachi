@@ -86,10 +86,22 @@ pub const Settings = struct {
         hidden_sources: []const i64 = &.{},
         /// Pinned source ids (`pinned_catalogues`).
         pinned_sources: []const i64 = &.{},
-        /// The source last browsed (`last_catalogue_source`); 0 none.
-        last_source: i64 = 0,
+        /// The source last browsed (`last_catalogue_source`); -1 none, 0 is local.
+        last_source: i64 = -1,
         /// Global search only searches pinned sources.
         search_pinned_only: bool = true,
+        /// What a migration carries over (`migration_flags`).
+        migration: Migration = .{},
+    };
+
+    /// Mihon's migration flags, all on by default.
+    pub const Migration = struct {
+        /// Read state up to the highest chapter read, bookmarks and fetch dates.
+        chapters: bool = true,
+        categories: bool = true,
+        notes: bool = true,
+        /// Delete the old title's downloads.
+        remove_downloads: bool = true,
     };
 
     pub const Library = struct {

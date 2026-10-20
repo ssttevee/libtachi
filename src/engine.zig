@@ -58,6 +58,16 @@ pub const Request = union(enum) {
     remove: []const u8,
     /// Adds the series in the local source to the library.
     scan_local,
+    /// Searches sources for `query`, one page each, as Mihon's global search
+    /// does: enabled sources, only pinned ones if `pinned_only`, or exactly
+    /// `sources` if given. Results arrive as each source answers; see
+    /// `Job.searchResults`.
+    global_search: struct { query: []const u8, pinned_only: bool = true, sources: []const i64 = &.{} },
+    /// Moves a library title to another source's title (`source`, `manga`)
+    /// as Mihon's migration does, carrying over what the settings'
+    /// `browse.migration` says. With `replace` false the old title stays in
+    /// the library too.
+    migrate: struct { from: []const u8, source: i64, manga: models.Manga, replace: bool = true },
     /// Restores a Mihon backup (`.tachibk`) into the library.
     import_backup: []const u8,
     /// Writes the library as a Mihon backup.
@@ -89,10 +99,21 @@ pub const Result = struct {
     update_errors: []const UpdateError = &.{},
     /// Titles a library update skipped by its rules.
     update_skipped: usize = 0,
+    /// A global search's results, in Mihon's order: sources with results
+    /// first, then pinned ones, then by name.
+    search: []const SearchResult = &.{},
     message: []const u8 = "Ready",
 };
 
 pub const UpdateError = struct { manga_id: []const u8, title: []const u8, message: []const u8 };
+
+pub const SearchResult = struct {
+    source: models.SourceInfo,
+    pinned: bool = false,
+    mangas: []const models.Manga = &.{},
+    /// Why the source failed; null if it answered.
+    failure: ?[]const u8 = null,
+};
 
 pub const Phase = enum(u8) {
     /// The operation itself is running.
@@ -862,6 +883,168 @@ pub const Engine = struct {
         _ = try self.store.update(arena_state.allocator(), context, edit);
     }
 
+    // ---- sources ---------------------------------------------------------------
+
+    /// Mihon's sources screen from `sources` (a `.sources` job's result) and
+    /// the settings.
+    pub fn sourceList(self: *Engine, arena: std.mem.Allocator, sources: []const models.SourceInfo) !views.SourceList {
+        const s = try self.loadSettings(arena);
+        return views.sourceList(arena, sources, s.browse);
+    }
+
+    pub fn setSourceHidden(self: *Engine, id: i64, hidden: bool) !void {
+        try self.setSourceFlag("hidden_sources", id, hidden);
+    }
+
+    pub fn setSourcePinned(self: *Engine, id: i64, pinned: bool) !void {
+        try self.setSourceFlag("pinned_sources", id, pinned);
+    }
+
+    /// Shows or hides a language's sources.
+    pub fn setLanguage(self: *Engine, lang: []const u8, enabled: bool) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var s = try self.loadSettings(a);
+        var list: std.ArrayList([]const u8) = .empty;
+        for (s.browse.languages) |l| if (!std.mem.eql(u8, l, lang)) try list.append(a, l);
+        if (enabled) try list.append(a, lang);
+        s.browse.languages = list.items;
+        try self.saveSettings(s);
+    }
+
+    /// Remembers the source browsed last.
+    pub fn setLastSource(self: *Engine, id: i64) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        var s = try self.loadSettings(arena_state.allocator());
+        if (s.browse.last_source == id) return;
+        s.browse.last_source = id;
+        try self.saveSettings(s);
+    }
+
+    fn setSourceFlag(self: *Engine, comptime field: []const u8, id: i64, on: bool) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var s = try self.loadSettings(a);
+        var list: std.ArrayList(i64) = .empty;
+        for (@field(s.browse, field)) |known| if (known != id) try list.append(a, known);
+        if (on) try list.append(a, id);
+        @field(s.browse, field) = list.items;
+        try self.saveSettings(s);
+    }
+
+    fn globalSearch(self: *Engine, job: *Job, query: []const u8, pinned_only: bool, only: []const i64) !void {
+        const a = job.arena.allocator();
+        if (std.mem.trim(u8, query, " \t\r\n").len == 0) {
+            job.result.message = "Nothing to search for";
+            return;
+        }
+        const s = try self.loadSettings(a);
+        const sources = (try job.call(.sources)).sources;
+        try self.rememberSources(job, sources);
+        var targets: std.ArrayList(models.SourceInfo) = .empty;
+        for (sources) |source| {
+            const id = source.idInt() catch continue;
+            if (only.len > 0) {
+                if (std.mem.indexOfScalar(i64, only, id) == null) continue;
+            } else if (!views.sourceEnabled(source, s.browse) or (pinned_only and !views.sourcePinned(source, s.browse))) continue;
+            try targets.append(a, source);
+        }
+        job.pages_total.store(targets.items.len, .release);
+        // One source at a time: backends run one call at a time.
+        for (targets.items, 1..) |source, done| {
+            try self.io.checkCancel();
+            var result: SearchResult = .{ .source = source, .pinned = views.sourcePinned(source, s.browse) };
+            const id = source.idInt() catch unreachable;
+            if (job.call(.{ .browse = .{ .source = id, .kind = .{ .search = .{ .query = query } } } })) |reply| {
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var mangas: std.ArrayList(models.Manga) = .empty;
+                if (reply.page) |page| for (page.mangas) |m| {
+                    if ((try seen.getOrPut(a, m.url)).found_existing) continue;
+                    try mangas.append(a, m);
+                };
+                result.mangas = mangas.items;
+            } else |err| switch (err) {
+                error.Canceled => return err,
+                else => result.failure = try std.fmt.allocPrint(a, "{s}: {s}", .{ @errorName(err), tachi.lastError() }),
+            }
+            while (!job.search_lock.tryLock()) std.atomic.spinLoopHint();
+            defer job.search_lock.unlock();
+            try job.search_partial.append(a, result);
+            job.pages_done.store(done, .release);
+        }
+        const results = try a.dupe(SearchResult, job.search_partial.items);
+        sortSearch(results);
+        job.result.search = results;
+        job.result.message = "Search finished";
+    }
+
+    fn migrate(self: *Engine, job: *Job, from: []const u8, source: i64, remote: models.Manga, replace: bool) !void {
+        const a = job.arena.allocator();
+        const current = try self.store.load(a);
+        const old = current.manga[current.find(from) orelse return error.UnknownManga];
+        const target_id = try library.mangaId(a, source, remote.url);
+        if (std.mem.eql(u8, target_id, old.id)) return error.SameTitle;
+        const existing = if (current.find(target_id)) |i| current.manga[i].chapters else &.{};
+        _ = try self.fetchTitle(job, source, remote, existing, .{ .manual = true });
+        const s = try self.loadSettings(a);
+        const Edit = struct {
+            old: []const u8,
+            target: []const u8,
+            flags: settings.Settings.Migration,
+            replace: bool,
+            now: i64,
+            fn apply(edit: @This(), arena: std.mem.Allocator, lib: library.Library) !?library.Library {
+                const titles = try arena.dupe(library.Manga, lib.manga);
+                const o = titles[lib.find(edit.old) orelse return error.UnknownManga];
+                const t = &titles[lib.find(edit.target).?];
+                if (edit.flags.chapters) {
+                    var max_read: ?f64 = null;
+                    for (o.chapters) |ch| if (ch.read) {
+                        max_read = @max(max_read orelse ch.number, ch.number);
+                    };
+                    const chapters = try arena.dupe(library.Chapter, t.chapters);
+                    for (chapters) |*ch| {
+                        if (!ch.recognized()) continue;
+                        for (o.chapters) |prev| if (prev.recognized() and prev.number == ch.number) {
+                            ch.date_fetch = prev.date_fetch;
+                            ch.bookmark = prev.bookmark;
+                            break;
+                        };
+                        if (max_read) |max| if (ch.number <= max) {
+                            ch.read = true;
+                        };
+                    }
+                    t.chapters = chapters;
+                }
+                if (edit.flags.categories) t.categories = o.categories;
+                if (edit.flags.notes) t.notes = o.notes;
+                t.tracks = o.tracks;
+                t.chapter_flags = o.chapter_flags;
+                t.reader_flags = o.reader_flags;
+                t.favorite = true;
+                t.date_added = if (edit.replace and o.date_added != 0) o.date_added else edit.now;
+                if (edit.replace) {
+                    const previous = &titles[lib.find(edit.old).?];
+                    previous.favorite = false;
+                    previous.date_added = 0;
+                }
+                var next = lib;
+                next.manga = titles;
+                return next;
+            }
+        };
+        _ = try self.store.update(a, Edit{ .old = from, .target = target_id, .flags = s.browse.migration, .replace = replace, .now = wallMillis(self.io) }, Edit.apply);
+        if (s.browse.migration.remove_downloads and !old.local()) {
+            var ids: std.ArrayList([]const u8) = .empty;
+            for (old.chapters) |ch| if (ch.downloaded()) try ids.append(a, ch.id);
+            _ = try self.removeDownloads(a, ids.items);
+        }
+        job.result = .{ .library_changed = true, .manga_id = target_id, .message = "Migrated" };
+    }
+
     // ---- operations ------------------------------------------------------------
 
     pub fn execute(self: *Engine, job: *Job) !void {
@@ -928,6 +1111,8 @@ pub const Engine = struct {
                 job.result = .{ .library_changed = true, .manga_id = book.id, .new_chapters = fetched.new_chapters, .message = "Chapter list updated" };
             },
             .update_library => |c| try self.updateLibrary(job, c.category),
+            .global_search => |c| try self.globalSearch(job, c.query, c.pinned_only, c.sources),
+            .migrate => |c| try self.migrate(job, c.from, c.source, c.manga, c.replace),
             .download => |id| try self.downloadChapter(job, id),
             .delete_download => |id| {
                 const deleted = try self.deleteDownloads(&.{id});
@@ -1240,6 +1425,24 @@ fn scheduleDates(arena: std.mem.Allocator, m: library.Manga) ![]const fetch_inte
     return dates.items;
 }
 
+/// Mihon's global search order: sources with results, then pinned ones,
+/// then by name and language.
+fn sortSearch(results: []SearchResult) void {
+    std.mem.sort(SearchResult, results, {}, struct {
+        fn less(_: void, a: SearchResult, b: SearchResult) bool {
+            const a_hits = a.failure == null and a.mangas.len > 0;
+            const b_hits = b.failure == null and b.mangas.len > 0;
+            if (a_hits != b_hits) return a_hits;
+            if (a.pinned != b.pinned) return a.pinned;
+            return switch (std.ascii.orderIgnoreCase(a.source.name, b.source.name)) {
+                .lt => true,
+                .gt => false,
+                .eq => std.mem.lessThan(u8, a.source.lang, b.source.lang),
+            };
+        }
+    }.less);
+}
+
 fn sortByOrder(categories: []library.Category) void {
     std.mem.sort(library.Category, categories, {}, struct {
         fn less(_: void, x: library.Category, y: library.Category) bool {
@@ -1281,6 +1484,9 @@ pub const Job = struct {
     extension_len: usize = 0,
     pages_done: std.atomic.Value(usize) = .init(0),
     pages_total: std.atomic.Value(usize) = .init(0),
+    /// A global search's results so far; read them with `searchResults`.
+    search_lock: std.atomic.Mutex = .unlocked,
+    search_partial: std.ArrayList(SearchResult) = .empty,
     /// Milliseconds the JVM took to start for this job, if it had to.
     start_ms: u64 = 0,
     starting_at: u64 = 0,
@@ -1387,6 +1593,14 @@ pub const Job = struct {
 
     /// Stops the job as soon as possible; it fails with `Canceled`. Pages a
     /// download saved stay for a retry.
+    /// A global search's results so far, in the order sources answered;
+    /// valid until `deinit`.
+    pub fn searchResults(self: *Job, arena: std.mem.Allocator) ![]SearchResult {
+        while (!self.search_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.search_lock.unlock();
+        return arena.dupe(SearchResult, self.search_partial.items);
+    }
+
     pub fn cancel(self: *Job) void {
         if (self.request.usesBackend() and self.engine.execute_fn == null) self.engine.backend.cancel();
         if (self.future) |*future| future.cancel(self.engine.io);
@@ -1580,4 +1794,95 @@ test "engine marks chapters, keeps history, manages categories and deletes downl
     try std.testing.expectEqual(0, groups[0].entries.len);
     try std.testing.expectEqual(0, try engine.clearDatabase(true));
     try std.testing.expectEqual(1, try engine.clearDatabase(false));
+}
+
+test "engine searches sources globally and migrates a title as Mihon does" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+
+    const Fake = struct {
+        fn run(_: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+            if (status) |s| s.ready(s.context);
+            const info: models.SourceInfo = .{ .id = "", .name = "", .lang = "en", .supportsLatest = true, .isConfigurable = false, .className = "", .extensionPkg = "" };
+            return switch (c) {
+                .sources => blk: {
+                    const list = try arena.alloc(models.SourceInfo, 3);
+                    for (list, [_][]const u8{ "1", "2", "3" }, [_][]const u8{ "Old", "New", "Broken" }) |*s, id, name| {
+                        s.* = info;
+                        s.id = id;
+                        s.name = name;
+                    }
+                    break :blk .{ .sources = list };
+                },
+                .browse => |b| switch (b.source) {
+                    3 => error.ExtensionError,
+                    else => .{ .page = .{ .mangas = &.{ .{ .url = "/x", .title = "X" }, .{ .url = "/x", .title = "X again" } }, .hasNextPage = false } },
+                },
+                .update => |u| .{ .update = .{ .manga = .{ .url = u.manga.url, .title = "Target" }, .chapters = &.{
+                    .{ .url = "/t3", .name = "Chapter 3" },
+                    .{ .url = "/t2", .name = "Chapter 2" },
+                    .{ .url = "/t1", .name = "Chapter 1" },
+                } } },
+                else => error.Unexpected,
+            };
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+    };
+    var state: u8 = 0;
+    const backend: be.Backend = .{ .ptr = &state, .vtable = &.{ .run = Fake.run, .warm = Fake.yes, .cancel = Fake.none, .release = Fake.none, .idle = Fake.none } };
+    var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+
+    // Pinned only by default: nothing pinned, nothing searched.
+    const none_pinned = try Job.start(&engine, .{ .global_search = .{ .query = "x" } });
+    none_pinned.join();
+    try std.testing.expectEqual(0, none_pinned.result.search.len);
+    none_pinned.deinit();
+    try engine.setSourcePinned(3, true);
+    const search = try Job.start(&engine, .{ .global_search = .{ .query = "x", .pinned_only = false } });
+    search.join();
+    defer search.deinit();
+    try std.testing.expect(search.failure == null);
+    const results = search.result.search;
+    try std.testing.expectEqual(3, results.len);
+    try std.testing.expectEqualStrings("New", results[0].source.name);
+    try std.testing.expectEqual(1, results[0].mangas.len);
+    try std.testing.expectEqualStrings("Old", results[1].source.name);
+    try std.testing.expect(results[2].failure != null);
+
+    // Migration carries read state up to the highest read number,
+    // bookmarks, categories and notes, and takes the old title out.
+    var old_chapters = [_]library.Chapter{
+        .{ .id = "1:/o1", .title = "Chapter 1", .number = 1, .read = true, .date_fetch = 11 },
+        .{ .id = "1:/o2", .title = "Chapter 2", .number = 2, .read = true, .bookmark = true, .date_fetch = 22 },
+    };
+    try engine.store.save(a, .{
+        .manga = &.{.{ .id = "1:/old", .title = "Old", .source_id = 1, .remote = .{ .url = "/old", .title = "Old" }, .chapters = &old_chapters, .categories = &.{5}, .notes = "mine", .date_added = 1000, .chapter_flags = 0x100 }},
+        .categories = &.{.{ .id = 5, .name = "Five" }},
+    });
+    const job = try Job.start(&engine, .{ .migrate = .{ .from = "1:/old", .source = 2, .manga = .{ .url = "/new", .title = "New" } } });
+    job.join();
+    defer job.deinit();
+    try std.testing.expect(job.failure == null);
+    const lib = try engine.loadLibrary(a);
+    const old = lib.manga[lib.find("1:/old").?];
+    const new = lib.manga[lib.find("2:/new").?];
+    try std.testing.expect(!old.favorite);
+    try std.testing.expect(new.favorite);
+    try std.testing.expectEqual(1000, new.date_added);
+    try std.testing.expectEqualStrings("mine", new.notes);
+    try std.testing.expectEqualSlices(u32, &.{5}, new.categories);
+    try std.testing.expectEqual(0x100, new.chapter_flags);
+    for (new.chapters) |ch| {
+        try std.testing.expectEqual(ch.number <= 2, ch.read);
+        try std.testing.expectEqual(ch.number == 2, ch.bookmark);
+    }
 }
