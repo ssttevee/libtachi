@@ -17,6 +17,7 @@ differs on purpose.
 | Chapter list flags, sorts, mark previous read | Same |
 | Reader chapter list (skip read, filtered, duplicates) | Same |
 | Reading progress, read on the last page, history time | Same, through `pageShown`; a progress write per call rather than a 2-second debounce |
+| Incognito, globally and per extension | Same |
 | Delete after reading, duplicate marking, download ahead | Same; download-ahead checks once per chapter once the next one is downloaded |
 | Mark read/unread, bookmarks, history removal and clearing | Same |
 | Updates feed, history feed, upcoming, stats, unseen-updates badge | Same |
