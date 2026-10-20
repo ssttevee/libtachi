@@ -808,28 +808,29 @@ pub fn sourceList(arena: std.mem.Allocator, sources: []const models.SourceInfo, 
     }.less);
     var list: SourceList = .{ .pinned = &.{}, .languages = &.{} };
     var pinned: std.ArrayList(models.SourceInfo) = .empty;
-    var groups: std.ArrayList(LanguageGroup) = .empty;
+    var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(models.SourceInfo)) = .empty;
+    defer groups.deinit(arena);
     for (kept.items) |source| {
         if ((source.idInt() catch 0) == browse.last_source) list.last_used = source;
         if (sourcePinned(source, browse)) {
             try pinned.append(arena, source);
             continue;
         }
-        const group = for (groups.items) |*g| {
-            if (std.mem.eql(u8, g.lang, source.lang)) break g;
-        } else blk: {
-            try groups.append(arena, .{ .lang = source.lang, .sources = &.{} });
-            break :blk &groups.items[groups.items.len - 1];
-        };
-        group.sources = try std.mem.concat(arena, models.SourceInfo, &.{ group.sources, &.{source} });
+        const group = try groups.getOrPut(arena, source.lang);
+        if (!group.found_existing) group.value_ptr.* = .empty;
+        try group.value_ptr.append(arena, source);
     }
-    std.mem.sort(LanguageGroup, groups.items, {}, struct {
+    const languages = try arena.alloc(LanguageGroup, groups.count());
+    for (languages, groups.keys(), groups.values()) |*group, lang, items| {
+        group.* = .{ .lang = lang, .sources = items.items };
+    }
+    std.mem.sort(LanguageGroup, languages, {}, struct {
         fn less(_: void, a: LanguageGroup, b: LanguageGroup) bool {
             return std.mem.lessThan(u8, a.lang, b.lang);
         }
     }.less);
     list.pinned = pinned.items;
-    list.languages = groups.items;
+    list.languages = languages;
     return list;
 }
 
@@ -1104,6 +1105,20 @@ test "source list keeps enabled languages, pins and the last used source" {
     try testing.expectEqual(2, list.languages.len);
     try testing.expectEqualStrings("en", list.languages[0].lang);
     try testing.expectEqualStrings("other", list.languages[1].lang);
+
+    const grouped = try sourceList(a, &.{ dex, french, other, hidden }, .{
+        .languages = &.{ "en", "fr" },
+        .hidden_sources = &.{4},
+    });
+    try testing.expectEqual(3, grouped.languages.len);
+    try testing.expectEqualStrings("en", grouped.languages[0].lang);
+    try testing.expectEqual(2, grouped.languages[0].sources.len);
+    try testing.expectEqualStrings("Batoto", grouped.languages[0].sources[0].name);
+    try testing.expectEqualStrings("mangadex", grouped.languages[0].sources[1].name);
+    try testing.expectEqualStrings("fr", grouped.languages[1].lang);
+    try testing.expectEqualStrings("Japscan", grouped.languages[1].sources[0].name);
+    try testing.expectEqualStrings("other", grouped.languages[2].lang);
+    try testing.expectEqualStrings("0", grouped.languages[2].sources[0].id);
 }
 
 test "duplicates match titles like Mihon's query and shared tracker entries" {
