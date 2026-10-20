@@ -791,8 +791,7 @@ pub const Engine = struct {
         if (newly_read) {
             try self.chapterFinished(a, s, found);
             if (s.tracking.auto_update and found.chapter.recognized()) {
-                try self.queueTracking(found.manga.id, found.chapter.number);
-                try self.startTracking();
+                if (try self.queueTracking(found.manga.id, found.chapter.number)) try self.startTracking();
             }
         }
         if (ahead) try self.downloadAhead(a, s, found, hash);
@@ -1705,7 +1704,7 @@ pub const Engine = struct {
     }
 
     fn startTracking(self: *Engine) !void {
-        if (self.options.tracker_driver == null or self.paused.load(.acquire)) return;
+        if (self.paused.load(.acquire)) return;
         self.tracking_job_lock.lockUncancelable(self.io);
         defer self.tracking_job_lock.unlock(self.io);
         if (self.tracking_job) |job| {
@@ -1716,8 +1715,10 @@ pub const Engine = struct {
         self.tracking_job = try Job.start(self, .{ .track_pending = .{ .connected = true, .force = true } });
     }
 
-    pub fn queueTracking(self: *Engine, manga_id: []const u8, chapter: f64) !void {
-        if (!std.math.isFinite(chapter) or chapter < 0) return;
+    /// Queues `chapter` as progress for the title's logged-in trackers that
+    /// are behind it; true if any were.
+    pub fn queueTracking(self: *Engine, manga_id: []const u8, chapter: f64) !bool {
+        if (!std.math.isFinite(chapter) or chapter < 0) return false;
         self.tracking_lock.lockUncancelable(self.io);
         defer self.tracking_lock.unlock(self.io);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
@@ -1736,6 +1737,7 @@ pub const Engine = struct {
             state.retry_at = 0;
             try state.save(self.gpa, self.io, self.options.dir);
         }
+        return added;
     }
 
     pub const MarkTracked = struct { changed: usize, prompts: []const tracking.Pending };
@@ -1763,8 +1765,9 @@ pub const Engine = struct {
 
     /// Applies manga-level progress to every eligible bound tracker.
     pub fn applyTracking(self: *Engine, prompts: []const tracking.Pending) !void {
-        for (prompts) |p| try self.queueTracking(p.manga_id, p.chapter);
-        try self.startTracking();
+        var any = false;
+        for (prompts) |p| any = try self.queueTracking(p.manga_id, p.chapter) or any;
+        if (any) try self.startTracking();
     }
 
     fn trackerCall(self: *Engine, job: *Job, state: *tracking.State, id: i32, op: tracking.Operation) !tracking.Reply {
