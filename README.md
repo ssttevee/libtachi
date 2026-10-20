@@ -52,23 +52,25 @@ JavaScript engine. See the roadmap in `docs/DESIGN.md`.
 Requirements: Zig 0.17, a JDK 17+ (to build and to run), and an `android.jar`
 (only to build the host jar). The Gradle build finds one under `ANDROID_HOME`
 / `~/Library/Android/sdk`; without an SDK, run `host/scripts/get-android-jar.sh`
-and pass `-Ptachi.androidJar=host/lib/android.jar`.
+and pass `-Dandroid-jar=host/lib/android.jar`.
 
 ```sh
-zig build host        # host/build/libs/tachi-host.jar, copied to zig-out/lib  (Gradle, ~1 min first time)
 zig build             # zig-out/lib/libtachi.{a,dylib|so}, zig-out/lib/tachi-host.jar,
                       # zig-out/include/tachi.h, zig-out/bin/tachi-cli
-zig build test
+zig build host        # only the jar (Gradle, ~1 min the first time)
+zig build test        # no Gradle unless -Dembed-host-jar
 
 # For distribution: bake the jar into the library and CLI so they are the only
 # files to ship (plus a JDK). It is written to the cache dir on first run.
 zig build -Dembed-host-jar
 ```
 
-`-Dhost-jar=PATH` picks a jar other than `host/build/libs/tachi-host.jar`
-for both modes. Without embedding, `zig build` copies an already built jar to
-`zig-out/lib`, and the runtime looks for it beside the executable and in
-`../lib`, so `zig-out/bin/tachi-cli` works from any directory.
+The host jar is a cached build step: Gradle runs only when a file under
+`host/src` or `host/gradle`, or a Gradle build script, changes; its output
+lives in the zig cache. `-Dhost-jar=PATH` uses a prebuilt jar instead and
+skips Gradle. Without embedding, the jar is installed to `zig-out/lib`, and
+the runtime looks for it beside the executable and in `../lib`, so
+`zig-out/bin/tachi-cli` works from any directory.
 
 Start-up: the runtime keeps a JVM class-data-sharing archive of the host in
 the cache dir (JDK 19+, created on the first exit). With it a full

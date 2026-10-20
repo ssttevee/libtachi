@@ -11,11 +11,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const host_jar = b.option(
+
+    // Kotlin host jar: built by Gradle as a cached step unless -Dhost-jar names one.
+    const host_jar = if (b.option(
         []const u8,
         "host-jar",
-        "Path to tachi-host.jar (default: host/build/libs/tachi-host.jar)",
-    ) orelse "host/build/libs/tachi-host.jar";
+        "Use this tachi-host.jar instead of building it with Gradle",
+    )) |path| sourcePath(b, path) else gradleHostJar(b, b.option(
+        []const u8,
+        "android-jar",
+        "android.jar for the Gradle build (default: newest platform under $ANDROID_HOME)",
+    ));
     const embed_host_jar = b.option(
         bool,
         "embed-host-jar",
@@ -61,13 +67,11 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 
-    // Kotlin host jar via Gradle. `zig build host` builds it and copies it to
-    // <prefix>/lib, where the runtime looks next to the executable.
-    const gradle = b.addSystemCommand(&.{ "./gradlew", "shadowJar", "-q" });
-    gradle.setCwd(b.path("host"));
-    const install_built_jar = b.addInstallLibFile(sourcePath(b, host_jar), "tachi-host.jar");
-    install_built_jar.step.dependOn(&gradle.step);
-    b.step("host", "Build tachi-host.jar with Gradle and copy it to <prefix>/lib").dependOn(&install_built_jar.step);
+    // Without embedding, the jar ships beside the library; the runtime looks in
+    // <prefix>/lib relative to the executable. `zig build host` builds just that.
+    const install_jar = b.addInstallLibFile(host_jar, "tachi-host.jar");
+    if (!embed_host_jar) b.getInstallStep().dependOn(&install_jar.step);
+    b.step("host", "Build tachi-host.jar and copy it to <prefix>/lib").dependOn(&install_jar.step);
 
     // libzstd's decoder and the JNI bridge behind okhttp3.zstd.Zstd, for -Dtarget.
     // The host loads it from disk, so consumers install the named lazy paths
@@ -82,11 +86,33 @@ pub fn build(b: *std.Build) void {
         zstd_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
         zstd_step.dependOn(&b.addInstallFile(upstream.path("LICENSE"), "share/licenses/zstd-LICENSE.txt").step);
     }
+}
 
-    // A plain `zig build` copies an already built jar too, unless it is embedded.
-    // A missing jar is not an error here: the runtime may be pointed at one.
-    if (!embed_host_jar and fileExists(b, host_jar)) {
-        b.getInstallStep().dependOn(&b.addInstallLibFile(sourcePath(b, host_jar), "tachi-host.jar").step);
+/// Runs `gradlew shadowJar` into a zig cache directory. The step is cached on
+/// the Gradle build files and host sources, so it only runs when they change.
+fn gradleHostJar(b: *std.Build, android_jar: ?[]const u8) std.Build.LazyPath {
+    const gradle = b.addSystemCommand(&.{ "./gradlew", "shadowJar", "-q" });
+    gradle.setCwd(b.path("host"));
+    const out_dir = gradle.addPrefixedOutputDirectoryArg("-Ptachi.outputDir=", "libs");
+    if (android_jar) |path| gradle.addPrefixedFileArg("-Ptachi.androidJar=", sourcePath(b, path));
+    gradle.setName("gradle shadowJar");
+    for ([_][]const u8{ "build.gradle.kts", "settings.gradle.kts", "gradle.properties", "gradlew" }) |file| {
+        gradle.addFileInput(b.path(b.pathJoin(&.{ "host", file })));
+    }
+    for ([_][]const u8{ "host/gradle", "host/src" }) |dir| addFileInputsUnder(b, gradle, dir);
+    return out_dir.path(b, "tachi-host.jar");
+}
+
+fn addFileInputsUnder(b: *std.Build, run: *std.Build.Step.Run, sub_path: []const u8) void {
+    const io = b.graph.io;
+    var dir = std.Io.Dir.cwd().openDir(io, fsPath(b, sub_path), .{ .iterate = true }) catch |e|
+        std.debug.panic("{s}: {s}", .{ sub_path, @errorName(e) });
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |e| std.debug.panic("{s}: {s}", .{ sub_path, @errorName(e) })) |entry| {
+        if (entry.kind != .file) continue;
+        run.addFileInput(b.path(b.pathJoin(&.{ sub_path, entry.path })));
     }
 }
 
@@ -118,7 +144,7 @@ fn zstdJni(b: *std.Build, upstream: *std.Build.Dependency, jdk: ?[]const u8, tar
     return lib;
 }
 
-/// `b.path` only takes project-relative paths; `-Dhost-jar` may be absolute.
+/// `b.path` only takes project-relative paths; options may be absolute.
 fn sourcePath(b: *std.Build, path: []const u8) std.Build.LazyPath {
     return if (std.fs.path.isAbsolute(path)) .{ .cwd_relative = path } else b.path(path);
 }
@@ -129,31 +155,28 @@ fn fsPath(b: *std.Build, path: []const u8) []const u8 {
     return b.root.joinString(b.allocator, path) catch @panic("OOM");
 }
 
-fn fileExists(b: *std.Build, path: []const u8) bool {
-    std.Io.Dir.cwd().access(b.graph.io, fsPath(b, path), .{}) catch return false;
-    return true;
-}
-
 /// A module exposing `bytes: ?[]const u8` and `hash: []const u8` for the host
 /// jar. Without `-Dembed-host-jar`, `bytes` is null and the runtime looks for
-/// the jar on disk. The hash names the extracted copy and its CDS archive, so a
-/// rebuilt jar never collides with a stale cache entry.
-fn embeddedHostJar(b: *std.Build, jar: ?[]const u8) *std.Build.Module {
+/// the jar on disk. Otherwise tools/embed_host_jar.zig hashes the jar in a
+/// cached step, and the jar is copied next to the generated source for
+/// @embedFile.
+fn embeddedHostJar(b: *std.Build, jar: ?std.Build.LazyPath) *std.Build.Module {
     const wf = b.addWriteFiles();
     const source = if (jar) |path| blk: {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, fsPath(b, path), b.allocator, .limited(1 << 30)) catch |e|
-            std.debug.panic("-Dembed-host-jar: cannot read {s} ({s}); run `zig build host` first", .{ path, @errorName(e) });
-        const hash = std.hash.Wyhash.hash(0, bytes);
-        _ = wf.addCopyFile(sourcePath(b, path), "tachi-host.jar");
-        break :blk b.fmt(
-            \\pub const bytes: ?[]const u8 = @embedFile("tachi-host.jar");
-            \\pub const hash = "{x:0>16}";
-            \\
-        , .{hash});
-    } else
+        const tool = b.addExecutable(.{ .name = "embed_host_jar", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/embed_host_jar.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }) });
+        const gen = b.addRunArtifact(tool);
+        gen.addFileArg(path);
+        const generated = gen.addOutputFileArg("host_jar.zig");
+        _ = wf.addCopyFile(path, "tachi-host.jar");
+        break :blk wf.addCopyFile(generated, "host_jar.zig");
+    } else wf.add("host_jar.zig",
         \\pub const bytes: ?[]const u8 = null;
         \\pub const hash = "";
         \\
-    ;
-    return b.createModule(.{ .root_source_file = wf.add("host_jar.zig", source) });
+    );
+    return b.createModule(.{ .root_source_file = source });
 }

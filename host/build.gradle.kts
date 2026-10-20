@@ -104,6 +104,8 @@ tasks.shadowJar {
     archiveBaseName.set("tachi-host")
     archiveClassifier.set("")
     archiveVersion.set("")
+    // `zig build` points this at its cache so the jar is a tracked build output.
+    (findProperty("tachi.outputDir") as String?)?.let { destinationDirectory.set(file(it)) }
     mergeServiceFiles()
     // Our android/androidx implementations must win over the stub jar.
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
