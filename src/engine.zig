@@ -23,6 +23,7 @@ const settings = @import("settings.zig");
 const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
 const views = @import("views.zig");
+const fetch_interval = @import("fetch_interval.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -184,26 +185,18 @@ pub const Engine = struct {
     // ---- views -----------------------------------------------------------------
 
     /// The library as Mihon shows it, with the settings' filters and sorts,
-    /// and only titles whose title contains `search` if it isn't empty.
-    /// Allocated in `arena`.
+    /// and only titles matching `search` in Mihon's search syntax (see
+    /// `query`) if it isn't empty. Allocated in `arena`.
     pub fn libraryView(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.Group {
         const s = try self.loadSettings(arena);
-        const Search = struct {
-            text: []const u8,
-            fn matches(context: *const anyopaque, manga: *const library.Manga, _: library.Counts) bool {
-                const text: *const []const u8 = @ptrCast(@alignCast(context));
-                return std.ascii.findIgnoreCase(manga.title, text.*) != null;
-            }
-        };
-        const text = try arena.create([]const u8);
-        text.* = search;
-        return views.libraryView(arena, try self.store.load(arena), .{
+        const lib = try self.store.load(arena);
+        return views.libraryView(arena, lib, .{
             .filters = s.library.filters,
             .downloaded_only = s.library.downloaded_only,
             .skip_outside_release_period = s.update.skip_outside_release_period,
             .default_sort = .decode(s.library.sort),
             .random_seed = s.library.random_seed,
-            .match = if (search.len == 0) null else .{ .context = @ptrCast(text), .matches = Search.matches },
+            .match = try views.search(arena, lib, search, self.options.utc_offset_s),
         });
     }
 
@@ -562,8 +555,8 @@ pub const Engine = struct {
             fn apply(edit: @This(), arena: std.mem.Allocator, m: *library.Manga) !bool {
                 if (m.favorite == edit.favorite) return false;
                 m.favorite = edit.favorite;
+                m.date_added = if (edit.favorite) edit.now else 0;
                 if (edit.favorite) {
-                    m.date_added = edit.now;
                     if (m.categories.len == 0) if (edit.default_category) |c| {
                         m.categories = try arena.dupe(u32, &.{c});
                     };
@@ -594,6 +587,32 @@ pub const Engine = struct {
     /// Sets a title's reader bits: reading mode in 0x7, orientation in 0x38.
     pub fn setReaderFlags(self: *Engine, manga_id: []const u8, flags: u32) !void {
         try self.setField(manga_id, "reader_flags", flags);
+    }
+
+    /// Sets how many days a title waits between updates, as Mihon's custom
+    /// interval; 0 goes back to estimating it from releases. Reschedules now.
+    pub fn setFetchInterval(self: *Engine, manga_id: []const u8, days: u31) !void {
+        const Edit = struct {
+            interval: i32,
+            now: i64,
+            utc_offset_s: i32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, m: *library.Manga) !bool {
+                const next = try fetch_interval.update(arena, .{
+                    .chapters = try scheduleDates(arena, m.*),
+                    .fetch_interval = edit.interval,
+                    .next_update_ms = m.next_update,
+                    .last_update_ms = m.last_update,
+                    .now_ms = edit.now,
+                    .utc_offset_s = edit.utc_offset_s,
+                });
+                m.fetch_interval = next.fetch_interval;
+                m.next_update = next.next_update_ms;
+                return true;
+            }
+        };
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        try self.editTitle(arena_state.allocator(), manga_id, Edit{ .interval = -@as(i32, days), .now = wallMillis(self.io), .utc_offset_s = self.options.utc_offset_s }, Edit.apply);
     }
 
     /// Makes a title's chapter list flags the default for new titles, and
@@ -882,7 +901,7 @@ pub const Engine = struct {
                 const current = try self.store.load(a);
                 const index = current.find(try library.mangaId(a, c.source, c.manga.url));
                 const existing = if (index) |i| current.manga[i].chapters else &.{};
-                const fetched = try self.fetchTitle(job, c.source, c.manga, existing);
+                const fetched = try self.fetchTitle(job, c.source, c.manga, existing, .{ .manual = true });
                 if (index) |i| {
                     if (!current.manga[i].favorite) try self.setFavorite(fetched.manga_id, true);
                 } else {
@@ -904,7 +923,7 @@ pub const Engine = struct {
                 const a = job.arena.allocator();
                 const current = try self.store.load(a);
                 const book = current.manga[current.find(id) orelse return error.UnknownManga];
-                const fetched = try self.fetchTitle(job, book.source_id orelse return error.LocalTitle, book.remote orelse return error.LocalTitle, book.chapters);
+                const fetched = try self.fetchTitle(job, book.source_id orelse return error.LocalTitle, book.remote orelse return error.LocalTitle, book.chapters, .{ .manual = true });
                 try self.autoDownload(job, fetched.new_chapters);
                 job.result = .{ .library_changed = true, .manga_id = book.id, .new_chapters = fetched.new_chapters, .message = "Chapter list updated" };
             },
@@ -1018,7 +1037,7 @@ pub const Engine = struct {
     /// Fetches a title's details and chapters in one source call and syncs
     /// them into the library as Mihon does; returns the title's id and the
     /// chapters that are new to the reader.
-    fn fetchTitle(self: *Engine, job: *Job, source: i64, remote: models.Manga, existing: []const library.Chapter) !Fetched {
+    fn fetchTitle(self: *Engine, job: *Job, source: i64, remote: models.Manga, existing: []const library.Chapter, schedule: Schedule) !Fetched {
         const a = job.arena.allocator();
         const started = millis(self.io);
         var known: std.ArrayList(models.Chapter) = .empty;
@@ -1031,15 +1050,49 @@ pub const Engine = struct {
             update: models.MangaUpdate,
             now: i64,
             options: library.SyncOptions,
+            schedule: Schedule,
+            utc_offset_s: i32,
             synced: *library.Synced,
             fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
                 edit.synced.* = try library.syncSource(arena, current, edit.source, edit.update.manga, edit.update.chapters, edit.now, edit.options);
-                return edit.synced.library;
+                const lib = edit.synced.library;
+                const index = lib.find(edit.synced.manga_id).?;
+                const m = lib.manga[index];
+                // Mihon reschedules after a change, and otherwise only when
+                // asked, never estimated, or behind the update window.
+                if (!edit.synced.changed and !edit.schedule.manual and m.fetch_interval != 0 and
+                    !(edit.schedule.window != null and (m.next_update == 0 or m.next_update < edit.schedule.window.?.lower))) return if (edit.synced.changed) lib else null;
+                const next = try fetch_interval.update(arena, .{
+                    .chapters = try scheduleDates(arena, m),
+                    .fetch_interval = m.fetch_interval,
+                    .next_update_ms = m.next_update,
+                    .last_update_ms = m.last_update,
+                    .found_release = edit.synced.found_release,
+                    .now_ms = edit.now,
+                    .utc_offset_s = edit.utc_offset_s,
+                    .fetch_window = edit.schedule.window,
+                });
+                if (next.fetch_interval == m.fetch_interval and next.next_update_ms == m.next_update) return if (edit.synced.changed) lib else null;
+                const titles = try arena.dupe(library.Manga, lib.manga);
+                titles[index].fetch_interval = next.fetch_interval;
+                titles[index].next_update = next.next_update_ms;
+                var result = lib;
+                result.manga = titles;
+                edit.synced.library = result;
+                return result;
             }
         };
         const s = try self.loadSettings(a);
         var synced: library.Synced = undefined;
-        _ = try self.store.update(a, Edit{ .source = source, .update = update, .now = wallMillis(self.io), .options = .{ .mark_duplicate_read = s.update.mark_new_duplicates_read, .update_title = s.update.titles }, .synced = &synced }, Edit.apply);
+        _ = try self.store.update(a, Edit{
+            .source = source,
+            .update = update,
+            .now = wallMillis(self.io),
+            .options = .{ .mark_duplicate_read = s.update.mark_new_duplicates_read, .update_title = s.update.titles },
+            .schedule = schedule,
+            .utc_offset_s = self.options.utc_offset_s,
+            .synced = &synced,
+        }, Edit.apply);
         log.info("refresh chapters={d} new={d} source_ms={d} save_ms={d}", .{ update.chapters.len, synced.new_chapters.len, fetched - started, millis(self.io) - fetched });
         return .{ .manga_id = synced.manga_id, .new_chapters = synced.new_chapters };
     }
@@ -1053,7 +1106,7 @@ pub const Engine = struct {
         const a = job.arena.allocator();
         const current = try self.store.load(a);
         const s = try self.loadSettings(a);
-        const window_upper = dayStart(wallMillis(self.io), self.options.utc_offset_s) + std.time.ms_per_day;
+        const window = fetch_interval.window(wallMillis(self.io), self.options.utc_offset_s);
         var queue: std.ArrayList(library.Manga) = .empty;
         var skipped: usize = 0;
         for (current.manga) |book| {
@@ -1067,7 +1120,7 @@ pub const Engine = struct {
                 (s.update.skip_completed and book.status() == 2) or
                 (s.update.skip_unread and counts.unread != 0) or
                 (s.update.skip_not_started and counts.total > 0 and counts.read == 0) or
-                (s.update.skip_outside_release_period and book.next_update != 0 and book.next_update > window_upper);
+                (s.update.skip_outside_release_period and book.next_update != 0 and fetch_interval.outsideReleasePeriod(book.next_update, window));
             if (skip) {
                 skipped += 1;
                 continue;
@@ -1085,7 +1138,7 @@ pub const Engine = struct {
         job.pages_total.store(queue.items.len, .release);
         for (queue.items, 1..) |book, done| {
             try self.io.checkCancel();
-            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters)) |fetched| {
+            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters, .{ .window = window })) |fetched| {
                 updated += 1;
                 try new_chapters.appendSlice(a, fetched.new_chapters);
             } else |err| switch (err) {
@@ -1176,6 +1229,17 @@ fn deletable(a: std.mem.Allocator, s: settings.Settings, manga: library.Manga, c
     return ids.items;
 }
 
+/// The release history a title's schedule is estimated from: chapters of
+/// groups not excluded that the source still lists.
+fn scheduleDates(arena: std.mem.Allocator, m: library.Manga) ![]const fetch_interval.ChapterDates {
+    var dates: std.ArrayList(fetch_interval.ChapterDates) = .empty;
+    for (m.chapters) |ch| if (!m.excludes(ch.scanlator) and !ch.orphaned) try dates.append(arena, .{
+        .upload_ms = if (ch.date_upload == 0) null else ch.date_upload,
+        .fetch_ms = ch.date_fetch,
+    });
+    return dates.items;
+}
+
 fn sortByOrder(categories: []library.Category) void {
     std.mem.sort(library.Category, categories, {}, struct {
         fn less(_: void, x: library.Category, y: library.Category) bool {
@@ -1184,6 +1248,14 @@ fn sortByOrder(categories: []library.Category) void {
     }.less);
 }
 const Fetched = struct { manga_id: []const u8, new_chapters: []const []const u8 };
+
+/// How a fetch reschedules the title's next update.
+const Schedule = struct {
+    /// The user asked for it, so the schedule is estimated again.
+    manual: bool = false,
+    /// A library update's window, kept across its titles.
+    window: ?fetch_interval.Window = null,
+};
 
 fn findChapter(lib: library.Library, chapter_id: []const u8) ?Found {
     for (lib.manga) |m| for (m.chapters) |ch| {
@@ -1335,12 +1407,6 @@ pub const Job = struct {
 
 fn millis(io: Io) u64 {
     return @intCast(@divTrunc(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
-}
-
-/// Midnight before `ms` in the zone `utc_offset_s` from UTC, as UTC milliseconds.
-fn dayStart(ms: i64, utc_offset_s: i32) i64 {
-    const offset_ms = @as(i64, utc_offset_s) * std.time.ms_per_s;
-    return @divFloor(ms + offset_ms, std.time.ms_per_day) * std.time.ms_per_day - offset_ms;
 }
 
 fn wallMillis(io: Io) i64 {

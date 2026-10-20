@@ -173,7 +173,7 @@ const Reader = struct {
         const key = try self.varint();
         const number: u32 = @intCast(key >> 3);
         if (number == 0) return error.InvalidBackup;
-        const wire: Wire = @enumFromInt(@as(u3, @truncate(key)));
+        const wire: Wire = @fromBackingInt(@intCast(@as(u3, @truncate(key))));
         return .{ .number = number, .value = switch (wire) {
             .varint => .{ .varint = try self.varint() },
             .fixed64 => blk: {
@@ -219,7 +219,7 @@ const Writer = struct {
         try self.out.append(self.arena, @truncate(v));
     }
     fn key(self: *Writer, number: u32, wire: Wire) !void {
-        try self.varint(@as(u64, number) << 3 | @intFromEnum(wire));
+        try self.varint(@as(u64, number) << 3 | @backingInt(wire));
     }
     fn int64(self: *Writer, number: u32, value: i64) !void {
         try self.key(number, .varint);

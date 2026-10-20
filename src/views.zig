@@ -5,6 +5,7 @@
 const std = @import("std");
 const library = @import("library.zig");
 const settings = @import("settings.zig");
+const query = @import("query.zig");
 
 const Library = library.Library;
 const Manga = library.Manga;
@@ -62,7 +63,7 @@ pub const ChapterFlags = struct {
             .unread = tri(bits & unread_mask, 0x2, 0x4),
             .downloaded = tri(bits & downloaded_mask, 0x8, 0x10),
             .bookmarked = tri(bits & bookmarked_mask, 0x20, 0x40),
-            .sort = @enumFromInt(bits & sort_mask),
+            .sort = @fromBackingInt(@intCast(bits & sort_mask)),
             .display_number = bits & display_mask != 0,
         };
     }
@@ -74,7 +75,7 @@ pub const ChapterFlags = struct {
             untri(self.unread, 0x2, 0x4) |
             untri(self.downloaded, 0x8, 0x10) |
             untri(self.bookmarked, 0x20, 0x40) |
-            @intFromEnum(self.sort) |
+            @backingInt(self.sort) |
             (if (self.display_number) @as(u32, display_mask) else 0);
     }
 
@@ -274,7 +275,7 @@ pub const LibrarySort = struct {
 
     /// The flags for this sort, keeping bits of `old` it doesn't cover.
     pub fn encode(self: LibrarySort, old: u32) u32 {
-        return (old & ~@as(u32, mode_mask | ascending_bit)) | @intFromEnum(self.mode) | (if (self.ascending) @as(u32, ascending_bit) else 0);
+        return (old & ~@as(u32, mode_mask | ascending_bit)) | @backingInt(self.mode) | (if (self.ascending) @as(u32, ascending_bit) else 0);
     }
 };
 
@@ -306,7 +307,7 @@ pub const LibraryOptions = struct {
     default_sort: LibrarySort = .{},
     /// Seed for the random sort.
     random_seed: u64 = 0,
-    /// Only titles this accepts, as for a search; null accepts all.
+    /// Only titles this accepts, as `search` makes; null accepts all.
     match: ?Matcher = null,
     /// A track's score on a 10-point scale, or null if its tracker isn't
     /// logged in. Null leaves every title unscored for the tracker sort.
@@ -317,6 +318,69 @@ pub const Matcher = struct {
     context: *const anyopaque,
     matches: *const fn (context: *const anyopaque, manga: *const Manga, counts: library.Counts) bool,
 };
+
+/// A matcher for Mihon's library search syntax (see `query`); null for
+/// empty text, which matches everything.
+pub fn search(arena: std.mem.Allocator, lib: Library, text: []const u8, utc_offset_s: i32) !?Matcher {
+    if (std.mem.trim(u8, text, " \t\r\n,").len == 0) return null;
+    const Search = struct {
+        query: query.Query,
+        sources: []const library.SourceName,
+        utc_offset_s: i32,
+        arena: std.mem.Allocator,
+
+        fn matches(context: *const anyopaque, manga: *const Manga, counts: library.Counts) bool {
+            const self: *const @This() = @ptrCast(@alignCast(context));
+            return self.query.matches(subject(self, manga.*, counts), self.utc_offset_s);
+        }
+
+        fn subject(self: *const @This(), m: Manga, counts: library.Counts) query.Subject {
+            const id = m.source_id orelse 0;
+            var source: library.SourceName = .{ .id = id, .name = if (m.local()) "Local source" else "" };
+            for (self.sources) |known| if (known.id == id) {
+                source = known;
+            };
+            const remote = m.remote orelse @import("models.zig").Manga{ .url = "", .title = "" };
+            return .{
+                .title = m.title,
+                .author = if (m.author.len > 0) m.author else remote.author,
+                .artist = remote.artist,
+                .description = if (m.description.len > 0) m.description else remote.description,
+                .genres = genres(self.arena, remote.genre) catch &.{},
+                .source_name = source.name,
+                .source_id = id,
+                .notes = m.notes,
+                .language = source.lang,
+                .added = if (m.date_added == 0) null else m.date_added,
+                .next_update = if (m.next_update == 0) null else m.next_update,
+                .fetch_interval = m.fetch_interval,
+                .unread = @intCast(counts.unread),
+                .read = @intCast(counts.read),
+                .total = @intCast(counts.total),
+            };
+        }
+    };
+    const context = try arena.create(Search);
+    context.* = .{ .query = try query.parse(arena, text), .sources = lib.sources, .utc_offset_s = utc_offset_s, .arena = arena };
+    return .{ .context = @ptrCast(context), .matches = Search.matches };
+}
+
+/// A source's genre string as Mihon splits it: on ", ", trimmed, blanks
+/// dropped, each once.
+pub fn genres(arena: std.mem.Allocator, genre: ?[]const u8) ![]const []const u8 {
+    const text = genre orelse return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitSequence(u8, text, ", ");
+    while (it.next()) |part| {
+        const g = std.mem.trim(u8, part, " \t\r\n");
+        if (g.len == 0) continue;
+        const seen = for (list.items) |known| {
+            if (std.mem.eql(u8, known, g)) break true;
+        } else false;
+        if (!seen) try list.append(arena, g);
+    }
+    return list.items;
+}
 
 pub const Entry = struct {
     manga: *const Manga,
@@ -514,12 +578,12 @@ pub fn updates(arena: std.mem.Allocator, lib: Library, options: UpdatesOptions) 
 }
 
 /// Mihon's history: each title's most recently read chapter, latest first,
-/// titles containing `search` (any case) only. Includes titles no longer in
+/// titles containing `title` (any case) only. Includes titles no longer in
 /// the library.
-pub fn history(arena: std.mem.Allocator, lib: Library, search: []const u8) ![]FeedItem {
+pub fn history(arena: std.mem.Allocator, lib: Library, title: []const u8) ![]FeedItem {
     var items: std.ArrayList(FeedItem) = .empty;
     for (lib.manga) |*m| {
-        if (search.len > 0 and std.ascii.findIgnoreCase(m.title, search) == null) continue;
+        if (title.len > 0 and std.ascii.findIgnoreCase(m.title, title) == null) continue;
         var latest: ?*const Chapter = null;
         for (m.chapters) |*ch| {
             if (ch.last_read == 0) continue;
@@ -833,4 +897,33 @@ test "stats count favorites, all downloads and all reading time" {
     try testing.expectEqual(150, s.read_ms);
     try testing.expectEqual(0, s.update_candidates);
     try testing.expect(std.math.isNan(s.mean_score));
+}
+
+test "library search uses Mihon's syntax over titles, genres and sources" {
+    var a_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a_state.deinit();
+    const a = a_state.allocator();
+    var read = [_]Chapter{testChapter("r", 0, 1)};
+    read[0].read = true;
+    const lib: Library = .{
+        .manga = &.{
+            .{ .id = "1:/a", .title = "Alpha", .source_id = 1, .chapters = &read, .remote = .{ .url = "/a", .title = "Alpha", .genre = "Action, Comedy" } },
+            .{ .id = "1:/b", .title = "Beta", .source_id = 1, .remote = .{ .url = "/b", .title = "Beta", .genre = "Drama" } },
+            .{ .id = "local:C", .title = "Gamma" },
+        },
+        .sources = &.{.{ .id = 1, .name = "MangaDex", .lang = "en" }},
+    };
+    const Case = struct { text: []const u8, count: usize };
+    for ([_]Case{
+        .{ .text = "", .count = 3 },
+        .{ .text = "genre:comedy", .count = 1 },
+        .{ .text = "-genre:comedy", .count = 2 },
+        .{ .text = "mangadex", .count = 2 },
+        .{ .text = "local", .count = 1 },
+        .{ .text = "read>0 || gamma", .count = 2 },
+        .{ .text = "lang:en", .count = 2 },
+    }) |case| {
+        const groups = try libraryView(a, lib, .{ .match = try search(a, lib, case.text, 0) });
+        try testing.expectEqual(case.count, groups[0].entries.len);
+    }
 }
