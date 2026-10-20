@@ -175,6 +175,28 @@ pub const BridgeMethod = enum {
         };
     }
 
+    /// Zig argument tuple derived from the JNI signature at compile time.
+    fn Args(comptime m: BridgeMethod) type {
+        return comptime blk: {
+            const sig = m.signature();
+            var types: []const type = &.{};
+            var i: usize = 1;
+            while (sig[i] != ')') : (i += 1) {
+                const T = switch (sig[i]) {
+                    'J' => i64,
+                    '[' => array: {
+                        i += 1;
+                        if (sig[i] != 'B') @compileError("unsupported bridge array type");
+                        break :array []const u8;
+                    },
+                    else => @compileError("unsupported bridge argument type"),
+                };
+                types = types ++ &[_]type{T};
+            }
+            break :blk @Tuple(types);
+        };
+    }
+
     /// `true` when the method returns `byte[]`, so `invokeBytes` may be used.
     pub fn returnsBytes(m: BridgeMethod) bool {
         return std.mem.endsWith(u8, m.signature(), ")[B");
@@ -442,21 +464,22 @@ pub const Runtime = struct {
 
     /// Marshals a Zig tuple into `jvalue`s: `i64` -> `J`, `[]const u8` -> `byte[]`.
     /// The arrays are local refs owned by the caller's frame.
-    fn marshal(env: *jni.JNIEnv, args: anytype) Error![args.len]jni.jvalue {
+    fn marshal(env: *jni.JNIEnv, comptime method: BridgeMethod, args: method.Args()) Error![args.len]jni.jvalue {
         var out: [args.len]jni.jvalue = undefined;
         inline for (args, 0..) |arg, i| {
             out[i] = switch (@TypeOf(arg)) {
-                i64, comptime_int => .{ .j = arg },
-                else => .{ .l = try newByteArray(env, arg) },
+                i64 => .{ .j = arg },
+                []const u8 => .{ .l = try newByteArray(env, arg) },
+                else => unreachable,
             };
         }
         return out;
     }
 
     /// Calls a static object-returning bridge method inside the caller's frame.
-    fn callStatic(self: *Runtime, env: *jni.JNIEnv, comptime method: BridgeMethod, args: anytype) Error!jni.jobject {
+    fn callStatic(self: *Runtime, env: *jni.JNIEnv, comptime method: BridgeMethod, args: method.Args()) Error!jni.jobject {
         comptime std.debug.assert(method.returnsBytes());
-        const jargs = try marshal(env, args);
+        const jargs = try marshal(env, method, args);
         const result = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(method), &jargs);
         if (env.f.ExceptionCheck(env) != 0) {
             describeException(env);
@@ -466,7 +489,7 @@ pub const Runtime = struct {
     }
 
     /// Opens a frame, calls a `byte[]`-returning method and copies the reply out.
-    fn invokeInFrame(self: *Runtime, comptime method: BridgeMethod, args: anytype) Error![]u8 {
+    fn invokeInFrame(self: *Runtime, comptime method: BridgeMethod, args: method.Args()) Error![]u8 {
         const env = try self.frame();
         defer _ = env.f.PopLocalFrame(env, null);
         const arr = try self.callStatic(env, method, args) orelse return error.InvalidResponse;
@@ -474,14 +497,14 @@ pub const Runtime = struct {
     }
 
     /// Reply's `ok` payload re-serialised as JSON, owned by the caller.
-    fn invokeJson(self: *Runtime, comptime method: BridgeMethod, args: anytype) Error![]u8 {
+    fn invokeJson(self: *Runtime, comptime method: BridgeMethod, args: method.Args()) Error![]u8 {
         const reply = try self.invokeInFrame(method, args);
         defer self.gpa.free(reply);
         return unwrapOk(self.gpa, reply);
     }
 
     /// Reply's `ok` payload decoded as `T`.
-    fn invokeParsed(self: *Runtime, comptime T: type, comptime method: BridgeMethod, args: anytype) Error!Result(T) {
+    fn invokeParsed(self: *Runtime, comptime T: type, comptime method: BridgeMethod, args: method.Args()) Error!Result(T) {
         const reply = try self.invokeInFrame(method, args);
         defer self.gpa.free(reply);
         return parseEnvelope(T, self.gpa, reply);
@@ -753,4 +776,31 @@ test "every bridge method has a parseable signature" {
         try std.testing.expect(m.signature()[0] == '(');
         try std.testing.expect(m.returnsBytes() or m == .shutdown);
     }
+}
+
+test "bridge signatures determine Zig argument tuples" {
+    try std.testing.expect(BridgeMethod.Args(.call) == @Tuple(&.{ i64, []const u8, []const u8 }));
+    try std.testing.expect(BridgeMethod.Args(.install) == @Tuple(&.{[]const u8}));
+    try std.testing.expect(BridgeMethod.Args(.listExtensions) == @Tuple(&.{}));
+    // A long-only call does not touch JNI; preserve all bits of a source ID.
+    const args = try Runtime.marshal(undefined, .loadSource, .{std.math.minInt(i64)});
+    try std.testing.expectEqual(std.math.minInt(i64), args[0].j);
+    const empty = try Runtime.marshal(undefined, .listExtensions, .{});
+    try std.testing.expectEqual(0, empty.len);
+}
+
+test "dupeStrings releases every initialized prefix on allocation failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const strings = try dupeStrings(gpa, &.{ "first", "", "last" });
+            defer {
+                for (strings) |str| gpa.free(str);
+                gpa.free(strings);
+            }
+            try std.testing.expectEqualStrings("first", strings[0]);
+            try std.testing.expectEqualStrings("", strings[1]);
+            try std.testing.expectEqualStrings("last", strings[2]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
