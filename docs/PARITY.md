@@ -76,8 +76,8 @@ differs on purpose.
 |---|---|
 | Trackers' statuses, score scales and conversions, setters, automatic completion | Same (`tracking.zig`) |
 | AddTracks, TrackChapter, refresh, deferred retries, mark-read always/ask/never | Same |
-| Enhanced trackers' progress sync | Same rules; the Komga, Kavita and Suwayomi services in progress |
-| Services | MangaUpdates done; the others in progress, one file each under `src/track/` |
+| Services: MyAnimeList, AniList, Kitsu, Shikimori, Bangumi, MangaUpdates, Hikka, MangaBaka, Comick | Same requests and mappings, one file each under `src/track/`; the app keeps an OAuth login's verifier and state between opening the login page and finishing. AniList's 25-a-minute limit isn't ported |
+| Enhanced trackers (Komga, Kavita, Suwayomi): bound when a title joins the library, progress sync, migration | Same rules. **Deviation:** they authenticate from the extension's own settings (API key or basic auth for Komga, Kavita's JWT, Suwayomi's login modes) instead of sharing Android's cookie jar, and accept sources by extension package rather than class; see [enhanced-tracking.md](enhanced-tracking.md) |
 
 ## Boundaries
 

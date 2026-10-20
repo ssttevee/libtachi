@@ -1871,6 +1871,39 @@ pub const Engine = struct {
         try self.putTrack(job, manga_id, remote.tracker_id, merged);
     }
 
+    /// Binds the title to every logged-in enhanced tracker (Komga, Kavita,
+    /// Suwayomi) whose extension provides it, as Mihon's
+    /// `bindEnhancedTrackers`. The caller holds `tracking_lock`.
+    fn matchEnhanced(self: *Engine, job: *Job, state: *tracking.State, manga_id: []const u8) !void {
+        const a = job.arena.allocator();
+        const lib = try self.store.load(a);
+        const manga = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        const enhanced = @import("track/enhanced.zig");
+        const pkg = enhanced.sourcePackage(lib, manga);
+        for ([_]i32{ 6, 8, 9 }) |id| {
+            if (!state.loggedIn(id) or !enhanced.accepts(id, pkg)) continue;
+            for (manga.tracks) |t| {
+                if (t.tracker_id == id) break;
+            } else {
+                const reply = try self.trackerCall(job, state, id, .{ .search = (manga.remote orelse return error.LocalManga).url });
+                if (reply.matches.len == 0) continue;
+                const bound = (try self.trackerCall(job, state, id, .{ .bind = .{ .track = reply.matches[0].track, .has_read_chapters = false } })).track orelse return error.InvalidTrackerResponse;
+                try self.syncEnhanced(job, state, manga.id, bound);
+                job.result.tracking_reply = .{ .track = bound, .matches = reply.matches };
+            }
+        }
+    }
+
+    /// Mihon binds enhanced trackers when a title joins the library; a
+    /// failure there doesn't stop the add.
+    fn bindEnhancedOnAdd(self: *Engine, job: *Job, manga_id: []const u8) void {
+        self.tracking_lock.lockUncancelable(self.io);
+        defer self.tracking_lock.unlock(self.io);
+        const state = self.loadTrackers(job.arena.allocator()) catch return;
+        if (!state.loggedIn(6) and !state.loggedIn(8) and !state.loggedIn(9)) return;
+        self.matchEnhanced(job, state, manga_id) catch |err| log.warn("enhanced trackers not bound: {s}", .{@errorName(err)});
+    }
+
     fn executeTracking(self: *Engine, job: *Job) !void {
         try self.tracking_lock.lock(self.io);
         defer self.tracking_lock.unlock(self.io);
@@ -1884,24 +1917,7 @@ pub const Engine = struct {
                 }
                 job.result.tracking_reply = try self.trackerCall(job, state, c.id, c.operation);
             },
-            .track_match => |c| {
-                const lib = try self.store.load(a);
-                const manga = lib.manga[lib.find(c.manga_id) orelse return error.UnknownManga];
-                const enhanced = @import("track/enhanced.zig");
-                const pkg = enhanced.sourcePackage(lib, manga);
-                for ([_]i32{ 6, 8, 9 }) |id| {
-                    if (!state.loggedIn(id) or !enhanced.accepts(id, pkg)) continue;
-                    for (manga.tracks) |t| {
-                        if (t.tracker_id == id) break;
-                    } else {
-                        const reply = try self.trackerCall(job, state, id, .{ .search = (manga.remote orelse return error.LocalManga).url });
-                        if (reply.matches.len == 0) continue;
-                        const bound = (try self.trackerCall(job, state, id, .{ .bind = .{ .track = reply.matches[0].track, .has_read_chapters = false } })).track orelse return error.InvalidTrackerResponse;
-                        try self.syncEnhanced(job, state, manga.id, bound);
-                        job.result.tracking_reply = .{ .track = bound, .matches = reply.matches };
-                    }
-                }
-            },
+            .track_match => |c| try self.matchEnhanced(job, state, c.manga_id),
             .track_chapter => |c| try self.trackChapter(job, state, c.manga_id, c.chapter),
             .track_set => |c| {
                 if (!state.loggedIn(c.tracker_id)) return error.TrackerLoggedOut;
@@ -2058,6 +2074,7 @@ pub const Engine = struct {
                     };
                     try self.editTitle(a, fetched.manga_id, Edit{ .s = s }, Edit.apply);
                 }
+                self.bindEnhancedOnAdd(job, fetched.manga_id);
                 job.result = .{ .library_changed = true, .manga_id = fetched.manga_id, .new_chapters = fetched.new_chapters, .message = "Added to library" };
             },
             .refresh => |id| {
