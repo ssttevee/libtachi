@@ -44,6 +44,8 @@ Anything that may touch the network or take long is a `Request`, run as a
 | `migrate` | move a title to another source |
 | `import_backup`, `export_backup` | Mihon `.tachibk` backups |
 | `import_downloads`, `export_downloads` | Mihon's downloads folder layout |
+| `add_store`, `refresh_stores` | extension stores; with stores, `extensions` merges them all |
+| `tracker`, `track_bind`, `track_unbind`, `track_set`, `track_refresh`, `track_chapter`, `track_pending` | tracking: log in, search, bind, edit, refresh, progress and deferred retries |
 
 `Job.phase` says whether the JVM is starting or an extension is loading
 before the operation itself; `pages_done` / `pages_total` give progress.
@@ -83,9 +85,16 @@ Quick local edits are plain methods:
   `moveCategory`, `setCategories`, `setLibrarySort`.
 - Sources: `setSourceHidden`, `setSourcePinned`, `setLanguage`,
   `setLastSource`.
-- Housekeeping: `markUpdatesSeen`, `libraryUpdateDue`, `chapterCacheBytes`,
-  `clearChapterCache`, the download queue (`engine.queue`: `enqueue`,
-  `start`, `pause`, `remove`, `moveToFront`, `clear`, `snapshot`).
+- Extensions: `extensionStores`, `removeStore`, `trustExtension`,
+  `untrustedExtensions`.
+- Tracking: `loadTrackers`, `trackerLogout`, `saveTrackerFormats`,
+  `markReadTracked`, `applyTracking`; reader completion tracks on its own.
+- Housekeeping: `launched` (once at start), `setNetwork` (the device's
+  network, for Wi-Fi-only downloads), `markUpdatesSeen`,
+  `libraryUpdateDue`, `chapterCacheBytes`, `clearChapterCache`, the
+  download queue (`engine.queue`: `enqueue`, `start`, `pause`, `remove`,
+  `moveToFront`, `clear`, `snapshot`, `waitingForWifi`), and at exit
+  `finishTracking`, `queue.deinit` and `deinit`.
 
 ## Settings
 
@@ -105,6 +114,9 @@ Everything lives in the directory given as `Options.dir`:
 | `library.json` | titles, chapters, categories, known sources |
 | `reading.json` | per-chapter reading state, rewritten on page turns |
 | `settings.json` | `Settings` |
+| `stores.json` | extension stores and hand-trusted extensions |
+| `trackers.json` | tracker credentials, score formats, deferred updates |
+| `prefs/` | extensions' settings (the runtime's, with `Options.host_dir`) |
 | `downloads/` | downloaded pages; `queue.json` and `pending_delete.json` |
 | `local/` | the local source: one folder per series |
 | `covers/` | cached thumbnails and `custom/` covers |

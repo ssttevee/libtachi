@@ -72,8 +72,12 @@ differs on purpose.
 
 ## Tracking
 
-In progress: trackers, automatic progress, deferred retries, enhanced
-trackers.
+| Mihon | libtachi |
+|---|---|
+| Trackers' statuses, score scales and conversions, setters, automatic completion | Same (`tracking.zig`) |
+| AddTracks, TrackChapter, refresh, deferred retries, mark-read always/ask/never | Same |
+| Enhanced trackers' progress sync | Same rules; the Komga, Kavita and Suwayomi services in progress |
+| Services | MangaUpdates done; the others in progress, one file each under `src/track/` |
 
 ## Boundaries
 
