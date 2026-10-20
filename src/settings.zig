@@ -6,12 +6,15 @@ const std = @import("std");
 const Io = std.Io;
 const models = @import("models.zig");
 const library = @import("library.zig");
+const views = @import("views.zig");
 
 pub const Settings = struct {
     update: Update = .{},
     downloads: Downloads = .{},
     reader: Reader = .{},
     browse: Browse = .{},
+    library: Library = .{},
+    updates: Updates = .{},
 
     pub const Update = struct {
         /// Skip completed titles (`manga_ongoing`).
@@ -58,6 +61,9 @@ pub const Settings = struct {
         parallel_sources: u8 = 5,
         /// Pages downloading at once per source (`download_parallel_page_limit`).
         parallel_pages: u8 = 5,
+        /// Unread chapters to queue once a quarter of a downloaded chapter
+        /// is read, if the next is downloaded too; 0 never (`auto_download_while_reading`).
+        ahead: u8 = 0,
     };
 
     pub const Reader = struct {
@@ -84,6 +90,37 @@ pub const Settings = struct {
         last_source: i64 = 0,
         /// Global search only searches pinned sources.
         search_pinned_only: bool = true,
+    };
+
+    pub const Library = struct {
+        filters: views.LibraryFilters = .{},
+        /// Only downloaded and local titles and chapters (`pref_downloaded_only`).
+        downloaded_only: bool = false,
+        /// The sort for new categories and titles in none, as `Category.flags`
+        /// (`library_sorting_mode`); alphabetical, ascending.
+        sort: u32 = 0x40,
+        /// Each category keeps its own sort (`categorized_display`); otherwise
+        /// a sort applies to all.
+        per_category_sort: bool = false,
+        /// Seed of the random sort (`library_random_sort_seed`).
+        random_seed: u64 = 0,
+        /// Category new titles go into; null none (`default_category`).
+        default_category: ?u32 = null,
+        /// Chapter list flags new titles start with (`default_chapter_*`).
+        default_chapter_flags: u32 = 0,
+    };
+
+    pub const Updates = struct {
+        downloaded: views.TriState = .disabled,
+        unread: views.TriState = .disabled,
+        started: views.TriState = .disabled,
+        bookmarked: views.TriState = .disabled,
+        hide_excluded_scanlators: bool = false,
+        categories: []const u32 = &.{},
+        exclude_categories: []const u32 = &.{},
+        /// Categories for the upcoming feed (`pref_filter_upcoming_*_categories`).
+        upcoming_categories: []const u32 = &.{},
+        upcoming_exclude_categories: []const u32 = &.{},
     };
 
     pub const file_name = "settings.json";

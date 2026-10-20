@@ -22,6 +22,7 @@ pub const recognition = @import("recognition.zig");
 pub const backup = @import("backup.zig");
 pub const settings = @import("settings.zig");
 pub const queue = @import("queue.zig");
+pub const views = @import("views.zig");
 pub const downloads = @import("downloads.zig");
 pub const backend = @import("backend.zig");
 pub const worker = @import("worker.zig");
@@ -827,6 +828,7 @@ test {
     _ = backup;
     _ = settings;
     _ = queue;
+    _ = views;
     _ = downloads;
     std.testing.refAllDecls(backend.InProcess);
     std.testing.refAllDecls(worker);

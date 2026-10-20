@@ -161,6 +161,17 @@ pub const Queue = struct {
     /// Removes a chapter from the queue, cancelling it if it is downloading.
     pub fn remove(self: *Queue, engine: *Engine, chapter_id: []const u8) !void {
         self.acquire();
+        self.ensureLoaded(engine) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        const queued = for (self.items.items) |item| {
+            if (std.mem.eql(u8, item.chapter_id, chapter_id)) break true;
+        } else false;
+        if (!queued) {
+            self.lock.unlock();
+            return;
+        }
         const downloading = for (self.items.items) |item| {
             if (std.mem.eql(u8, item.chapter_id, chapter_id)) break item.status == .downloading;
         } else false;
@@ -181,6 +192,7 @@ pub const Queue = struct {
     pub fn moveToFront(self: *Queue, engine: *Engine, chapter_id: []const u8) !void {
         self.acquire();
         defer self.lock.unlock();
+        try self.ensureLoaded(engine);
         for (self.items.items, 0..) |item, i| if (std.mem.eql(u8, item.chapter_id, chapter_id)) {
             const moved = self.items.orderedRemove(i);
             try self.items.insert(engine.gpa, 0, moved);
@@ -193,6 +205,7 @@ pub const Queue = struct {
         self.pause(engine);
         self.acquire();
         defer self.lock.unlock();
+        self.loaded = true;
         for (self.items.items) |item| freeItem(engine.gpa, item);
         self.items.clearRetainingCapacity();
         try self.persist(engine);

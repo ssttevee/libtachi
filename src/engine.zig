@@ -22,6 +22,7 @@ const backup = @import("backup.zig");
 const settings = @import("settings.zig");
 const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
+const views = @import("views.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -48,9 +49,11 @@ pub const Request = union(enum) {
     update_library: struct { category: ?u32 = null },
     /// Downloads a library chapter, resuming pages an earlier attempt saved.
     download: []const u8,
-    /// Deletes a chapter's downloaded pages.
+    /// Deletes a chapter's downloaded pages, unless the deletion settings
+    /// protect it; see `Engine.deleteDownloads`.
     delete_download: []const u8,
-    /// Removes a title from the library; its downloads stay.
+    /// Takes a title out of the library, keeping its chapters, history and
+    /// downloads; `Engine.clearDatabase` forgets it.
     remove: []const u8,
     /// Adds the series in the local source to the library.
     scan_local,
@@ -120,6 +123,9 @@ pub const Engine = struct {
     paused: std.atomic.Value(bool) = .init(false),
     /// Mihon's download queue; see `queue.Queue`.
     queue: queue_mod.Queue = .{},
+    /// The chapter `pageShown` last checked for downloading ahead (a hash).
+    ahead_checked: std.atomic.Value(u64) = .init(0),
+    pending_lock: Io.Mutex = .init,
     /// Runs jobs instead of the engine, for tests without a JVM.
     execute_fn: ?*const fn (*Engine, *Job) anyerror!void = null,
 
@@ -141,12 +147,12 @@ pub const Engine = struct {
     /// and adds `read_ms` of reading time to its history. Cheap enough for
     /// every page turn: only the reading-state file is rewritten.
     pub fn setProgress(self: *Engine, chapter_id: []const u8, page: u32, read: bool, read_ms: i64) !void {
-        try self.store.setProgress(self.gpa, &.{.{ .chapter_id = chapter_id, .page = page, .read = read, .now = wallMillis(self.io), .read_ms = read_ms }});
+        _ = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = chapter_id, .page = page, .read = read, .now = wallMillis(self.io), .read_ms = read_ms }});
     }
 
     /// Records several chapters' progress in one write, as for an import.
     pub fn setProgressMany(self: *Engine, progress: []const library.Progress) !void {
-        try self.store.setProgress(self.gpa, progress);
+        _ = try self.store.setProgress(self.gpa, progress);
     }
 
     /// Stops extension work and refuses new jobs until `resume`, as for an
@@ -173,6 +179,668 @@ pub const Engine = struct {
     /// No job is running: lets the backend do its upkeep.
     pub fn idle(self: *Engine) void {
         self.backend.idle();
+    }
+
+    // ---- views -----------------------------------------------------------------
+
+    /// The library as Mihon shows it, with the settings' filters and sorts,
+    /// and only titles whose title contains `search` if it isn't empty.
+    /// Allocated in `arena`.
+    pub fn libraryView(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.Group {
+        const s = try self.loadSettings(arena);
+        const Search = struct {
+            text: []const u8,
+            fn matches(context: *const anyopaque, manga: *const library.Manga, _: library.Counts) bool {
+                const text: *const []const u8 = @ptrCast(@alignCast(context));
+                return std.ascii.findIgnoreCase(manga.title, text.*) != null;
+            }
+        };
+        const text = try arena.create([]const u8);
+        text.* = search;
+        return views.libraryView(arena, try self.store.load(arena), .{
+            .filters = s.library.filters,
+            .downloaded_only = s.library.downloaded_only,
+            .skip_outside_release_period = s.update.skip_outside_release_period,
+            .default_sort = .decode(s.library.sort),
+            .random_seed = s.library.random_seed,
+            .match = if (search.len == 0) null else .{ .context = @ptrCast(text), .matches = Search.matches },
+        });
+    }
+
+    /// A title's chapters as its chapter list flags show them.
+    pub fn chapterList(self: *Engine, arena: std.mem.Allocator, manga_id: []const u8) ![]library.Chapter {
+        const s = try self.loadSettings(arena);
+        const lib = try self.store.load(arena);
+        return views.chapterList(arena, lib.manga[lib.find(manga_id) orelse return error.UnknownManga], s.library.downloaded_only);
+    }
+
+    /// The chapters the reader moves through from `chapter_id`.
+    pub fn readerChapters(self: *Engine, arena: std.mem.Allocator, chapter_id: []const u8) !views.ReaderChapters {
+        const s = try self.loadSettings(arena);
+        const found = findChapter(try self.store.load(arena), chapter_id) orelse return error.UnknownChapter;
+        return (try views.readerChapters(arena, found.manga, chapter_id, s.reader, s.library.downloaded_only)).?;
+    }
+
+    /// Mihon's updates feed with the settings' filters.
+    pub fn updatesFeed(self: *Engine, arena: std.mem.Allocator) ![]views.FeedItem {
+        const s = try self.loadSettings(arena);
+        const u = s.updates;
+        return views.updates(arena, try self.store.load(arena), .{
+            .downloaded = u.downloaded,
+            .unread = u.unread,
+            .started = u.started,
+            .bookmarked = u.bookmarked,
+            .hide_excluded_scanlators = u.hide_excluded_scanlators,
+            .categories = u.categories,
+            .exclude_categories = u.exclude_categories,
+            .downloaded_only = s.library.downloaded_only,
+            .now = wallMillis(self.io),
+            .utc_offset_s = self.options.utc_offset_s,
+        });
+    }
+
+    /// Each title's latest read chapter, latest first.
+    pub fn history(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.FeedItem {
+        return views.history(arena, try self.store.load(arena), search);
+    }
+
+    /// Library titles expected to update today or later.
+    pub fn upcoming(self: *Engine, arena: std.mem.Allocator) ![]*const library.Manga {
+        const s = try self.loadSettings(arena);
+        return views.upcoming(arena, try self.store.load(arena), s.updates.upcoming_categories, s.updates.upcoming_exclude_categories, wallMillis(self.io), self.options.utc_offset_s);
+    }
+
+    pub fn stats(self: *Engine, arena: std.mem.Allocator) !views.Stats {
+        const s = try self.loadSettings(arena);
+        return views.stats(try self.store.load(arena), s.update, null);
+    }
+
+    // ---- reading ---------------------------------------------------------------
+
+    pub const PageShown = struct {
+        chapter_id: []const u8,
+        /// Zero-based page now shown.
+        page: u32,
+        /// Pages in the chapter.
+        pages: u32,
+        /// Reading time since the last call, in milliseconds, for history.
+        read_ms: i64 = 0,
+    };
+
+    /// The reader's hook for each page shown, doing what Mihon's reader
+    /// does: records the page, and on the last one marks the chapter read,
+    /// queues the download `remove_after_read_slots` chapters behind for
+    /// deletion and marks same-numbered chapters read if the settings say
+    /// so. Past a quarter of a downloaded chapter whose next chapter is
+    /// downloaded, it queues the next unread ones (`Settings.downloads.ahead`).
+    /// Records nothing in incognito. Call `leaveReader` when the reader closes.
+    pub fn pageShown(self: *Engine, shown: PageShown) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const s = try self.loadSettings(a);
+        if (s.reader.incognito) return;
+        const last = shown.pages > 0 and shown.page + 1 >= shown.pages;
+        const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
+        const hash = std.hash.Wyhash.hash(0, shown.chapter_id);
+        const ahead = s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash;
+        if (!newly_read and !ahead) return;
+        const lib = try self.store.load(a);
+        const found = findChapter(lib, shown.chapter_id) orelse return;
+        if (newly_read) try self.chapterFinished(a, s, found);
+        if (ahead) try self.downloadAhead(a, s, found, hash);
+    }
+
+    /// Deletes the downloads finished chapters queued for deletion, as
+    /// Mihon does when the reader closes.
+    pub fn leaveReader(self: *Engine) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        self.pending_lock.lockUncancelable(self.io);
+        defer self.pending_lock.unlock(self.io);
+        const pending = try self.loadPending(a);
+        if (pending.len == 0) return;
+        _ = try self.removeDownloads(a, pending);
+        try self.savePending(a, &.{});
+    }
+
+    fn chapterFinished(self: *Engine, a: std.mem.Allocator, s: settings.Settings, found: Found) !void {
+        const manga = found.manga;
+        if (s.downloads.remove_after_read_slots >= 0) if (try views.readerChapters(a, manga, found.chapter.id, s.reader, s.library.downloaded_only)) |list| {
+            const slots: usize = @intCast(s.downloads.remove_after_read_slots);
+            if (list.current >= slots and list.chapters[list.current - slots].read) {
+                const target = list.chapters[list.current - slots];
+                var doomed: std.ArrayList(library.Chapter) = .empty;
+                try doomed.append(a, target);
+                // Mihon deletes duplicates of the number too, as read.
+                if (s.update.mark_existing_duplicates_read) for (manga.chapters) |ch| {
+                    if (std.mem.eql(u8, ch.id, target.id) or !ch.recognized() or ch.number != target.number) continue;
+                    var copy = ch;
+                    copy.read = true;
+                    try doomed.append(a, copy);
+                };
+                const ids = try deletable(a, s, manga, doomed.items);
+                self.pending_lock.lockUncancelable(self.io);
+                defer self.pending_lock.unlock(self.io);
+                var pending: std.ArrayList([]const u8) = .empty;
+                try pending.appendSlice(a, try self.loadPending(a));
+                for (ids) |id| {
+                    const known = for (pending.items) |p| {
+                        if (std.mem.eql(u8, p, id)) break true;
+                    } else false;
+                    if (!known) try pending.append(a, id);
+                }
+                try self.savePending(a, pending.items);
+            }
+        };
+        if (s.update.mark_existing_duplicates_read and found.chapter.recognized()) {
+            var states: std.ArrayList(library.Reading) = .empty;
+            for (manga.chapters) |ch| if (!ch.read and ch.recognized() and ch.number == found.chapter.number) {
+                var state = readingOf(ch);
+                state.read = true;
+                try states.append(a, state);
+            };
+            try self.store.putReading(self.gpa, states.items);
+        }
+    }
+
+    fn downloadAhead(self: *Engine, a: std.mem.Allocator, s: settings.Settings, found: Found, hash: u64) !void {
+        const manga = found.manga;
+        if (manga.local() or !found.chapter.downloaded()) return self.ahead_checked.store(hash, .release);
+        const list = (try views.readerChapters(a, manga, found.chapter.id, s.reader, s.library.downloaded_only)).?;
+        const next = list.next() orelse return self.ahead_checked.store(hash, .release);
+        // Checked again on later pages, in case it finishes downloading.
+        if (!next.downloaded()) return;
+        self.ahead_checked.store(hash, .release);
+        var chapters = try views.nextUnread(a, manga, next.id);
+        if (s.reader.skip_duplicates) chapters = try views.removeDuplicates(a, chapters, next);
+        const take = chapters[0..@min(chapters.len, s.downloads.ahead)];
+        const ids = try a.alloc([]const u8, take.len);
+        for (take, ids) |ch, *id| id.* = ch.id;
+        if (ids.len > 0) _ = try self.queue.enqueue(self, ids, true);
+    }
+
+    const Pending = struct { chapters: []const []const u8 = &.{} };
+
+    fn pendingPath(self: *Engine, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ self.options.dir, "downloads", "pending_delete.json" });
+    }
+
+    /// The caller holds `pending_lock`.
+    fn loadPending(self: *Engine, a: std.mem.Allocator) ![]const []const u8 {
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, try self.pendingPath(a), a, .limited(4 << 20)) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        return (try std.json.parseFromSliceLeaky(Pending, a, bytes, models.parse_options)).chapters;
+    }
+
+    fn savePending(self: *Engine, a: std.mem.Allocator, ids: []const []const u8) !void {
+        const path = try self.pendingPath(a);
+        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
+        try library.writeJsonAtomic(a, self.io, path, Pending{ .chapters = ids });
+    }
+
+    // ---- chapter actions ---------------------------------------------------------
+
+    /// Marks chapters read or unread as Mihon does: marking read changes
+    /// only unread chapters, marking unread also clears partly read ones'
+    /// page. Marked read, their downloads are deleted if
+    /// `remove_after_marked_read` is set, within the deletion protections.
+    /// Returns how many chapters changed.
+    pub fn markRead(self: *Engine, chapter_ids: []const []const u8, read: bool) !usize {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const s = try self.loadSettings(a);
+        const lib = try self.store.load(a);
+        var states: std.ArrayList(library.Reading) = .empty;
+        var doomed: std.ArrayList([]const u8) = .empty;
+        for (lib.manga) |m| {
+            var changed: std.ArrayList(library.Chapter) = .empty;
+            for (m.chapters) |ch| {
+                if (!contains(chapter_ids, ch.id)) continue;
+                if (if (read) ch.read else !ch.read and ch.last_page_read == 0) continue;
+                var state = readingOf(ch);
+                state.read = read;
+                if (!read) state.page = 0;
+                try states.append(a, state);
+                var copy = ch;
+                copy.read = read;
+                try changed.append(a, copy);
+            }
+            if (read and s.downloads.remove_after_marked_read and !m.local()) try doomed.appendSlice(a, try deletable(a, s, m, changed.items));
+        }
+        try self.store.putReading(self.gpa, states.items);
+        if (doomed.items.len > 0) _ = try self.removeDownloads(a, doomed.items);
+        return states.items.len;
+    }
+
+    /// Marks every chapter of a title read or unread.
+    pub fn markTitleRead(self: *Engine, manga_id: []const u8, read: bool) !usize {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const lib = try self.store.load(a);
+        const m = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        const ids = try a.alloc([]const u8, m.chapters.len);
+        for (m.chapters, ids) |ch, *id| id.* = ch.id;
+        return self.markRead(ids, read);
+    }
+
+    /// Marks read the chapters before `chapter_id` as the chapter list shows them.
+    pub fn markPreviousRead(self: *Engine, chapter_id: []const u8) !usize {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const s = try self.loadSettings(a);
+        const found = findChapter(try self.store.load(a), chapter_id) orelse return error.UnknownChapter;
+        return self.markRead(try views.previousChapters(a, found.manga, chapter_id, s.library.downloaded_only), true);
+    }
+
+    pub fn setBookmark(self: *Engine, chapter_ids: []const []const u8, bookmark: bool) !usize {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const lib = try self.store.load(a);
+        var states: std.ArrayList(library.Reading) = .empty;
+        for (lib.manga) |m| for (m.chapters) |ch| {
+            if (!contains(chapter_ids, ch.id) or ch.bookmark == bookmark) continue;
+            var state = readingOf(ch);
+            state.bookmark = bookmark;
+            try states.append(a, state);
+        };
+        try self.store.putReading(self.gpa, states.items);
+        return states.items.len;
+    }
+
+    pub const HistoryScope = union(enum) {
+        chapter: []const u8,
+        manga: []const u8,
+        /// Clears all reading time too, as Mihon's "remove all" does.
+        all,
+    };
+
+    /// Removes chapters from the history. A chapter or title keeps its
+    /// reading time; clearing all forgets it.
+    pub fn removeHistory(self: *Engine, scope: HistoryScope) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const lib = try self.store.load(a);
+        var states: std.ArrayList(library.Reading) = .empty;
+        for (lib.manga) |m| for (m.chapters) |ch| {
+            const in_scope = switch (scope) {
+                .chapter => |id| std.mem.eql(u8, ch.id, id),
+                .manga => |id| std.mem.eql(u8, m.id, id),
+                .all => true,
+            };
+            if (!in_scope or (ch.last_read == 0 and (scope != .all or ch.read_ms == 0))) continue;
+            var state = readingOf(ch);
+            state.last_read = 0;
+            if (scope == .all) state.read_ms = 0;
+            try states.append(a, state);
+        };
+        try self.store.putReading(self.gpa, states.items);
+    }
+
+    /// Deletes chapters' downloads, except those Mihon's deletion settings
+    /// protect: bookmarked ones unless `remove_bookmarked`, and read ones of
+    /// titles in `remove_exclude_categories`. Returns how many were deleted.
+    pub fn deleteDownloads(self: *Engine, chapter_ids: []const []const u8) !usize {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const s = try self.loadSettings(a);
+        const lib = try self.store.load(a);
+        var doomed: std.ArrayList([]const u8) = .empty;
+        for (lib.manga) |m| {
+            if (m.local()) continue;
+            var chapters: std.ArrayList(library.Chapter) = .empty;
+            for (m.chapters) |ch| if (contains(chapter_ids, ch.id)) try chapters.append(a, ch);
+            try doomed.appendSlice(a, try deletable(a, s, m, chapters.items));
+        }
+        return self.removeDownloads(a, doomed.items);
+    }
+
+    /// Takes chapters out of the download queue and deletes their files.
+    fn removeDownloads(self: *Engine, a: std.mem.Allocator, chapter_ids: []const []const u8) !usize {
+        for (chapter_ids) |id| try self.queue.remove(self, id);
+        const Edit = struct {
+            ids: []const []const u8,
+            pages: *std.ArrayList([]const u8),
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var next = current;
+                var changed = false;
+                for (edit.ids) |id| {
+                    const found = findChapter(next, id) orelse continue;
+                    if (found.manga.local() or !found.chapter.downloaded()) continue;
+                    try edit.pages.appendSlice(arena, found.chapter.pages);
+                    next = (try library.setPages(arena, next, id, &.{})).?;
+                    changed = true;
+                }
+                return if (changed) next else null;
+            }
+        };
+        var pages: std.ArrayList([]const u8) = .empty;
+        _ = try self.store.update(a, Edit{ .ids = chapter_ids, .pages = &pages }, Edit.apply);
+        var deleted: usize = 0;
+        var last_dir: ?[]const u8 = null;
+        for (pages.items) |page| {
+            const path = try self.store.pagePath(a, page);
+            Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            const dir = std.fs.path.dirname(path) orelse continue;
+            if (last_dir == null or !std.mem.eql(u8, last_dir.?, dir)) {
+                if (last_dir) |d| self.removeEmptyDirs(d);
+                last_dir = dir;
+                deleted += 1;
+            }
+        }
+        if (last_dir) |d| self.removeEmptyDirs(d);
+        return deleted;
+    }
+
+    /// Removes `dir` and its parent if they are empty, stopping at `downloads`.
+    fn removeEmptyDirs(self: *Engine, dir: []const u8) void {
+        Io.Dir.cwd().deleteDir(self.io, dir) catch return;
+        const parent = std.fs.path.dirname(dir) orelse return;
+        if (std.mem.eql(u8, std.fs.path.basename(parent), "downloads")) return;
+        Io.Dir.cwd().deleteDir(self.io, parent) catch {};
+    }
+
+    // ---- titles -----------------------------------------------------------------
+
+    /// Adds a title to the library or takes it out, keeping its chapters and
+    /// history either way. Added, it gets the date and, if it has none, the
+    /// default category.
+    pub fn setFavorite(self: *Engine, manga_id: []const u8, favorite: bool) !void {
+        const Edit = struct {
+            favorite: bool,
+            now: i64,
+            default_category: ?u32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, m: *library.Manga) !bool {
+                if (m.favorite == edit.favorite) return false;
+                m.favorite = edit.favorite;
+                if (edit.favorite) {
+                    m.date_added = edit.now;
+                    if (m.categories.len == 0) if (edit.default_category) |c| {
+                        m.categories = try arena.dupe(u32, &.{c});
+                    };
+                }
+                return true;
+            }
+        };
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const s = try self.loadSettings(arena_state.allocator());
+        try self.editTitle(arena_state.allocator(), manga_id, Edit{ .favorite = favorite, .now = wallMillis(self.io), .default_category = s.library.default_category }, Edit.apply);
+    }
+
+    pub fn setNotes(self: *Engine, manga_id: []const u8, notes: []const u8) !void {
+        try self.setField(manga_id, "notes", notes);
+    }
+
+    /// Hides chapters from these scanlation groups and skips them in updates.
+    pub fn setExcludedScanlators(self: *Engine, manga_id: []const u8, groups: []const []const u8) !void {
+        try self.setField(manga_id, "excluded_scanlators", groups);
+    }
+
+    /// Sets a title's chapter list bits; see `views.ChapterFlags`.
+    pub fn setChapterFlags(self: *Engine, manga_id: []const u8, flags: u32) !void {
+        try self.setField(manga_id, "chapter_flags", flags);
+    }
+
+    /// Sets a title's reader bits: reading mode in 0x7, orientation in 0x38.
+    pub fn setReaderFlags(self: *Engine, manga_id: []const u8, flags: u32) !void {
+        try self.setField(manga_id, "reader_flags", flags);
+    }
+
+    /// Makes a title's chapter list flags the default for new titles, and
+    /// with `apply_to_library` for every library title too.
+    pub fn setDefaultChapterFlags(self: *Engine, flags: u32, apply_to_library: bool) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var s = try self.loadSettings(a);
+        s.library.default_chapter_flags = flags;
+        try self.saveSettings(s);
+        if (!apply_to_library) return;
+        const Edit = struct {
+            flags: u32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                const titles = try arena.dupe(library.Manga, current.manga);
+                for (titles) |*m| if (m.favorite) {
+                    m.chapter_flags = edit.flags;
+                };
+                var next = current;
+                next.manga = titles;
+                return next;
+            }
+        };
+        _ = try self.store.update(a, Edit{ .flags = flags }, Edit.apply);
+    }
+
+    /// Mihon's "clear database": forgets titles not in the library, those
+    /// with read chapters too unless `keep_read`. Their downloads stay.
+    pub fn clearDatabase(self: *Engine, keep_read: bool) !usize {
+        const Edit = struct {
+            keep_read: bool,
+            removed: *usize,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var kept: std.ArrayList(library.Manga) = .empty;
+                for (current.manga) |m| {
+                    if (!m.favorite and !(edit.keep_read and m.counts().read > 0)) continue;
+                    try kept.append(arena, m);
+                }
+                edit.removed.* = current.manga.len - kept.items.len;
+                if (edit.removed.* == 0) return null;
+                var next = current;
+                next.manga = kept.items;
+                return next;
+            }
+        };
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        var removed: usize = 0;
+        _ = try self.store.update(arena_state.allocator(), Edit{ .keep_read = keep_read, .removed = &removed }, Edit.apply);
+        return removed;
+    }
+
+    fn setField(self: *Engine, manga_id: []const u8, comptime field: []const u8, value: anytype) !void {
+        const Edit = struct {
+            value: @TypeOf(value),
+            fn apply(edit: @This(), _: std.mem.Allocator, m: *library.Manga) !bool {
+                @field(m, field) = edit.value;
+                return true;
+            }
+        };
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        try self.editTitle(arena_state.allocator(), manga_id, Edit{ .value = value }, Edit.apply);
+    }
+
+    fn editTitle(self: *Engine, a: std.mem.Allocator, manga_id: []const u8, context: anytype, comptime edit: fn (@TypeOf(context), std.mem.Allocator, *library.Manga) anyerror!bool) !void {
+        const Edit = struct {
+            id: []const u8,
+            context: @TypeOf(context),
+            found: *bool,
+            fn apply(e: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                e.found.* = current.find(e.id) != null;
+                return library.editManga(arena, current, e.id, e.context, edit);
+            }
+        };
+        var found = false;
+        _ = try self.store.update(a, Edit{ .id = manga_id, .context = context, .found = &found }, Edit.apply);
+        if (!found) return error.UnknownManga;
+    }
+
+    // ---- categories ---------------------------------------------------------------
+
+    /// Adds a category after the others, sorted as the library sort says.
+    pub fn createCategory(self: *Engine, name: []const u8) !u32 {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const s = try self.loadSettings(a);
+        const Edit = struct {
+            name: []const u8,
+            flags: u32,
+            id: *u32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                if (edit.name.len == 0) return error.InvalidCategoryName;
+                var max_id: u32 = 0;
+                var next_order: u32 = 0;
+                for (current.categories) |c| {
+                    if (std.mem.eql(u8, c.name, edit.name)) return error.DuplicateCategory;
+                    max_id = @max(max_id, c.id);
+                    next_order = @max(next_order, c.order + 1);
+                }
+                edit.id.* = max_id + 1;
+                const categories = try arena.alloc(library.Category, current.categories.len + 1);
+                @memcpy(categories[0..current.categories.len], current.categories);
+                categories[current.categories.len] = .{ .id = max_id + 1, .name = edit.name, .order = next_order, .flags = edit.flags };
+                var next = current;
+                next.categories = categories;
+                return next;
+            }
+        };
+        var id: u32 = 0;
+        _ = try self.store.update(a, Edit{ .name = name, .flags = s.library.sort, .id = &id }, Edit.apply);
+        return id;
+    }
+
+    pub fn renameCategory(self: *Engine, id: u32, name: []const u8) !void {
+        const Edit = struct {
+            id: u32,
+            name: []const u8,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                if (edit.name.len == 0) return error.InvalidCategoryName;
+                const categories = try arena.dupe(library.Category, current.categories);
+                var found = false;
+                for (categories) |*c| {
+                    if (c.id == edit.id) {
+                        c.name = edit.name;
+                        found = true;
+                    } else if (std.mem.eql(u8, c.name, edit.name)) return error.DuplicateCategory;
+                }
+                if (!found) return error.UnknownCategory;
+                var next = current;
+                next.categories = categories;
+                return next;
+            }
+        };
+        try self.editLibrary(Edit{ .id = id, .name = name }, Edit.apply);
+    }
+
+    /// Deletes a category; its titles leave it, and those in no other go to
+    /// the default category.
+    pub fn deleteCategory(self: *Engine, id: u32) !void {
+        const Edit = struct {
+            id: u32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var kept: std.ArrayList(library.Category) = .empty;
+                for (current.categories) |c| if (c.id != edit.id) try kept.append(arena, c);
+                if (kept.items.len == current.categories.len) return error.UnknownCategory;
+                sortByOrder(kept.items);
+                for (kept.items, 0..) |*c, i| c.order = @intCast(i);
+                const titles = try arena.dupe(library.Manga, current.manga);
+                for (titles) |*m| {
+                    if (std.mem.indexOfScalar(u32, m.categories, edit.id) == null) continue;
+                    var own: std.ArrayList(u32) = .empty;
+                    for (m.categories) |c| if (c != edit.id) try own.append(arena, c);
+                    m.categories = own.items;
+                }
+                var next = current;
+                next.categories = kept.items;
+                next.manga = titles;
+                return next;
+            }
+        };
+        try self.editLibrary(Edit{ .id = id }, Edit.apply);
+    }
+
+    /// Moves a category to position `to` among the categories.
+    pub fn moveCategory(self: *Engine, id: u32, to: usize) !void {
+        const Edit = struct {
+            id: u32,
+            to: usize,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var list: std.ArrayList(library.Category) = .empty;
+                try list.appendSlice(arena, current.categories);
+                sortByOrder(list.items);
+                const from = for (list.items, 0..) |c, i| {
+                    if (c.id == edit.id) break i;
+                } else return error.UnknownCategory;
+                const moved = list.orderedRemove(from);
+                try list.insert(arena, @min(edit.to, list.items.len), moved);
+                for (list.items, 0..) |*c, i| c.order = @intCast(i);
+                var next = current;
+                next.categories = list.items;
+                return next;
+            }
+        };
+        try self.editLibrary(Edit{ .id = id, .to = to }, Edit.apply);
+    }
+
+    /// Puts titles in exactly these categories; empty is the default category.
+    pub fn setCategories(self: *Engine, manga_ids: []const []const u8, category_ids: []const u32) !void {
+        const Edit = struct {
+            ids: []const []const u8,
+            categories: []const u32,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                for (edit.categories) |id| {
+                    const known = for (current.categories) |c| {
+                        if (c.id == id) break true;
+                    } else false;
+                    if (!known) return error.UnknownCategory;
+                }
+                const own = try arena.dupe(u32, edit.categories);
+                const titles = try arena.dupe(library.Manga, current.manga);
+                for (titles) |*m| if (contains(edit.ids, m.id)) {
+                    m.categories = own;
+                };
+                var next = current;
+                next.manga = titles;
+                return next;
+            }
+        };
+        try self.editLibrary(Edit{ .ids = manga_ids, .categories = category_ids }, Edit.apply);
+    }
+
+    /// Sets the library sort as Mihon does: for every category and the
+    /// global sort, or with `per_category_sort` for just `category` (0, the
+    /// default category, keeps the global sort).
+    pub fn setLibrarySort(self: *Engine, category: u32, sort: views.LibrarySort) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        var s = try self.loadSettings(a);
+        const only: ?u32 = if (s.library.per_category_sort and category != 0) category else null;
+        if (only == null) {
+            s.library.sort = sort.encode(s.library.sort);
+            try self.saveSettings(s);
+        }
+        const Edit = struct {
+            only: ?u32,
+            sort: views.LibrarySort,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                const categories = try arena.dupe(library.Category, current.categories);
+                for (categories) |*c| if (edit.only == null or edit.only.? == c.id) {
+                    c.flags = edit.sort.encode(c.flags);
+                };
+                var next = current;
+                next.categories = categories;
+                return next;
+            }
+        };
+        try self.editLibrary(Edit{ .only = only, .sort = sort }, Edit.apply);
+    }
+
+    fn editLibrary(self: *Engine, context: anytype, comptime edit: fn (@TypeOf(context), std.mem.Allocator, library.Library) anyerror!?library.Library) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        _ = try self.store.update(arena_state.allocator(), context, edit);
     }
 
     // ---- operations ------------------------------------------------------------
@@ -212,8 +880,24 @@ pub const Engine = struct {
             .add => |c| {
                 const a = job.arena.allocator();
                 const current = try self.store.load(a);
-                const existing = if (current.find(try library.mangaId(a, c.source, c.manga.url))) |i| current.manga[i].chapters else &.{};
+                const index = current.find(try library.mangaId(a, c.source, c.manga.url));
+                const existing = if (index) |i| current.manga[i].chapters else &.{};
                 const fetched = try self.fetchTitle(job, c.source, c.manga, existing);
+                if (index) |i| {
+                    if (!current.manga[i].favorite) try self.setFavorite(fetched.manga_id, true);
+                } else {
+                    // New titles start with the default chapter flags and category.
+                    const s = try self.loadSettings(a);
+                    const Edit = struct {
+                        s: settings.Settings,
+                        fn apply(edit: @This(), arena: std.mem.Allocator, m: *library.Manga) !bool {
+                            m.chapter_flags = edit.s.library.default_chapter_flags;
+                            if (edit.s.library.default_category) |category| m.categories = try arena.dupe(u32, &.{category});
+                            return true;
+                        }
+                    };
+                    try self.editTitle(a, fetched.manga_id, Edit{ .s = s }, Edit.apply);
+                }
                 job.result = .{ .library_changed = true, .manga_id = fetched.manga_id, .new_chapters = fetched.new_chapters, .message = "Added to library" };
             },
             .refresh => |id| {
@@ -226,16 +910,13 @@ pub const Engine = struct {
             },
             .update_library => |c| try self.updateLibrary(job, c.category),
             .download => |id| try self.downloadChapter(job, id),
-            .delete_download => |id| try self.deleteDownload(job, id),
+            .delete_download => |id| {
+                const deleted = try self.deleteDownloads(&.{id});
+                job.result = .{ .library_changed = deleted > 0, .message = if (deleted > 0) "Download deleted" else "Download kept by the deletion settings" };
+            },
             .remove => |id| {
-                const Edit = struct {
-                    id: []const u8,
-                    fn apply(edit: @This(), a: std.mem.Allocator, current: library.Library) !?library.Library {
-                        return library.remove(a, current, edit.id);
-                    }
-                };
-                _ = try self.store.update(job.arena.allocator(), Edit{ .id = id }, Edit.apply);
-                job.result = .{ .library_changed = true, .message = "Removed from library" };
+                try self.setFavorite(id, false);
+                job.result = .{ .library_changed = true, .manga_id = id, .message = "Removed from library" };
             },
             .import_backup => |path| {
                 const a = job.arena.allocator();
@@ -468,31 +1149,40 @@ pub const Engine = struct {
         _ = try self.store.update(a, Edit{ .id = chapter_id, .pages = chapter.pages }, Edit.apply);
         job.result = .{ .library_changed = true, .manga_id = found.manga.id, .message = "Chapter downloaded" };
     }
-
-    fn deleteDownload(self: *Engine, job: *Job, chapter_id: []const u8) !void {
-        const a = job.arena.allocator();
-        const current = try self.store.load(a);
-        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
-        if (found.manga.source_id == null) return error.LocalChapter;
-        const Edit = struct {
-            id: []const u8,
-            fn apply(edit: @This(), arena: std.mem.Allocator, lib: library.Library) !?library.Library {
-                return library.setPages(arena, lib, edit.id, &.{});
-            }
-        };
-        _ = try self.store.update(a, Edit{ .id = chapter_id }, Edit.apply);
-        var folder: ?[]const u8 = null;
-        for (found.chapter.pages) |page| {
-            const path = try self.store.pagePath(a, page);
-            Io.Dir.cwd().deleteFile(self.io, path) catch {};
-            folder = std.fs.path.dirname(path);
-        }
-        if (folder) |dir| Io.Dir.cwd().deleteDir(self.io, dir) catch {};
-        job.result = .{ .library_changed = true, .manga_id = found.manga.id, .message = "Download deleted" };
-    }
 };
 
 const Found = struct { manga: library.Manga, chapter: library.Chapter };
+
+fn contains(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |candidate| if (std.mem.eql(u8, candidate, id)) return true;
+    return false;
+}
+
+fn readingOf(ch: library.Chapter) library.Reading {
+    return .{ .id = ch.id, .page = ch.last_page_read, .read = ch.read, .bookmark = ch.bookmark, .last_read = ch.last_read, .read_ms = ch.read_ms };
+}
+
+/// The chapters of `manga` Mihon's deletion settings let go: not
+/// bookmarked ones unless `remove_bookmarked`, and not read ones if the
+/// title is in a category in `remove_exclude_categories`.
+fn deletable(a: std.mem.Allocator, s: settings.Settings, manga: library.Manga, chapters: []const library.Chapter) ![]const []const u8 {
+    const protect_read = !settings.categoryAllowed(manga.categories, &.{}, s.downloads.remove_exclude_categories);
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (chapters) |ch| {
+        if (protect_read and ch.read) continue;
+        if (!s.downloads.remove_bookmarked and ch.bookmark) continue;
+        try ids.append(a, ch.id);
+    }
+    return ids.items;
+}
+
+fn sortByOrder(categories: []library.Category) void {
+    std.mem.sort(library.Category, categories, {}, struct {
+        fn less(_: void, x: library.Category, y: library.Category) bool {
+            return x.order < y.order;
+        }
+    }.less);
+}
 const Fetched = struct { manga_id: []const u8, new_chapters: []const []const u8 };
 
 fn findChapter(lib: library.Library, chapter_id: []const u8) ?Found {
@@ -731,4 +1421,97 @@ test "engine adds, downloads, records progress and indexes local series through 
     engine.queue.deinit(&engine);
     const after = try engine.loadLibrary(arena);
     try std.testing.expectEqual(1, after.manga[after.find("7:/m").?].chapters[1].pages.len);
+}
+
+test "engine marks chapters, keeps history, manages categories and deletes downloads as Mihon does" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+
+    var chapters: [4]library.Chapter = undefined;
+    for (&chapters, 0..) |*ch, i| {
+        const page = try std.fmt.allocPrint(a, "downloads/c{d}/p/0001.png", .{i + 1});
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(page).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = page, .data = "x" });
+        ch.* = .{ .id = try std.fmt.allocPrint(a, "1:/c{d}", .{i + 1}), .title = try std.fmt.allocPrint(a, "Chapter {d}", .{i + 1}), .number = @floatFromInt(i + 1), .source_order = @intCast(3 - i), .pages = try a.dupe([]const u8, &.{page}) };
+    }
+    chapters[3].number = 3; // a second Chapter 3
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "1:/m", .title = "M", .source_id = 1, .chapters = &chapters }} });
+
+    // Marking read changes unread chapters; unread also clears a page.
+    try engine.setProgress("1:/c2", 4, false, 1000);
+    try std.testing.expectEqual(2, try engine.markPreviousRead("1:/c3"));
+    try std.testing.expectEqual(0, try engine.markRead(&.{"1:/c1"}, true));
+    try std.testing.expectEqual(1, try engine.markRead(&.{"1:/c2"}, false));
+    var lib = try engine.loadLibrary(a);
+    try std.testing.expect(lib.manga[0].chapters[0].read);
+    try std.testing.expect(!lib.manga[0].chapters[1].read);
+    try std.testing.expectEqual(0, lib.manga[0].chapters[1].last_page_read);
+    try std.testing.expectEqual(1000, lib.manga[0].chapters[1].read_ms);
+
+    // History: removing a chapter keeps its reading time, clearing all doesn't.
+    try std.testing.expectEqual(1, (try engine.history(a, "")).len);
+    try engine.removeHistory(.{ .chapter = "1:/c2" });
+    lib = try engine.loadLibrary(a);
+    try std.testing.expectEqual(0, lib.manga[0].chapters[1].last_read);
+    try std.testing.expectEqual(1000, lib.manga[0].chapters[1].read_ms);
+    try engine.removeHistory(.all);
+    try std.testing.expectEqual(0, (try engine.loadLibrary(a)).manga[0].chapters[1].read_ms);
+
+    // Bookmarked chapters keep their downloads by default.
+    try std.testing.expectEqual(1, try engine.setBookmark(&.{"1:/c2"}, true));
+    try std.testing.expectEqual(1, try engine.deleteDownloads(&.{ "1:/c1", "1:/c2" }));
+    lib = try engine.loadLibrary(a);
+    try std.testing.expect(!lib.manga[0].chapters[0].downloaded());
+    try std.testing.expect(lib.manga[0].chapters[1].downloaded());
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "downloads/c1", .{}));
+
+    // Finishing chapter 3 deletes it on leaving the reader, with
+    // remove_after_read_slots 0, and marks the other Chapter 3 read.
+    var s = try engine.loadSettings(a);
+    s.downloads.remove_after_read_slots = 0;
+    s.update.mark_existing_duplicates_read = true;
+    try engine.saveSettings(s);
+    try engine.pageShown(.{ .chapter_id = "1:/c3", .page = 0, .pages = 2 });
+    try engine.pageShown(.{ .chapter_id = "1:/c3", .page = 1, .pages = 2 });
+    lib = try engine.loadLibrary(a);
+    try std.testing.expect(lib.manga[0].chapters[2].downloaded());
+    try std.testing.expect(lib.manga[0].chapters[3].read);
+    try engine.leaveReader();
+    lib = try engine.loadLibrary(a);
+    try std.testing.expect(!lib.manga[0].chapters[2].downloaded());
+    try std.testing.expect(!lib.manga[0].chapters[3].downloaded());
+
+    // Categories: create, reorder, assign, delete.
+    const first = try engine.createCategory("First");
+    const second = try engine.createCategory("Second");
+    try std.testing.expectError(error.DuplicateCategory, engine.createCategory("First"));
+    try engine.moveCategory(second, 0);
+    try engine.setCategories(&.{"1:/m"}, &.{ first, second });
+    var groups = try engine.libraryView(a, "");
+    try std.testing.expectEqual(2, groups.len);
+    try std.testing.expectEqualStrings("Second", groups[0].category.name);
+    try engine.deleteCategory(second);
+    lib = try engine.loadLibrary(a);
+    try std.testing.expectEqualSlices(u32, &.{first}, lib.manga[0].categories);
+    try std.testing.expectEqual(0, lib.categories[0].order);
+    try engine.setLibrarySort(0, .{ .mode = .total_chapters, .ascending = false });
+    lib = try engine.loadLibrary(a);
+    try std.testing.expectEqual(views.SortMode.total_chapters, views.LibrarySort.decode(lib.categories[0].flags).mode);
+    try std.testing.expectEqual(0, (try engine.libraryView(a, "zzz"))[0].entries.len);
+
+    // Removing keeps the title for its history until the database is cleared.
+    const remove = try Job.start(&engine, .{ .remove = "1:/m" });
+    remove.join();
+    remove.deinit();
+    groups = try engine.libraryView(a, "");
+    try std.testing.expectEqual(0, groups[0].entries.len);
+    try std.testing.expectEqual(0, try engine.clearDatabase(true));
+    try std.testing.expectEqual(1, try engine.clearDatabase(false));
 }

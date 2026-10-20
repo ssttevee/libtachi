@@ -213,7 +213,8 @@ pub const Reading = struct {
     last_read: i64 = 0,
     read_ms: i64 = 0,
 
-    fn of(chapter: Chapter) ?Reading {
+    /// A chapter's state, or null if it has none.
+    pub fn of(chapter: Chapter) ?Reading {
         if (chapter.last_page_read == 0 and !chapter.read and !chapter.bookmark and chapter.last_read == 0 and chapter.read_ms == 0) return null;
         return .{ .id = chapter.id, .page = chapter.last_page_read, .read = chapter.read, .bookmark = chapter.bookmark, .last_read = chapter.last_read, .read_ms = chapter.read_ms };
     }
@@ -306,9 +307,32 @@ pub const Store = struct {
         return next;
     }
 
+    /// Replaces chapters' reading state, as for marking them read or unread,
+    /// without touching the library file.
+    pub fn putReading(self: *Store, gpa: std.mem.Allocator, states: []const Reading) !void {
+        if (states.len == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var reading: std.ArrayList(Reading) = .empty;
+        try reading.appendSlice(arena, try self.loadReading(arena));
+        for (states) |state| {
+            for (reading.items) |*r| {
+                if (std.mem.eql(u8, r.id, state.id)) {
+                    r.* = state;
+                    break;
+                }
+            } else try reading.append(arena, state);
+        }
+        try self.saveReading(arena, reading.items);
+    }
+
     /// Records reading progress without touching the library file. Unknown
-    /// chapters are recorded too; they apply once the chapter is in the library.
-    pub fn setProgress(self: *Store, gpa: std.mem.Allocator, progress: []const Progress) !void {
+    /// chapters are recorded too; they apply once the chapter is in the
+    /// library. Returns how many chapters this marked read.
+    pub fn setProgress(self: *Store, gpa: std.mem.Allocator, progress: []const Progress) !usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -317,11 +341,13 @@ pub const Store = struct {
         var reading: std.ArrayList(Reading) = .empty;
         try reading.appendSlice(arena, try self.loadReading(arena));
         var changed = false;
+        var newly_read: usize = 0;
         for (progress) |p| {
             for (reading.items) |*r| {
                 if (!std.mem.eql(u8, r.id, p.chapter_id)) continue;
                 const read_now = r.read or p.read;
                 if (r.page == p.page and r.read == read_now and p.read_ms == 0) break;
+                if (read_now and !r.read) newly_read += 1;
                 r.page = p.page;
                 r.read = read_now;
                 r.last_read = p.now;
@@ -330,10 +356,12 @@ pub const Store = struct {
                 break;
             } else {
                 try reading.append(arena, .{ .id = p.chapter_id, .page = p.page, .read = p.read, .last_read = p.now, .read_ms = p.read_ms });
+                if (p.read) newly_read += 1;
                 changed = true;
             }
         }
         if (changed) try self.saveReading(arena, reading.items);
+        return newly_read;
     }
 
     /// Absolute path of a page file the library refers to.
@@ -736,6 +764,17 @@ pub fn setProgress(arena: std.mem.Allocator, library: Library, progress: Progres
     return null;
 }
 
+/// Applies `edit` to the title with `id`, a copy the caller may change;
+/// null if there is no such title or `edit` returns false.
+pub fn editManga(arena: std.mem.Allocator, library: Library, id: []const u8, context: anytype, comptime edit: fn (@TypeOf(context), std.mem.Allocator, *Manga) anyerror!bool) !?Library {
+    const index = library.find(id) orelse return null;
+    const titles = try arena.dupe(Manga, library.manga);
+    if (!try edit(context, arena, &titles[index])) return null;
+    var result = library;
+    result.manga = titles;
+    return result;
+}
+
 /// Sets a chapter's downloaded pages; null if the chapter is unknown.
 pub fn setPages(arena: std.mem.Allocator, library: Library, chapter_id: []const u8, pages: []const []const u8) !?Library {
     for (library.manga, 0..) |m, mi| for (m.chapters, 0..) |ch, ci| {
@@ -892,8 +931,8 @@ test "reading state lives in its own file and overlays the library" {
     const manga: Manga = .{ .id = "1:/m", .title = "M", .chapters = &.{ .{ .id = "1:/c1", .title = "1" }, .{ .id = "1:/c2", .title = "2" } } };
     try store.save(std.testing.allocator, try merge(a, .{}, manga, 1));
     const before = try tmp.dir.statFile(io, Store.file_name, .{});
-    try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 7, .now = 50, .read_ms = 1000 }});
-    try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 9, .read = true, .now = 60, .read_ms = 500 }});
+    _ = try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 7, .now = 50, .read_ms = 1000 }});
+    _ = try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 9, .read = true, .now = 60, .read_ms = 500 }});
     const after = try tmp.dir.statFile(io, Store.file_name, .{});
     try std.testing.expectEqual(before.mtime.nanoseconds, after.mtime.nanoseconds);
     const loaded = try store.load(a);
