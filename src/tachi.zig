@@ -32,6 +32,7 @@ pub const downloads = @import("downloads.zig");
 pub const backend = @import("backend.zig");
 pub const worker = @import("worker.zig");
 pub const local = @import("local.zig");
+pub const tracking = @import("tracking.zig");
 pub const engine = @import("engine.zig");
 pub const Engine = engine.Engine;
 pub const Job = engine.Job;
@@ -861,6 +862,7 @@ test {
     std.testing.refAllDecls(worker);
     std.testing.refAllDecls(worker.Client);
     _ = local;
+    _ = tracking;
     _ = engine;
     std.testing.refAllDecls(Engine);
     std.testing.refAllDecls(Runtime);

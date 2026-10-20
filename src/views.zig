@@ -298,6 +298,15 @@ pub const LibraryFilters = struct {
     tracked: []const TrackerFilter = &.{},
 };
 
+/// A conversion with login state scoped to one engine snapshot.
+pub const TrackScore = struct {
+    context: *const anyopaque,
+    get_fn: *const fn (*const anyopaque, library.Track) ?f64,
+    pub fn get(self: TrackScore, track: library.Track) ?f64 {
+        return self.get_fn(self.context, track);
+    }
+};
+
 pub const LibraryOptions = struct {
     filters: LibraryFilters = .{},
     /// Mihon's global downloaded-only mode.
@@ -312,7 +321,7 @@ pub const LibraryOptions = struct {
     match: ?Matcher = null,
     /// A track's score on a 10-point scale, or null if its tracker isn't
     /// logged in. Null leaves every title unscored for the tracker sort.
-    track_score: ?*const fn (library.Track) ?f64 = null,
+    track_score: ?TrackScore = null,
 };
 
 pub const Matcher = struct {
@@ -525,11 +534,11 @@ fn orderFloat(a: f64, b: f64) std.math.Order {
 
 /// The mean of a title's logged-in trackers' scores, zeros included; -1
 /// if it has none.
-fn trackerMean(manga: Manga, score: ?*const fn (library.Track) ?f64) f64 {
+fn trackerMean(manga: Manga, score: ?TrackScore) f64 {
     const convert = score orelse return -1;
     var sum: f64 = 0;
     var n: usize = 0;
-    for (manga.tracks) |t| if (convert(t)) |s| {
+    for (manga.tracks) |t| if (convert.get(t)) |s| {
         sum += s;
         n += 1;
     };
@@ -656,7 +665,7 @@ pub const Stats = struct {
 };
 
 /// Mihon's library stats. `track_score` is as in `LibraryOptions`.
-pub fn stats(lib: Library, update: settings.Settings.Update, track_score: ?*const fn (library.Track) ?f64) Stats {
+pub fn stats(lib: Library, update: settings.Settings.Update, track_score: ?TrackScore) Stats {
     var s: Stats = .{};
     var score_sum: f64 = 0;
     var scored: usize = 0;
@@ -677,7 +686,7 @@ pub fn stats(lib: Library, update: settings.Settings.Update, track_score: ?*cons
             var on_tracker = false;
             var sum: f64 = 0;
             var n: usize = 0;
-            for (m.tracks) |t| if (convert(t)) |score| {
+            for (m.tracks) |t| if (convert.get(t)) |score| {
                 on_tracker = true;
                 if (score > 0) {
                     sum += score;

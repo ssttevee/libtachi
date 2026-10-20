@@ -23,6 +23,7 @@ const settings = @import("settings.zig");
 const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
 const views = @import("views.zig");
+const tracking = @import("tracking.zig");
 const fetch_interval = @import("fetch_interval.zig");
 const mihon_downloads = @import("mihon_downloads.zig");
 const preferences = @import("preferences.zig");
@@ -97,15 +98,27 @@ pub const Request = union(enum) {
     /// Writes the library as a Mihon backup.
     export_backup: struct { path: []const u8, options: backup.ExportOptions = .{} },
 
+    /// Browser login URL or credential/code/token exchange, or a provider call.
+    tracker: struct { id: i32, operation: tracking.Operation },
+    track_bind: struct { manga_id: []const u8, track: library.Track },
+    track_unbind: struct { manga_id: []const u8, tracker_id: i32, delete_remote: bool = false },
+    track_set: struct { manga_id: []const u8, tracker_id: i32, value: tracking.Setter },
+    track_refresh: struct { manga_id: ?[]const u8 = null },
+    track_chapter: struct { manga_id: []const u8, chapter: f64 },
+    /// Run once while connected; retry_at and attempts persist across restarts.
+    track_pending: struct { connected: bool, force: bool = false },
+
     fn usesBackend(self: Request) bool {
         return switch (self) {
-            .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads, .add_store, .refresh_stores => false,
+            .tracker, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending, .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads, .add_store, .refresh_stores => false,
             else => true,
         };
     }
 };
 
 pub const Result = struct {
+    tracking_reply: tracking.Reply = .{},
+    tracking_errors: []const TrackingError = &.{},
     sources: []const models.SourceInfo = &.{},
     extensions: []const manage.RepoEntry = &.{},
     extension_updates: ?manage.UpdateResult = null,
@@ -139,6 +152,8 @@ pub const Result = struct {
     message: []const u8 = "Ready",
 };
 
+pub const TrackingError = struct { manga_id: []const u8, tracker_id: i32, message: []const u8 };
+
 pub const UpdateError = struct { manga_id: []const u8, title: []const u8, message: []const u8 };
 
 pub const Untrusted = struct { pkg: []const u8, version_code: i64, fingerprint: []const u8 };
@@ -167,6 +182,8 @@ pub const Options = struct {
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
     release_jvm: bool = true,
+    /// Native tracking adapter; no extension runtime is started by tracking.
+    tracker_driver: ?tracking.Driver = null,
     /// The user's offset from UTC in seconds, for "today" in update
     /// schedules and the updates feed.
     utc_offset_s: i32 = 0,
@@ -190,6 +207,9 @@ pub const Engine = struct {
     /// 32 bits, as 32-bit ARM has no 64-bit atomics).
     ahead_checked: std.atomic.Value(u32) = .init(0),
     pending_lock: Io.Mutex = .init,
+    tracking_lock: Io.Mutex = .init,
+    tracking_job_lock: Io.Mutex = .init,
+    tracking_job: ?*Job = null,
     /// Runs jobs instead of the engine, for tests without a JVM.
     execute_fn: ?*const fn (*Engine, *Job) anyerror!void = null,
 
@@ -278,7 +298,9 @@ pub const Engine = struct {
     pub fn libraryView(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.Group {
         const s = try self.loadSettings(arena);
         const lib = try self.store.load(arena);
-        return views.libraryView(arena, lib, try views.libraryOptions(arena, lib, s, search, self.options.utc_offset_s));
+        var options = try views.libraryOptions(arena, lib, s, search, self.options.utc_offset_s);
+        options.track_score = tracking.scoreView(try self.loadTrackers(arena));
+        return views.libraryView(arena, lib, options);
     }
 
     /// Where extensions keep their settings.
@@ -721,7 +743,7 @@ pub const Engine = struct {
 
     pub fn stats(self: *Engine, arena: std.mem.Allocator) !views.Stats {
         const s = try self.loadSettings(arena);
-        return views.stats(try self.store.load(arena), s.update, null);
+        return views.stats(try self.store.load(arena), s.update, tracking.scoreView(try self.loadTrackers(arena)));
     }
 
     // ---- reading ---------------------------------------------------------------
@@ -757,7 +779,13 @@ pub const Engine = struct {
         if (!newly_read and !ahead) return;
         const lib = try self.store.load(a);
         const found = findChapter(lib, shown.chapter_id) orelse return;
-        if (newly_read) try self.chapterFinished(a, s, found);
+        if (newly_read) {
+            try self.chapterFinished(a, s, found);
+            if (s.tracking.auto_update and found.chapter.recognized()) {
+                try self.queueTracking(found.manga.id, found.chapter.number);
+                try self.startTracking();
+            }
+        }
         if (ahead) try self.downloadAhead(a, s, found, hash);
     }
 
@@ -1629,11 +1657,302 @@ pub const Engine = struct {
         job.result = .{ .library_changed = true, .manga_id = target_id, .message = "Migrated" };
     }
 
+    // ---- tracking --------------------------------------------------------------
+
+    /// Credentials, score formats and deferred updates in trackers.json.
+    pub fn loadTrackers(self: *Engine, a: std.mem.Allocator) !*tracking.State {
+        const state = try a.create(tracking.State);
+        state.* = try tracking.State.load(a, self.io, self.options.dir);
+        return state;
+    }
+
+    pub fn saveTrackerFormats(self: *Engine, formats: tracking.Formats) !void {
+        self.tracking_lock.lockUncancelable(self.io);
+        defer self.tracking_lock.unlock(self.io);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const state = try self.loadTrackers(arena.allocator());
+        state.formats = formats;
+        try state.save(self.gpa, self.io, self.options.dir);
+    }
+
+    pub fn trackerLogout(self: *Engine, id: i32) !void {
+        self.tracking_lock.lockUncancelable(self.io);
+        defer self.tracking_lock.unlock(self.io);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const state = try self.loadTrackers(arena.allocator());
+        try state.putCredential(arena.allocator(), .{ .tracker_id = id });
+        try state.save(self.gpa, self.io, self.options.dir);
+    }
+
+    /// Joins and releases the reader's automatic job. Call before destroying
+    /// the engine or its backend, and before inspecting automatic results.
+    pub fn finishTracking(self: *Engine) void {
+        self.tracking_job_lock.lockUncancelable(self.io);
+        defer self.tracking_job_lock.unlock(self.io);
+        if (self.tracking_job) |job| job.deinit();
+        self.tracking_job = null;
+    }
+
+    fn startTracking(self: *Engine) !void {
+        if (self.options.tracker_driver == null or self.paused.load(.acquire)) return;
+        self.tracking_job_lock.lockUncancelable(self.io);
+        defer self.tracking_job_lock.unlock(self.io);
+        if (self.tracking_job) |job| {
+            if (!job.done.load(.acquire)) return;
+            job.deinit();
+            self.tracking_job = null;
+        }
+        self.tracking_job = try Job.start(self, .{ .track_pending = .{ .connected = true, .force = true } });
+    }
+
+    pub fn queueTracking(self: *Engine, manga_id: []const u8, chapter: f64) !void {
+        if (!std.math.isFinite(chapter) or chapter < 0) return;
+        self.tracking_lock.lockUncancelable(self.io);
+        defer self.tracking_lock.unlock(self.io);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const state = try self.loadTrackers(a);
+        const lib = try self.store.load(a);
+        const manga = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        var added = false;
+        for (manga.tracks) |t| if (state.loggedIn(t.tracker_id) and chapter > t.last_chapter_read) {
+            try state.enqueue(a, .{ .manga_id = manga_id, .tracker_id = t.tracker_id, .chapter = chapter });
+            added = true;
+        };
+        if (added) {
+            state.attempts = 0;
+            state.retry_at = 0;
+            try state.save(self.gpa, self.io, self.options.dir);
+        }
+    }
+
+    pub const MarkTracked = struct { changed: usize, prompts: []const tracking.Pending };
+    /// Manga-screen wrapper. Bulk library/feed markRead deliberately bypasses
+    /// tracking. For ASK, pass prompts to applyTracking after confirmation.
+    pub fn markReadTracked(self: *Engine, a: std.mem.Allocator, chapter_ids: []const []const u8, read: bool) !MarkTracked {
+        const changed = try self.markRead(chapter_ids, read);
+        const s = try self.loadSettings(a);
+        if (!read or s.tracking.on_mark_read == .never) return .{ .changed = changed, .prompts = &.{} };
+        const lib = try self.store.load(a);
+        var prompts: std.ArrayList(tracking.Pending) = .empty;
+        for (lib.manga) |m| {
+            var max: f64 = -1;
+            for (m.chapters) |ch| if (contains(chapter_ids, ch.id) and ch.recognized()) {
+                max = @max(max, ch.number);
+            };
+            if (max >= 0 and m.tracks.len > 0) try prompts.append(a, .{ .manga_id = m.id, .tracker_id = 0, .chapter = max });
+        }
+        if (s.tracking.on_mark_read == .always) {
+            try self.applyTracking(prompts.items);
+            return .{ .changed = changed, .prompts = &.{} };
+        }
+        return .{ .changed = changed, .prompts = try prompts.toOwnedSlice(a) };
+    }
+
+    /// Applies manga-level progress to every eligible bound tracker.
+    pub fn applyTracking(self: *Engine, prompts: []const tracking.Pending) !void {
+        for (prompts) |p| try self.queueTracking(p.manga_id, p.chapter);
+        try self.startTracking();
+    }
+
+    fn trackerCall(self: *Engine, job: *Job, state: *tracking.State, id: i32, op: tracking.Operation) !tracking.Reply {
+        try job.checkCancelled();
+        _ = tracking.get(id) orelse return error.UnknownTracker;
+        const driver = self.options.tracker_driver orelse return error.TrackerNotImplemented;
+        const reply = driver.call(driver.context, job.arena.allocator(), self.io, id, state.credential(id), state.formats, op) catch |err| {
+            if (err == error.AuthenticationExpired) {
+                var c = state.credential(id);
+                c.auth_expired = true;
+                try state.putCredential(job.arena.allocator(), c);
+                try state.save(self.gpa, self.io, self.options.dir);
+            }
+            return err;
+        };
+        if (reply.credential) |c| {
+            if (c.tracker_id != id) return error.InvalidTrackerResponse;
+            try state.putCredential(job.arena.allocator(), c);
+            try state.save(self.gpa, self.io, self.options.dir);
+        }
+        if (reply.track) |t| if (t.tracker_id != id) return error.InvalidTrackerResponse;
+        return reply;
+    }
+
+    fn putTrack(self: *Engine, job: *Job, manga_id: []const u8, id: i32, track: ?library.Track) !void {
+        _ = try self.store.update(job.arena.allocator(), tracking.Edit{ .manga_id = manga_id, .tracker_id = id, .track = track }, tracking.Edit.apply);
+        job.result.library_changed = true;
+    }
+
+    fn boundTrack(self: *Engine, a: std.mem.Allocator, manga_id: []const u8, id: i32) !library.Track {
+        const lib = try self.store.load(a);
+        const m = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        for (m.tracks) |t| if (t.tracker_id == id) return t;
+        return error.TrackNotBound;
+    }
+
+    fn trackChapter(self: *Engine, job: *Job, state: *tracking.State, manga_id: []const u8, chapter: f64) !void {
+        if (!std.math.isFinite(chapter) or chapter < 0) return error.InvalidProgress;
+        const a = job.arena.allocator();
+        const lib = try self.store.load(a);
+        const m = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        var failures: std.ArrayList(TrackingError) = .empty;
+        for (m.tracks) |track| {
+            if (!state.loggedIn(track.tracker_id) or chapter <= track.last_chapter_read) continue;
+            self.advanceTrack(job, state, manga_id, track, chapter) catch |err| {
+                if (err == error.Canceled) return err;
+                try state.enqueue(a, .{ .manga_id = manga_id, .tracker_id = track.tracker_id, .chapter = chapter });
+                try failures.append(a, .{ .manga_id = manga_id, .tracker_id = track.tracker_id, .message = @errorName(err) });
+            };
+        }
+        job.result.tracking_errors = try std.mem.concat(a, TrackingError, &.{ job.result.tracking_errors, failures.items });
+        try state.save(self.gpa, self.io, self.options.dir);
+    }
+
+    fn advanceTrack(self: *Engine, job: *Job, state: *tracking.State, manga_id: []const u8, track: library.Track, chapter: f64) !void {
+        var fresh = (try self.trackerCall(job, state, track.tracker_id, .{ .refresh = track })).track orelse return error.InvalidTrackerResponse;
+        // Mihon assigns requested progress even when refreshed remote is ahead.
+        fresh.last_chapter_read = chapter;
+        _ = try self.trackerCall(job, state, track.tracker_id, .{ .update = .{ .track = fresh, .did_read_chapter = true } });
+        // TrackChapter upserts the immutable pre-update domain copy.
+        try self.putTrack(job, manga_id, track.tracker_id, fresh);
+        try state.remove(job.arena.allocator(), manga_id, track.tracker_id);
+    }
+
+    /// Enhanced trackers update the server before importing any local reads.
+    fn syncEnhanced(self: *Engine, job: *Job, state: *tracking.State, manga_id: []const u8, remote: library.Track) !void {
+        if (!(tracking.get(remote.tracker_id) orelse return error.UnknownTracker).enhanced) return;
+        const a = job.arena.allocator();
+        const lib = try self.store.load(a);
+        const manga = lib.manga[lib.find(manga_id) orelse return error.UnknownManga];
+        var merged = remote;
+        merged.last_chapter_read = @max(remote.last_chapter_read, try tracking.continuousRead(a, manga.chapters, true));
+        _ = try self.trackerCall(job, state, remote.tracker_id, .{ .update = .{ .track = merged } });
+        var reads: std.ArrayList(library.Reading) = .empty;
+        for (manga.chapters) |ch| if (ch.recognized() and !ch.read and ch.number <= remote.last_chapter_read) {
+            var r = readingOf(ch);
+            r.read = true;
+            try reads.append(a, r);
+        };
+        try self.store.putReading(self.gpa, reads.items);
+        try self.putTrack(job, manga_id, remote.tracker_id, merged);
+    }
+
+    fn executeTracking(self: *Engine, job: *Job) !void {
+        try self.tracking_lock.lock(self.io);
+        defer self.tracking_lock.unlock(self.io);
+        const a = job.arena.allocator();
+        const state = try self.loadTrackers(a);
+        switch (job.request) {
+            .tracker => |c| {
+                switch (c.operation) {
+                    .login, .login_url => {},
+                    else => if (!state.loggedIn(c.id)) return error.TrackerLoggedOut,
+                }
+                job.result.tracking_reply = try self.trackerCall(job, state, c.id, c.operation);
+            },
+            .track_chapter => |c| try self.trackChapter(job, state, c.manga_id, c.chapter),
+            .track_set => |c| {
+                if (!state.loggedIn(c.tracker_id)) return error.TrackerLoggedOut;
+                const old = try self.boundTrack(a, c.manga_id, c.tracker_id);
+                const changed = try tracking.set(old, c.value, state.formats, wallMillis(self.io));
+                const updated = (try self.trackerCall(job, state, c.tracker_id, .{ .update = .{ .track = changed } })).track orelse return error.InvalidTrackerResponse;
+                try self.putTrack(job, c.manga_id, c.tracker_id, updated);
+            },
+            .track_unbind => |c| {
+                const track = try self.boundTrack(a, c.manga_id, c.tracker_id);
+                if (c.delete_remote) {
+                    if (!(tracking.get(c.tracker_id) orelse return error.UnknownTracker).deletable) return error.UnsupportedDelete;
+                    if (!state.loggedIn(c.tracker_id)) return error.TrackerLoggedOut;
+                    _ = try self.trackerCall(job, state, c.tracker_id, .{ .delete = track });
+                }
+                try self.putTrack(job, c.manga_id, c.tracker_id, null);
+                try state.remove(a, c.manga_id, c.tracker_id);
+                try state.save(self.gpa, self.io, self.options.dir);
+            },
+            .track_bind => |c| {
+                if (!state.loggedIn(c.track.tracker_id)) return error.TrackerLoggedOut;
+                const lib = try self.store.load(a);
+                const manga = lib.manga[lib.find(c.manga_id) orelse return error.UnknownManga];
+                var has_read = false;
+                var first_date: i64 = 0;
+                for (manga.chapters) |ch| {
+                    has_read = has_read or ch.read;
+                    if (ch.last_read > 0 and (first_date == 0 or ch.last_read < first_date)) first_date = ch.last_read;
+                }
+                var bound = (try self.trackerCall(job, state, c.track.tracker_id, .{ .bind = .{ .track = c.track, .has_read_chapters = has_read } })).track orelse return error.InvalidTrackerResponse;
+                try self.putTrack(job, c.manga_id, bound.tracker_id, bound);
+                if (has_read) {
+                    const prefix = try tracking.continuousRead(a, manga.chapters, false);
+                    if (prefix > bound.last_chapter_read) {
+                        bound = try tracking.set(bound, .{ .progress = @intFromFloat(prefix) }, state.formats, wallMillis(self.io));
+                        bound = (try self.trackerCall(job, state, bound.tracker_id, .{ .update = .{ .track = bound } })).track orelse return error.InvalidTrackerResponse;
+                        try self.putTrack(job, c.manga_id, bound.tracker_id, bound);
+                    }
+                    if (bound.started == 0 and first_date > 0) {
+                        bound.started = first_date;
+                        bound = (try self.trackerCall(job, state, bound.tracker_id, .{ .update = .{ .track = bound } })).track orelse return error.InvalidTrackerResponse;
+                        try self.putTrack(job, c.manga_id, bound.tracker_id, bound);
+                    }
+                }
+                try self.syncEnhanced(job, state, c.manga_id, bound);
+            },
+            .track_refresh => |c| {
+                const lib = try self.store.load(a);
+                var failures: std.ArrayList(TrackingError) = .empty;
+                for (lib.manga) |m| {
+                    if (c.manga_id) |id| if (!std.mem.eql(u8, id, m.id)) continue;
+                    for (m.tracks) |t| {
+                        if (!state.loggedIn(t.tracker_id)) continue;
+                        const reply = self.trackerCall(job, state, t.tracker_id, .{ .refresh = t }) catch |err| {
+                            if (err == error.Canceled) return err;
+                            try failures.append(a, .{ .manga_id = m.id, .tracker_id = t.tracker_id, .message = @errorName(err) });
+                            continue;
+                        };
+                        const fresh = reply.track orelse return error.InvalidTrackerResponse;
+                        try self.putTrack(job, m.id, t.tracker_id, fresh);
+                        self.syncEnhanced(job, state, m.id, fresh) catch |err| {
+                            if (err == error.Canceled) return err;
+                            try failures.append(a, .{ .manga_id = m.id, .tracker_id = t.tracker_id, .message = @errorName(err) });
+                        };
+                    }
+                }
+                job.result.tracking_errors = try failures.toOwnedSlice(a);
+            },
+            .track_pending => |c| {
+                const now = wallMillis(self.io);
+                if (!c.connected or (!c.force and now < state.retry_at)) return;
+                if (state.attempts > 3) return error.TrackingRetriesExhausted;
+                const pending = try a.dupe(tracking.Pending, state.pending);
+                for (pending) |p| {
+                    const track = self.boundTrack(a, p.manga_id, p.tracker_id) catch |err| switch (err) {
+                        error.UnknownManga, error.TrackNotBound => {
+                            try state.remove(a, p.manga_id, p.tracker_id);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    _ = track;
+                    // The delayed worker calls TrackChapter for the whole manga.
+                    try self.trackChapter(job, state, p.manga_id, p.chapter);
+                }
+                if (state.pending.len > 0) {
+                    state.retry_at = now + @as(i64, 5 * 60 * 1000) * (@as(i64, 1) << @intCast(state.attempts));
+                    state.attempts += 1;
+                }
+                try state.save(self.gpa, self.io, self.options.dir);
+            },
+            else => unreachable,
+        }
+    }
+
     // ---- operations ------------------------------------------------------------
 
     pub fn execute(self: *Engine, job: *Job) !void {
         try self.io.checkCancel();
         switch (job.request) {
+            .tracker, .track_bind, .track_unbind, .track_set, .track_refresh, .track_chapter, .track_pending => return self.executeTracking(job),
             .sources => {
                 job.result.sources = (try job.call(.sources)).sources;
                 try self.rememberSources(job, job.result.sources);
@@ -2913,4 +3232,96 @@ test "engine merges store listings and keeps only trusted extension files" {
     const listed = try engine.untrustedExtensions(a);
     try std.testing.expectEqual(1, listed.len);
     try std.testing.expectEqualStrings("eu.unsigned", listed[0].pkg);
+}
+
+test "tracking jobs bind prefixes, preserve automatic semantics, retry and gate reader and mark-read" {
+    const Fake = struct {
+        updates: usize = 0,
+        fail: bool = false,
+        remote: library.Track = .{ .tracker_id = 2, .remote_id = 42, .status = 5, .total_chapters = 10 },
+        fn call(ctx: ?*anyopaque, _: std.mem.Allocator, _: Io, id: i32, _: tracking.Credential, _: tracking.Formats, op: tracking.Operation) anyerror!tracking.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (op) {
+                .login => return .{ .credential = .{ .tracker_id = id, .username = "u", .password = "token" } },
+                .bind, .refresh => return .{ .track = self.remote },
+                .update => |u| {
+                    if (self.fail) return error.Offline;
+                    self.updates += 1;
+                    self.remote = if (u.did_read_chapter) tracking.didRead(u.track, 999) else u.track;
+                    return .{ .track = self.remote };
+                },
+                .delete => return .{},
+                else => return error.Unexpected,
+            }
+        }
+        fn run(engine: *Engine, req: Request) !*Job {
+            const job = try Job.start(engine, req);
+            job.join();
+            if (job.failure != null) {
+                job.deinit();
+                return error.JobFailed;
+            }
+            return job;
+        }
+    };
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var fake: Fake = .{};
+    // Undefined backend proves no tracking request touches extensions, even warm().
+    var engine: Engine = .init(std.testing.allocator, io, undefined, .{ .dir = dir, .tracker_driver = .{ .context = &fake, .call = Fake.call } });
+    defer engine.finishTracking();
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "m", .title = "M", .chapters = &.{
+        .{ .id = "c3", .title = "3", .number = 3, .read = true, .last_read = 300 },
+        .{ .id = "c1", .title = "1", .number = 1, .read = true, .last_read = 100 },
+        .{ .id = "c2", .title = "2", .number = 2 },
+        .{ .id = "c10", .title = "10", .number = 10 },
+    } }} });
+    (try Fake.run(&engine, .{ .tracker = .{ .id = 2, .operation = .{ .login = .{ .username = "u", .password = "t" } } } })).deinit();
+    (try Fake.run(&engine, .{ .track_bind = .{ .manga_id = "m", .track = .{ .tracker_id = 2, .remote_id = 42 } } })).deinit();
+    var bound = (try engine.loadLibrary(a)).manga[0].tracks[0];
+    try std.testing.expectEqual(@as(f64, 1), bound.last_chapter_read);
+    try std.testing.expectEqual(@as(i64, 100), bound.started);
+    // Refresh ahead then request 2: deliberately overwrites remote-ahead value.
+    fake.remote.last_chapter_read = 8;
+    (try Fake.run(&engine, .{ .track_chapter = .{ .manga_id = "m", .chapter = 2 } })).deinit();
+    try std.testing.expectEqual(@as(f64, 2), fake.remote.last_chapter_read);
+    // Failure queues max requested value; success removes it.
+    fake.fail = true;
+    const failed = try Fake.run(&engine, .{ .track_chapter = .{ .manga_id = "m", .chapter = 4 } });
+    try std.testing.expectEqual(@as(usize, 1), failed.result.tracking_errors.len);
+    failed.deinit();
+    try std.testing.expectEqual(@as(f64, 4), (try engine.loadTrackers(a)).pending[0].chapter);
+    const offline = try Fake.run(&engine, .{ .track_pending = .{ .connected = false } });
+    offline.deinit();
+    try std.testing.expectEqual(@as(u8, 0), (try engine.loadTrackers(a)).attempts);
+    (try Fake.run(&engine, .{ .track_pending = .{ .connected = true } })).deinit();
+    try std.testing.expectEqual(@as(u8, 1), (try engine.loadTrackers(a)).attempts);
+    fake.fail = false;
+    (try Fake.run(&engine, .{ .track_pending = .{ .connected = true, .force = true } })).deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try engine.loadTrackers(a)).pending.len);
+    // ASK returns a manga-level prompt without advancing remote.
+    var s: settings.Settings = .{};
+    s.tracking.on_mark_read = .ask;
+    try engine.saveSettings(s);
+    const ask = try engine.markReadTracked(a, &.{"c10"}, true);
+    try std.testing.expectEqual(@as(usize, 1), ask.prompts.len);
+    try std.testing.expectEqual(@as(f64, 4), fake.remote.last_chapter_read);
+    try engine.applyTracking(ask.prompts);
+    engine.finishTracking();
+    try std.testing.expectEqual(@as(i32, 2), fake.remote.status);
+    bound = (try engine.loadLibrary(a)).manga[0].tracks[0];
+    try std.testing.expectEqual(@as(f64, 10), bound.last_chapter_read);
+    // Domain snapshot intentionally predates automatic status/date mutation.
+    try std.testing.expectEqual(@as(i32, 1), bound.status);
+    (try Fake.run(&engine, .{ .track_refresh = .{} })).deinit();
+    try std.testing.expectEqual(@as(i32, 2), (try engine.loadLibrary(a)).manga[0].tracks[0].status);
+    (try Fake.run(&engine, .{ .track_set = .{ .manga_id = "m", .tracker_id = 2, .value = .{ .score_index = 8 } } })).deinit();
+    try std.testing.expectEqual(@as(f64, 8), (try engine.stats(a)).mean_score);
+    try engine.trackerLogout(2);
+    try std.testing.expectEqual(@as(usize, 0), (try engine.stats(a)).tracked);
 }

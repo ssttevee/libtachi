@@ -19,6 +19,14 @@ pub const Settings = struct {
     /// Mihon preferences from a restored backup that libtachi has no
     /// setting for, kept for the next backup.
     mihon_preferences: []const backup.Preference = &.{},
+    tracking: Tracking = .{},
+
+    pub const Tracking = struct {
+        /// Reader completion (`pref_auto_update_manga_sync_key`).
+        auto_update: bool = true,
+        /// Manga-screen mark read (`pref_auto_update_manga_on_mark_read`).
+        on_mark_read: enum { always, ask, never } = .always,
+    };
 
     pub const Update = struct {
         /// Skip completed titles (`manga_ongoing`).

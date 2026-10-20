@@ -158,6 +158,13 @@ pub fn fromSettings(a: std.mem.Allocator, s: Settings) ![]const Preference {
     try P.add(&out, a, "pref_enable_chapter_name_hash", .{ .boolean = d.chapter_name_hash });
     try P.add(&out, a, "save_chapter_as_cbz", .{ .boolean = d.cbz });
 
+    try P.add(&out, a, "pref_auto_update_manga_sync_key", .{ .boolean = s.tracking.auto_update });
+    try P.add(&out, a, "pref_auto_update_manga_on_mark_read", .{ .string = switch (s.tracking.on_mark_read) {
+        .always => "ALWAYS",
+        .ask => "ASK",
+        .never => "NEVER",
+    } });
+
     const r = s.reader;
     try P.add(&out, a, "skip_read", .{ .boolean = r.skip_read });
     try P.add(&out, a, "skip_filtered", .{ .boolean = r.skip_filtered });
@@ -327,6 +334,11 @@ fn applyOne(a: std.mem.Allocator, s: *Settings, p: Preference, categories: []con
         if (v == .boolean) s.downloads.chapter_name_hash = v.boolean;
     } else if (eql(u8, key, "save_chapter_as_cbz")) {
         if (v == .boolean) s.downloads.cbz = v.boolean;
+    } else if (eql(u8, key, "pref_auto_update_manga_sync_key")) {
+        if (v == .boolean) s.tracking.auto_update = v.boolean;
+    } else if (eql(u8, key, "pref_auto_update_manga_on_mark_read")) {
+        if (v != .string) return true;
+        if (eql(u8, v.string, "ASK")) s.tracking.on_mark_read = .ask else if (eql(u8, v.string, "NEVER")) s.tracking.on_mark_read = .never else s.tracking.on_mark_read = .always;
     } else if (eql(u8, key, "skip_read")) {
         if (v == .boolean) s.reader.skip_read = v.boolean;
     } else if (eql(u8, key, "skip_filtered")) {
