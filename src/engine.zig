@@ -24,6 +24,7 @@ const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
 const views = @import("views.zig");
 const fetch_interval = @import("fetch_interval.zig");
+const mihon_downloads = @import("mihon_downloads.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -76,6 +77,13 @@ pub const Request = union(enum) {
     /// `browse.migration` says. With `replace` false the old title stays in
     /// the library too.
     migrate: struct { from: []const u8, source: i64, manga: models.Manga, replace: bool = true },
+    /// Writes every downloaded chapter of source titles into a Mihon
+    /// downloads folder at `root` (its `downloads` directory), named and
+    /// packed as the settings say.
+    export_downloads: []const u8,
+    /// Takes chapters from a Mihon downloads folder at `root` for library
+    /// chapters not yet downloaded, copying them into the library.
+    import_downloads: []const u8,
     /// Restores a Mihon backup (`.tachibk`) into the library.
     import_backup: []const u8,
     /// Writes the library as a Mihon backup.
@@ -83,7 +91,7 @@ pub const Request = union(enum) {
 
     fn usesBackend(self: Request) bool {
         return switch (self) {
-            .delete_download, .remove, .scan_local, .import_backup, .export_backup => false,
+            .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads => false,
             else => true,
         };
     }
@@ -726,31 +734,33 @@ pub const Engine = struct {
         const Edit = struct {
             ids: []const []const u8,
             pages: *std.ArrayList([]const u8),
+            deleted: *usize,
             fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
                 var next = current;
-                var changed = false;
                 for (edit.ids) |id| {
                     const found = findChapter(next, id) orelse continue;
                     if (found.manga.local() or !found.chapter.downloaded()) continue;
                     try edit.pages.appendSlice(arena, found.chapter.pages);
                     next = (try library.setPages(arena, next, id, &.{})).?;
-                    changed = true;
+                    edit.deleted.* += 1;
                 }
-                return if (changed) next else null;
+                return if (edit.deleted.* > 0) next else null;
             }
         };
         var pages: std.ArrayList([]const u8) = .empty;
-        _ = try self.store.update(a, Edit{ .ids = chapter_ids, .pages = &pages }, Edit.apply);
         var deleted: usize = 0;
+        _ = try self.store.update(a, Edit{ .ids = chapter_ids, .pages = &pages, .deleted = &deleted }, Edit.apply);
         var last_dir: ?[]const u8 = null;
         for (pages.items) |page| {
-            const path = try self.store.pagePath(a, page);
+            // A page inside an archive goes with the archive.
+            const file = page[0 .. std.mem.indexOfScalar(u8, page, '#') orelse page.len];
+            if (!library.safePath(file)) continue;
+            const path = try std.fs.path.join(a, &.{ self.options.dir, file });
             Io.Dir.cwd().deleteFile(self.io, path) catch {};
             const dir = std.fs.path.dirname(path) orelse continue;
             if (last_dir == null or !std.mem.eql(u8, last_dir.?, dir)) {
                 if (last_dir) |d| self.removeEmptyDirs(d);
                 last_dir = dir;
-                deleted += 1;
             }
         }
         if (last_dir) |d| self.removeEmptyDirs(d);
@@ -1183,6 +1193,120 @@ pub const Engine = struct {
         job.result.message = "Search finished";
     }
 
+    fn naming(s: settings.Settings) mihon_downloads.Naming {
+        return .{ .disallow_non_ascii = s.downloads.disallow_non_ascii_filenames, .chapter_hash = s.downloads.chapter_name_hash };
+    }
+
+    /// A title's folder in a Mihon downloads tree, or null if its source's
+    /// name was never learned.
+    fn mihonMangaDir(a: std.mem.Allocator, lib: library.Library, root: []const u8, m: library.Manga, n: mihon_downloads.Naming) !?[]const u8 {
+        const id = m.source_id orelse return null;
+        const source = for (lib.sources) |known| {
+            if (known.id == id) break known;
+        } else return null;
+        return try std.fs.path.join(a, &.{ root, try mihon_downloads.sourceDirName(a, source.name, source.lang, n), try mihon_downloads.mangaDirName(a, m.title, n) });
+    }
+
+    fn exportDownloads(self: *Engine, job: *Job, root: []const u8) !void {
+        const a = job.arena.allocator();
+        const s = try self.loadSettings(a);
+        const lib = try self.store.load(a);
+        var total: usize = 0;
+        for (lib.manga) |m| if (!m.local()) for (m.chapters) |ch| {
+            if (ch.downloaded()) total += 1;
+        };
+        job.pages_total.store(total, .release);
+        var done: usize = 0;
+        var skipped: usize = 0;
+        for (lib.manga) |m| {
+            if (m.local()) continue;
+            const manga_dir = try mihonMangaDir(a, lib, root, m, naming(s)) orelse {
+                for (m.chapters) |ch| if (ch.downloaded()) {
+                    skipped += 1;
+                };
+                continue;
+            };
+            var categories: std.ArrayList([]const u8) = .empty;
+            for (m.categories) |id| for (lib.categories) |c| if (c.id == id) try categories.append(a, std.mem.trim(u8, c.name, " "));
+            const source_name = for (lib.sources) |known| {
+                if (known.id == m.source_id.?) break known.name;
+            } else "";
+            for (m.chapters) |ch| {
+                if (!ch.downloaded()) continue;
+                try self.io.checkCancel();
+                var chapter_arena: std.heap.ArenaAllocator = .init(self.gpa);
+                defer chapter_arena.deinit();
+                const ca = chapter_arena.allocator();
+                const pages = try ca.alloc([]const u8, ch.pages.len);
+                for (ch.pages, pages) |page, *bytes| bytes.* = try Io.Dir.cwd().readFileAlloc(self.io, try self.pagePath(ca, page), ca, .limited(downloads.max_image));
+                const url = if (ch.remote) |r| r.url else "";
+                var urls: std.ArrayList([]const u8) = .empty;
+                for (m.tracks) |t| if (t.url.len > 0) try urls.append(ca, t.url);
+                try urls.append(ca, url);
+                const xml = try mihon_downloads.comicInfoXml(ca, m, ch, source_name, categories.items, urls.items);
+                const dir_name = try mihon_downloads.chapterDirName(ca, ch.title, ch.scanlator, url, naming(s));
+                try mihon_downloads.exportChapter(ca, self.io, manga_dir, dir_name, pages, xml, s.downloads.cbz);
+                done += 1;
+                job.pages_done.store(done, .release);
+            }
+        }
+        job.result.message = if (skipped == 0)
+            try std.fmt.allocPrint(a, "Exported {d} chapters", .{done})
+        else
+            try std.fmt.allocPrint(a, "Exported {d} chapters; {d} of sources never loaded were skipped", .{ done, skipped });
+    }
+
+    fn importDownloads(self: *Engine, job: *Job, root: []const u8) !void {
+        const a = job.arena.allocator();
+        const s = try self.loadSettings(a);
+        const lib = try self.store.load(a);
+        const Attach = struct { id: []const u8, pages: []const []const u8 };
+        var found_pages: std.ArrayList(Attach) = .empty;
+        for (lib.manga) |m| {
+            const manga_dir = try mihonMangaDir(a, lib, root, m, naming(s)) orelse continue;
+            for (m.chapters) |ch| {
+                if (ch.downloaded()) continue;
+                try self.io.checkCancel();
+                const url = if (ch.remote) |r| r.url else continue;
+                const names = try mihon_downloads.chapterDirNames(a, ch.title, ch.scanlator, url, naming(s));
+                const found = try mihon_downloads.findChapter(a, self.io, manga_dir, names) orelse continue;
+                const page_names = try mihon_downloads.pageNames(a, self.io, found);
+                if (page_names.len == 0) continue;
+                // Copied in, so the library stays whole without the tree.
+                const folder = try std.fmt.allocPrint(a, "downloads/mihon/{x}", .{std.hash.Wyhash.hash(0, ch.id)});
+                const pages = try a.alloc([]const u8, page_names.len);
+                if (found.cbz) {
+                    const relative = try std.mem.concat(a, u8, &.{ folder, ".cbz" });
+                    try self.copyInto(a, found.path, relative);
+                    for (page_names, pages) |name, *page| page.* = try std.fmt.allocPrint(a, "{s}#{s}", .{ relative, name });
+                } else for (page_names, pages) |name, *page| {
+                    page.* = try std.fmt.allocPrint(a, "{s}/{s}", .{ folder, name });
+                    try self.copyInto(a, try std.fs.path.join(a, &.{ found.path, name }), page.*);
+                }
+                try found_pages.append(a, .{ .id = ch.id, .pages = pages });
+            }
+        }
+        const Edit = struct {
+            found: []const Attach,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var next = current;
+                for (edit.found) |f| next = (try library.setPages(arena, next, f.id, f.pages)) orelse next;
+                return next;
+            }
+        };
+        if (found_pages.items.len > 0) _ = try self.store.update(a, Edit{ .found = found_pages.items }, Edit.apply);
+        job.result = .{ .library_changed = found_pages.items.len > 0, .message = try std.fmt.allocPrint(a, "Imported {d} chapters", .{found_pages.items.len}) };
+    }
+
+    /// Copies `from` (absolute) to `relative` in the library directory.
+    fn copyInto(self: *Engine, a: std.mem.Allocator, from: []const u8, relative: []const u8) !void {
+        const to = try std.fs.path.join(a, &.{ self.options.dir, relative });
+        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(to).?);
+        const bytes = try Io.Dir.cwd().readFileAlloc(self.io, from, self.gpa, .limited(1 << 30));
+        defer self.gpa.free(bytes);
+        try library.writeAtomic(a, self.io, to, bytes);
+    }
+
     fn migrate(self: *Engine, job: *Job, from: []const u8, source: i64, remote: models.Manga, replace: bool) !void {
         const a = job.arena.allocator();
         const current = try self.store.load(a);
@@ -1314,6 +1438,8 @@ pub const Engine = struct {
             },
             .update_library => |c| try self.updateLibrary(job, c.category),
             .global_search => |c| try self.globalSearch(job, c.query, c.pinned_only, c.sources),
+            .export_downloads => |root| try self.exportDownloads(job, root),
+            .import_downloads => |root| try self.importDownloads(job, root),
             .migrate => |c| try self.migrate(job, c.from, c.source, c.manga, c.replace),
             .download => |id| try self.downloadChapter(job, id),
             .read => |r| try self.readChapter(job, r.chapter, r.page),
@@ -2274,4 +2400,45 @@ test "engine caches thumbnails and prefers a custom cover" {
     try std.testing.expect(std.mem.indexOf(u8, (try engine.coverPath(a, manga)).?, "custom") != null);
     try engine.removeCustomCover("7:/m");
     try std.testing.expectEqualStrings(cached, (try engine.coverPath(a, manga)).?);
+}
+
+test "engine exports downloads in Mihon's layout and imports them back" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "lib/downloads/c1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/downloads/c1/0001.png", .data = "\x89PNG\r\n\x1a\npage one" });
+    const dir = try tmp.dir.realPathFileAlloc(io, "lib", a);
+    const root = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "mihon" });
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{
+        .manga = &.{.{ .id = "1:/m", .title = "Solo: Leveling", .source_id = 1, .remote = .{ .url = "/m", .title = "Solo: Leveling" }, .chapters = &.{
+            .{ .id = "1:/c1", .title = "Ch. 1", .scanlator = "G", .number = 1, .remote = .{ .url = "/c1", .name = "Ch. 1" }, .pages = &.{"downloads/c1/0001.png"} },
+        } }},
+        .sources = &.{.{ .id = 1, .name = "MangaDex", .lang = "en" }},
+    });
+
+    const out = try Job.start(&engine, .{ .export_downloads = root });
+    out.join();
+    try std.testing.expect(out.failure == null);
+    out.deinit();
+    try tmp.dir.access(io, "mihon/MangaDex (EN)/Solo_ Leveling/G_Ch. 1.cbz", .{});
+
+    try std.testing.expectEqual(1, try engine.deleteDownloads(&.{"1:/c1"}));
+    const in = try Job.start(&engine, .{ .import_downloads = root });
+    in.join();
+    try std.testing.expect(in.failure == null);
+    in.deinit();
+    const lib = try engine.loadLibrary(a);
+    const page = lib.manga[0].chapters[0].pages[0];
+    try std.testing.expect(std.mem.endsWith(u8, page, ".cbz#001.png"));
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, try engine.pagePath(a, page), a, .limited(64));
+    try std.testing.expectEqualStrings("\x89PNG\r\n\x1a\npage one", bytes);
+    // Deleting an imported chapter removes its archive.
+    try std.testing.expectEqual(1, try engine.deleteDownloads(&.{"1:/c1"}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fs.path.join(a, &.{ "lib", page[0..std.mem.indexOfScalar(u8, page, '#').?] }), .{}));
 }

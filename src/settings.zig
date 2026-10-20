@@ -61,6 +61,12 @@ pub const Settings = struct {
         parallel_sources: u8 = 5,
         /// Pages downloading at once per source (`download_parallel_page_limit`).
         parallel_pages: u8 = 5,
+        /// Mihon's downloads layout names for import and export
+        /// (`disallow_non_ascii_filenames`, `pref_enable_chapter_name_hash`).
+        disallow_non_ascii_filenames: bool = false,
+        chapter_name_hash: bool = false,
+        /// Export chapters as CBZ archives rather than folders (`save_chapter_as_cbz`).
+        cbz: bool = true,
         /// Unread chapters to queue once a quarter of a downloaded chapter
         /// is read, if the next is downloaded too; 0 never (`auto_download_while_reading`).
         ahead: u8 = 0,
