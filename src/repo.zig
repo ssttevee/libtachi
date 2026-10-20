@@ -318,12 +318,23 @@ pub const Http = struct {
     }
 };
 
-/// Fetches and decodes an index, following `extension_list_url` when the
-/// repo splits its list out. `bytes_out` receives the buffers the store's
-/// strings point into; free them after the store.
+/// Fetches and decodes an index, resolving a separate extension list if needed.
+/// All returned slices borrow from `arena` allocations.
 pub fn fetchIndex(h: *Http, arena: Allocator, url: []const u8) Error!Store {
+    return (try fetchIndexWithBytes(h, arena, url)).store;
+}
+
+/// The decoded index and its original response bytes, suitable for caching.
+pub const FetchedIndex = struct { store: Store, bytes: []const u8 };
+
+pub fn fetchIndexWithBytes(h: *Http, arena: Allocator, url: []const u8) Error!FetchedIndex {
     const bytes = try h.getAlloc(arena, url, max_index_len);
-    var store = try parseIndex(arena, bytes);
+    return .{ .store = try resolveExtensionList(h, arena, try parseIndex(arena, bytes)), .bytes = bytes };
+}
+
+/// Completes either a freshly downloaded or cached index with its external list.
+pub fn resolveExtensionList(h: *Http, arena: Allocator, index: Store) Error!Store {
+    var store = index;
     if (store.extensions.len == 0) if (store.extension_list_url) |list_url| {
         const list_bytes = try h.getAlloc(arena, list_url, max_index_len);
         store.extensions = try parseExtensionList(arena, list_bytes);

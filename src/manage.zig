@@ -365,14 +365,15 @@ fn fetchStore(rt: *Runtime, http: *repo.Http, arena: Allocator, opts: RepoOption
     const cache_path = try dataPath(rt, arena, name);
     const cwd = Io.Dir.cwd();
 
-    if (!opts.refresh) if (readCachedIndex(rt, arena, cache_path)) |store| return store;
+    if (!opts.refresh) if (readCachedIndex(rt, arena, cache_path)) |store|
+        return repo.resolveExtensionList(http, arena, store);
 
-    const store = try repo.fetchIndex(http, arena, url);
+    const fetched = try repo.fetchIndexWithBytes(http, arena, url);
     // Best-effort cache; a failure here must not fail the listing.
     if (cwd.createDirPath(rt.io, std.fs.path.dirname(cache_path).?)) {
-        http.getToFile(cwd, cache_path, url) catch {};
+        cwd.writeFile(rt.io, .{ .sub_path = cache_path, .data = fetched.bytes }) catch {};
     } else |_| {}
-    return store;
+    return fetched.store;
 }
 
 /// The cached index at `path` if it is younger than `index_ttl` and decodes.
@@ -383,7 +384,7 @@ fn readCachedIndex(rt: *Runtime, arena: Allocator, path: []const u8) ?repo.Store
     if (age.nanoseconds < 0 or age.nanoseconds >= index_ttl.nanoseconds) return null;
     const bytes = cwd.readFileAlloc(rt.io, path, arena, .limited(64 << 20)) catch return null;
     const store = repo.parseIndex(arena, bytes) catch return null; // corrupt cache: refetch
-    return if (store.extensions.len > 0) store else null;
+    return if (store.extensions.len > 0 or store.extension_list_url != null) store else null;
 }
 
 fn toEntry(rt: *Runtime, arena: Allocator, e: repo.Extension, installed: ?*InstalledEntry) Error!RepoEntry {
@@ -547,4 +548,55 @@ test "registry removal preserves order at every position" {
     _ = reg.remove("a");
     try std.testing.expectEqual(0, reg.extensions.len);
     try std.testing.expectEqual(null, reg.remove("a"));
+}
+
+test "index caching reuses the downloaded response and resolves split lists" {
+    const testing = std.testing;
+    const Fixture = @import("testing_http.zig").Fixture;
+    // Store field 101 -> extension list -> extension with package "ab".
+    const index = "\xaa\x06\x06\x0a\x04\x12\x02ab";
+    const list = "\x0a\x04\x12\x02ab";
+    inline for (.{ false, true }) |split| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var rt: Runtime = undefined; // This path only needs filesystem and allocation services.
+        rt.gpa = testing.allocator;
+        rt.io = testing.io;
+        rt.data_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(rt.data_dir);
+        var fixture = try Fixture.init(&.{});
+        defer fixture.deinit();
+        const list_url = try fixture.url(testing.allocator, "/list");
+        defer testing.allocator.free(list_url);
+        const root_bytes = if (split)
+            try std.mem.concat(testing.allocator, u8, &.{ "\xb2\x06", &.{@intCast(list_url.len)}, list_url })
+        else
+            try testing.allocator.dupe(u8, index);
+        defer testing.allocator.free(root_bytes);
+        const root_response = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ root_bytes.len, root_bytes });
+        defer testing.allocator.free(root_response);
+        const list_response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n" ++ list;
+        fixture.responses = if (split) &.{ root_response, list_response, list_response } else &.{root_response};
+        try fixture.start();
+        const url = try fixture.url(testing.allocator, "/index");
+        defer testing.allocator.free(url);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var http = repo.Http.init(testing.allocator, testing.io);
+        defer http.deinit();
+        const first = try fetchStore(&rt, &http, arena.allocator(), .{ .url = url });
+        const cached = try fetchStore(&rt, &http, arena.allocator(), .{ .url = url });
+        try testing.expectEqualStrings("ab", first.extensions[0].pkg);
+        try testing.expectEqualStrings("ab", cached.extensions[0].pkg);
+        try fixture.finish();
+        // The cache retains the exact bytes that produced the initial result.
+        var dir = try tmp.dir.openDir(testing.io, "repo", .{ .iterate = true });
+        defer dir.close(testing.io);
+        var it = dir.iterate();
+        const entry = (try it.next(testing.io)).?;
+        const bytes = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(4096));
+        defer testing.allocator.free(bytes);
+        try testing.expectEqualStrings(root_bytes, bytes);
+        try testing.expectEqual(null, try it.next(testing.io));
+    }
 }
