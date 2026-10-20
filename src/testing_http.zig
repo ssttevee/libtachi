@@ -7,6 +7,7 @@ pub const Fixture = struct {
     responses: []const []const u8,
     worker: ?Io.Future(anyerror!void) = null,
     requests: usize = 0,
+    captured: std.ArrayList([]const u8) = .empty,
 
     pub fn init(responses: []const []const u8) !Fixture {
         const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -29,6 +30,8 @@ pub const Fixture = struct {
     pub fn deinit(self: *Fixture) void {
         if (self.worker) |*worker| worker.cancel(std.testing.io) catch {};
         self.server.deinit(std.testing.io);
+        for (self.captured.items) |request| std.testing.allocator.free(request);
+        self.captured.deinit(std.testing.allocator);
     }
 
     fn serve(self: *Fixture) anyerror!void {
@@ -40,10 +43,17 @@ pub const Fixture = struct {
             defer stream.close(io);
             var read_buffer: [4096]u8 = undefined;
             var reader = stream.reader(io, &read_buffer);
+            var request: std.ArrayList(u8) = .empty;
+            errdefer request.deinit(std.testing.allocator);
+            var content_length: usize = 0;
             while (true) {
                 const line = try reader.interface.takeDelimiterInclusive('\n');
+                try request.appendSlice(std.testing.allocator, line);
+                if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \r\n"), 10);
                 if (std.mem.eql(u8, line, "\r\n")) break;
             }
+            try request.appendSlice(std.testing.allocator, try reader.interface.take(content_length));
+            try self.captured.append(std.testing.allocator, try request.toOwnedSlice(std.testing.allocator));
             self.requests += 1;
             var write_buffer: [4096]u8 = undefined;
             var writer = stream.writer(io, &write_buffer);

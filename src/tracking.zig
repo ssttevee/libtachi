@@ -235,7 +235,16 @@ pub const Operation = union(enum) {
     refresh: Track,
     delete: Track,
 };
-pub const Reply = struct { track: ?Track = null, matches: []const Search = &.{}, credential: ?Credential = null, login_url: ?[]const u8 = null };
+pub const Reply = struct {
+    track: ?Track = null,
+    matches: []const Search = &.{},
+    credential: ?Credential = null,
+    login_url: ?[]const u8 = null,
+    /// Pass this verifier to login after completing the authorization URL.
+    verifier: ?[]const u8 = null,
+    /// The remote preference read during MangaBaka login.
+    mangabaka_score_type: ?MangaBakaScore = null,
+};
 
 /// A search result, as Mihon's `TrackSearch`: the track to bind, and what
 /// to show to choose it.

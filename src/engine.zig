@@ -1783,6 +1783,11 @@ pub const Engine = struct {
             }
             return err;
         };
+        if (reply.mangabaka_score_type) |format| {
+            if (id != 11) return error.InvalidTrackerResponse;
+            state.formats.mangabaka_score_type = format;
+            try state.save(self.gpa, self.io, self.options.dir);
+        }
         if (reply.credential) |c| {
             if (c.tracker_id != id) return error.InvalidTrackerResponse;
             try state.putCredential(job.arena.allocator(), c);
