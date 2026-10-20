@@ -329,13 +329,12 @@ pub fn decode(arena: std.mem.Allocator, data: []const u8) !Backup {
 fn gunzip(arena: std.mem.Allocator, data: []const u8) ![]u8 {
     var input: std.Io.Reader = .fixed(data);
     const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+    defer arena.free(window);
     var decompress: std.compress.flate.Decompress = .init(&input, .gzip, window);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    _ = decompress.reader.streamRemaining(&out.writer) catch |err| switch (err) {
-        error.ReadFailed => return decompress.err orelse error.InvalidBackup,
-        else => |e| return e,
+    return decompress.reader.allocRemaining(arena, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => decompress.err orelse error.InvalidBackup,
+        else => return err,
     };
-    return out.toOwnedSlice();
 }
 
 fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
@@ -596,11 +595,21 @@ fn encodeInner(gpa: std.mem.Allocator, backup: Backup) ![]const u8 {
 }
 
 /// The backup as a `.tachibk` file: gzip around the protobuf.
-pub fn encodeFile(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
-    const raw = try encode(arena, backup);
-    var out: std.Io.Writer.Allocating = .init(arena);
+pub fn encodeFile(gpa: std.mem.Allocator, backup: Backup) ![]const u8 {
+    return encodeFileInner(gpa, backup) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => return err,
+    };
+}
+
+fn encodeFileInner(gpa: std.mem.Allocator, backup: Backup) ![]const u8 {
+    const raw = try encode(gpa, backup);
+    defer gpa.free(raw);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
     try out.ensureUnusedCapacity(64);
-    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
     var compress: std.compress.flate.Compress = try .init(&out.writer, window, .gzip, .default);
     try compress.writer.writeAll(raw);
     try compress.finish();
@@ -1330,6 +1339,25 @@ test "protobuf encoding releases nested messages on every allocation failure" {
             try std.testing.expectEqual(std.math.minInt(i64), decoded.manga[0].source);
             try std.testing.expectEqual(@as(f32, 1.5), decoded.manga[0].chapters[0].chapter_number);
             try std.testing.expectEqual(@as(i32, -1), decoded.preferences[0].value.int);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "backup compression releases scratch buffers on success and failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const compressed = try encodeFile(gpa, .{ .manga = &.{.{ .source = 1, .url = "/m" }} });
+            defer gpa.free(compressed);
+            const raw = try gunzip(gpa, compressed);
+            defer gpa.free(raw);
+            try std.testing.expectEqualSlices(u8, &.{ 0x0a, 0x06, 0x08, 0x01, 0x12, 0x02, '/', 'm' }, raw);
+            _ = gunzip(gpa, compressed[0 .. compressed.len - 1]) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.EndOfStream => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
