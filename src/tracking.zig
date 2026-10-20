@@ -235,7 +235,22 @@ pub const Operation = union(enum) {
     refresh: Track,
     delete: Track,
 };
-pub const Reply = struct { track: ?Track = null, matches: []const Track = &.{}, credential: ?Credential = null, login_url: ?[]const u8 = null };
+pub const Reply = struct { track: ?Track = null, matches: []const Search = &.{}, credential: ?Credential = null, login_url: ?[]const u8 = null };
+
+/// A search result, as Mihon's `TrackSearch`: the track to bind, and what
+/// to show to choose it.
+pub const Search = struct {
+    track: Track,
+    cover_url: []const u8 = "",
+    summary: []const u8 = "",
+    publishing_status: []const u8 = "",
+    publishing_type: []const u8 = "",
+    start_date: []const u8 = "",
+    authors: []const []const u8 = &.{},
+    artists: []const []const u8 = &.{},
+    /// The service's mean score on its own scale; -1 if none.
+    score: f64 = -1,
+};
 pub const Driver = struct {
     context: ?*anyopaque = null,
     call: *const fn (?*anyopaque, std.mem.Allocator, Io, i32, Credential, Formats, Operation) anyerror!Reply,
