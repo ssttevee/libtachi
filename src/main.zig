@@ -91,6 +91,42 @@ const Flags = struct {
     json: bool = false,
 };
 
+const Flag = enum {
+    data_dir,
+    host_jar,
+    java_home,
+    ext,
+    no_restore,
+    no_cds,
+    native_tls,
+    repo,
+    refresh,
+    lang,
+    grep,
+    json,
+    verbose,
+    help,
+};
+
+const flag_names = std.StaticStringMap(Flag).initComptime(.{
+    .{ "--data-dir", .data_dir },
+    .{ "--host-jar", .host_jar },
+    .{ "--java-home", .java_home },
+    .{ "--ext", .ext },
+    .{ "--no-restore", .no_restore },
+    .{ "--no-cds", .no_cds },
+    .{ "--native-tls", .native_tls },
+    .{ "--repo", .repo },
+    .{ "--refresh", .refresh },
+    .{ "--lang", .lang },
+    .{ "--grep", .grep },
+    .{ "--json", .json },
+    .{ "-v", .verbose },
+    .{ "--verbose", .verbose },
+    .{ "-h", .help },
+    .{ "--help", .help },
+});
+
 const RepoCommand = enum {
     list,
     install,
@@ -158,36 +194,25 @@ pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     _ = it.next(); // argv[0]
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--data-dir")) {
-            flags.data_dir = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--host-jar")) {
-            flags.host_jar = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--java-home")) {
-            flags.java_home = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--ext")) {
-            try exts.append(arena, it.next() orelse usage());
-        } else if (std.mem.eql(u8, arg, "--no-restore")) {
-            flags.no_restore = true;
-        } else if (std.mem.eql(u8, arg, "--no-cds")) {
-            flags.no_cds = true;
-        } else if (std.mem.eql(u8, arg, "--native-tls")) {
-            flags.native_transport = true;
-        } else if (std.mem.eql(u8, arg, "--repo")) {
-            flags.repo_url = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--refresh")) {
-            flags.refresh = true;
-        } else if (std.mem.eql(u8, arg, "--lang")) {
-            flags.lang = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--grep")) {
-            flags.grep = it.next() orelse usage();
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            flags.json = true;
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-            flags.verbose = true;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            usage();
-        } else {
+        const flag = flag_names.get(arg) orelse {
             try positional.append(arena, arg);
+            continue;
+        };
+        switch (flag) {
+            .data_dir => flags.data_dir = it.next() orelse usage(),
+            .host_jar => flags.host_jar = it.next() orelse usage(),
+            .java_home => flags.java_home = it.next() orelse usage(),
+            .ext => try exts.append(arena, it.next() orelse usage()),
+            .no_restore => flags.no_restore = true,
+            .no_cds => flags.no_cds = true,
+            .native_tls => flags.native_transport = true,
+            .repo => flags.repo_url = it.next() orelse usage(),
+            .refresh => flags.refresh = true,
+            .lang => flags.lang = it.next() orelse usage(),
+            .grep => flags.grep = it.next() orelse usage(),
+            .json => flags.json = true,
+            .verbose => flags.verbose = true,
+            .help => usage(),
         }
     }
     if (positional.items.len == 0) usage();
