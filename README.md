@@ -20,7 +20,13 @@ them on a desktop JVM is used here, but packaged as an embeddable library in
 the spirit of [PatchBukkit](https://github.com/Pumpkin-MC/PatchBukkit): the
 JVM lives inside your process and you talk to it through a small, stable C API.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the architecture and the reasoning
+On top of the runtime sits a turnkey engine for Tachiyomi-style apps: the
+library, downloads, the local source, library updates, backups and every
+list Mihon shows, with Mihon's behavior. An app only adds a UI.
+
+See [docs/ENGINE.md](docs/ENGINE.md) for the engine,
+[docs/PARITY.md](docs/PARITY.md) for how it compares with Mihon,
+[docs/DESIGN.md](docs/DESIGN.md) for the architecture and the reasoning
 behind it, and [docs/API.md](docs/API.md) for the JSON wire format.
 
 ## Status
@@ -165,6 +171,14 @@ Link against `zig-out/lib/libtachi.a` (or the shared library) plus `libc`;
 | Path | What |
 |---|---|
 | `src/tachi.zig` | Public Zig API (`Runtime`, typed results) |
+| `src/engine.zig` | The engine: `Engine`, `Job`, requests and actions |
+| `src/views.zig`, `src/query.zig` | Library, chapter, feed and source views; library search |
+| `src/library.zig`, `src/settings.zig` | Library store and sync; engine settings |
+| `src/queue.zig`, `src/downloads.zig` | Download queue; page downloads |
+| `src/local.zig`, `src/archive.zig`, `src/comicinfo.zig` | Local source and its formats |
+| `src/backup.zig`, `src/mihon_downloads.zig` | Mihon backups and downloads layout |
+| `src/recognition.zig`, `src/fetch_interval.zig` | Chapter numbers; update scheduling |
+| `src/backend.zig`, `src/worker.zig` | Extension backends: in process or a worker process |
 | `src/repo.zig` | repository index client: `index.pb` decoding, HTTP, signer check |
 | `src/manage.zig` | install registry, `restore`, repo install/update |
 | `src/jvm.zig` | libjvm discovery, JVM creation/adoption, thread attach |
