@@ -47,6 +47,17 @@ pub const Registry = struct {
         for (r.extensions) |*e| if (std.mem.eql(u8, e.pkg, pkg)) return e;
         return null;
     }
+
+    fn remove(r: *Registry, pkg: []const u8) ?InstalledEntry {
+        const idx = for (r.extensions, 0..) |e, i| {
+            if (std.mem.eql(u8, e.pkg, pkg)) break i;
+        } else return null;
+        // The parsed slice is arena-owned; only its logical length changes.
+        var entries = std.ArrayList(InstalledEntry).fromOwnedSlice(r.extensions);
+        const removed = entries.orderedRemove(idx);
+        r.extensions = entries.items;
+        return removed;
+    }
 };
 
 fn loadRegistry(rt: *Runtime, arena: Allocator) Error!Registry {
@@ -95,11 +106,7 @@ fn record(rt: *Runtime, arena: Allocator, info: models.ExtensionInfo, raw: std.j
 /// Drops the registry line for `pkg`, returning it so the file can be removed.
 fn forget(rt: *Runtime, arena: Allocator, pkg: []const u8) Error!?InstalledEntry {
     var reg = try loadRegistry(rt, arena);
-    const idx = for (reg.extensions, 0..) |e, i| {
-        if (std.mem.eql(u8, e.pkg, pkg)) break i;
-    } else return null;
-    const removed = reg.extensions[idx];
-    reg.extensions = try std.mem.concat(arena, InstalledEntry, &.{ reg.extensions[0..idx], reg.extensions[idx + 1 ..] });
+    const removed = reg.remove(pkg) orelse return null;
     try saveRegistry(rt, arena, reg);
     return removed;
 }
@@ -511,4 +518,33 @@ test "registry round-trips through JSON" {
     try std.testing.expectEqualStrings("https://r", back.value.find("a.b").?.repo.?);
     try std.testing.expectEqual(null, back.value.find("c.d").?.repo);
     try std.testing.expectEqual(null, back.value.find("zz"));
+}
+
+test "registry removal preserves order at every position" {
+    const original = [_]InstalledEntry{
+        .{ .pkg = "a", .path = "/a.jar", .versionCode = 1, .versionName = "1" },
+        .{ .pkg = "b", .path = "/b.jar", .versionCode = 2, .versionName = "2" },
+        .{ .pkg = "c", .path = "/c.jar", .versionCode = 3, .versionName = "3" },
+    };
+    for (original, 0..) |entry, removed_index| {
+        var entries = original;
+        var reg: Registry = .{ .extensions = &entries };
+        try std.testing.expectEqualStrings(entry.pkg, reg.remove(entry.pkg).?.pkg);
+        try std.testing.expectEqual(2, reg.extensions.len);
+        var i: usize = 0;
+        for (original, 0..) |expected, index| {
+            if (index == removed_index) continue;
+            try std.testing.expectEqualStrings(expected.pkg, reg.extensions[i].pkg);
+            i += 1;
+        }
+        try std.testing.expectEqual(null, reg.remove("missing"));
+        try std.testing.expectEqual(2, reg.extensions.len);
+    }
+    var empty: Registry = .{};
+    try std.testing.expectEqual(null, empty.remove("a"));
+    var single = [_]InstalledEntry{original[0]};
+    var reg: Registry = .{ .extensions = &single };
+    _ = reg.remove("a");
+    try std.testing.expectEqual(0, reg.extensions.len);
+    try std.testing.expectEqual(null, reg.remove("a"));
 }
