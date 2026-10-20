@@ -7,7 +7,11 @@ pub const Fixture = struct {
     responses: []const []const u8,
     worker: ?Io.Future(anyerror!void) = null,
     requests: usize = 0,
+    /// Each request as received, head and body.
     captured: std.ArrayList([]const u8) = .empty,
+    /// Optional substrings required in each request, including its body.
+    expected: []const []const []const u8 = &.{},
+    requests_match: bool = true,
 
     pub fn init(responses: []const []const u8) !Fixture {
         const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -25,6 +29,7 @@ pub const Fixture = struct {
     pub fn finish(self: *Fixture) !void {
         if (self.worker) |*worker| try worker.await(std.testing.io);
         try std.testing.expectEqual(self.responses.len, self.requests);
+        try std.testing.expect(self.requests_match);
     }
 
     pub fn deinit(self: *Fixture) void {
@@ -53,7 +58,16 @@ pub const Fixture = struct {
                 if (std.mem.eql(u8, line, "\r\n")) break;
             }
             try request.appendSlice(std.testing.allocator, try reader.interface.take(content_length));
-            try self.captured.append(std.testing.allocator, try request.toOwnedSlice(std.testing.allocator));
+            const received = try request.toOwnedSlice(std.testing.allocator);
+            try self.captured.append(std.testing.allocator, received);
+            if (self.expected.len > 0) {
+                for (self.expected[self.requests]) |needle| {
+                    if (std.mem.indexOf(u8, received, needle) == null) {
+                        std.debug.print("Missing request text: {s}\nRequest: {s}\n", .{ needle, received });
+                        self.requests_match = false;
+                    }
+                }
+            }
             self.requests += 1;
             var write_buffer: [4096]u8 = undefined;
             var writer = stream.writer(io, &write_buffer);
