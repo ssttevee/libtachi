@@ -215,6 +215,14 @@ pub const Engine = struct {
         self.paused.store(false, .release);
     }
 
+    /// Call once when the app starts: does what Mihon does at launch,
+    /// clearing the chapter cache if the settings say so.
+    pub fn launched(self: *Engine) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        if ((try self.loadSettings(arena_state.allocator())).library.auto_clear_chapter_cache) try self.clearChapterCache();
+    }
+
     /// The engine settings (`settings.json` in the library directory).
     pub fn loadSettings(self: *Engine, arena: std.mem.Allocator) !settings.Settings {
         return settings.Settings.load(arena, self.io, self.options.dir);

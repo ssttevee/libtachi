@@ -139,6 +139,8 @@ pub const Settings = struct {
         default_category: ?u32 = null,
         /// Chapter list flags new titles start with (`default_chapter_*`).
         default_chapter_flags: u32 = 0,
+        /// Empty the chapter cache when the app starts (`auto_clear_chapter_cache`).
+        auto_clear_chapter_cache: bool = false,
     };
 
     pub const Updates = struct {

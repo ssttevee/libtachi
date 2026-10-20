@@ -184,6 +184,7 @@ pub fn fromSettings(a: std.mem.Allocator, s: Settings) ![]const Preference {
     try P.add(&out, a, "categorized_display", .{ .boolean = l.per_category_sort });
     try P.add(&out, a, "library_random_sort_seed", .{ .int = @truncate(@as(i64, @bitCast(l.random_seed))) });
     try P.add(&out, a, "default_category", .{ .int = if (l.default_category) |c| @intCast(c) else -1 });
+    try P.add(&out, a, "auto_clear_chapter_cache", .{ .boolean = l.auto_clear_chapter_cache });
     for (chapter_defaults) |entry| try P.add(&out, a, entry[0], .{ .long = l.default_chapter_flags & entry[1] });
 
     const up = s.updates;
@@ -365,6 +366,8 @@ fn applyOne(a: std.mem.Allocator, s: *Settings, p: Preference, categories: []con
         } else try tracked.append(a, .{ .tracker_id = id, .state = triState(v.string) });
     } else if (eql(u8, key, "library_sorting_mode")) {
         if (v == .string) s.library.sort = sortFlags(v.string);
+    } else if (eql(u8, key, "auto_clear_chapter_cache")) {
+        if (v == .boolean) s.library.auto_clear_chapter_cache = v.boolean;
     } else if (eql(u8, key, "categorized_display")) {
         if (v == .boolean) s.library.per_category_sort = v.boolean;
     } else if (eql(u8, key, "library_random_sort_seed")) {
