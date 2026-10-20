@@ -31,6 +31,13 @@ class FileSharedPreferences(private val file: File) : SharedPreferences {
     @Synchronized
     override fun getAll(): MutableMap<String, *> = LinkedHashMap(values)
 
+    /** Reads the file again, for values written by someone else (a restored backup). */
+    @Synchronized
+    fun reload() {
+        values.clear()
+        load()
+    }
+
     @Synchronized
     override fun getString(key: String, defValue: String?): String? = values[key] as? String ?: defValue
 

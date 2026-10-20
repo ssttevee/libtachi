@@ -1529,8 +1529,9 @@ pub const Engine = struct {
                 if (decoded.preferences.len > 0) try self.saveSettings(try preferences.applyToSettings(a, try self.loadSettings(a), decoded.preferences, mapping.items));
                 if (decoded.source_preferences.len > 0) {
                     try preferences.writeSourcePreferences(a, self.io, try self.prefsDir(a), decoded.source_preferences);
-                    // A running runtime has the old values; the next one reads these.
-                    self.backend.release();
+                    // A running runtime has the old values in memory; a
+                    // runtime started later reads the files anyway.
+                    if (self.backend.warm()) _ = job.call(.reload_preferences) catch |err| log.warn("extension settings not reloaded: {s}", .{@errorName(err)});
                 }
                 job.result = .{ .library_changed = true, .message = try std.fmt.allocPrint(a, "Restored {d} titles", .{restored.restored}) };
             },

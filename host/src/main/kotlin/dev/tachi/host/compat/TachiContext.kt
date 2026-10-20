@@ -33,5 +33,10 @@ class TachiContext(
         return File(prefsDir, "${sanitize(name)}.json").delete()
     }
 
+    /** Every open preference file reads its file again. */
+    fun reloadPreferences() {
+        for (p in prefs.values) (p as? FileSharedPreferences)?.reload()
+    }
+
     private fun sanitize(name: String): String = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
 }

@@ -31,6 +31,8 @@ pub const Call = union(enum) {
     related: struct { source: i64, manga: models.Manga },
     preferences: i64,
     set_preference: struct { source: i64, key: []const u8, value: std.json.Value },
+    /// Extensions read their preference files again.
+    reload_preferences,
 
     pub const Repo = struct {
         /// Index URL; null for the default repository.
@@ -225,6 +227,10 @@ pub const InProcess = struct {
                 break :blk .{ .sources = try sources(rt, arena) };
             },
             .update_extensions => |repo| .{ .extension_updates = try into(manage.UpdateResult, arena, try rt.repoUpdate(repo.options()), self.gpa) },
+            .reload_preferences => blk: {
+                try rt.reloadPreferences();
+                break :blk .{};
+            },
             .browse => |c| blk: {
                 const Args = struct { page: i32, query: []const u8 = "", filters: ?[]const models.Filter = null };
                 const method: []const u8, const args: Args = switch (c.kind) {

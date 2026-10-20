@@ -180,11 +180,17 @@ pub const BridgeMethod = enum {
     lastImageMime,
     lastError,
     shutdown,
+    reloadPreferences,
+
+    /// Methods older host jars lack; the runtime starts without them.
+    fn optional(m: BridgeMethod) bool {
+        return m == .reloadPreferences;
+    }
 
     pub fn signature(m: BridgeMethod) [:0]const u8 {
         return switch (m) {
             .init, .install, .register, .uninstall => "([B)[B",
-            .listExtensions, .lastImageMime, .lastError => "()[B",
+            .listExtensions, .lastImageMime, .lastError, .reloadPreferences => "()[B",
             .extensionToLoad, .loadSource => "(J)[B",
             .call => "(J[B[B)[B",
             .fetchImage => "(J[B)[B",
@@ -279,7 +285,11 @@ pub const Runtime = struct {
 
         var ids: MethodIds = undefined;
         inline for (comptime std.enums.values(BridgeMethod)) |m| {
-            ids.set(m, env.f.GetStaticMethodID(env, self.bridge, @tagName(m), m.signature()) orelse {
+            ids.set(m, env.f.GetStaticMethodID(env, self.bridge, @tagName(m), m.signature()) orelse blk: {
+                if (m.optional()) {
+                    env.f.ExceptionClear(env);
+                    break :blk null;
+                }
                 describeException(env);
                 return error.BridgeMethodNotFound;
             });
@@ -412,6 +422,12 @@ pub const Runtime = struct {
     /// JSON array of `ExtensionInfo` (owned by caller).
     pub fn listExtensions(self: *Runtime) Error![]u8 {
         return self.invokeJson(.listExtensions, .{});
+    }
+
+    /// Has extensions read their preference files again, after something
+    /// other than the runtime wrote them (a restored backup).
+    pub fn reloadPreferences(self: *Runtime) Error!void {
+        self.gpa.free(try self.invokeJson(.reloadPreferences, .{}));
     }
 
     pub fn listExtensionsParsed(self: *Runtime) Error!Result([]const models.ExtensionInfo) {
@@ -569,6 +585,7 @@ pub const Runtime = struct {
     /// Calls a static object-returning bridge method inside the caller's frame.
     fn callStatic(self: *Runtime, env: *jni.JNIEnv, comptime method: BridgeMethod, args: method.Args()) Error!jni.jobject {
         comptime std.debug.assert(method.returnsBytes());
+        if (self.methods.get(method) == null) return error.BridgeMethodNotFound;
         const jargs = try marshal(env, method, args);
         const result = env.f.CallStaticObjectMethodA(env, self.bridge, self.methods.get(method), &jargs);
         if (env.f.ExceptionCheck(env) != 0) {

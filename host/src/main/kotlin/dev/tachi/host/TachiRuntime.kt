@@ -77,6 +77,7 @@ object TachiRuntime {
         cacheDir.mkdirs()
 
         val context = TachiContext(dataDir, cacheDir, config.packageName)
+        this.context = context
         application = Application().also { it.attach(context) }
         _config = config
 
@@ -94,4 +95,11 @@ object TachiRuntime {
     }
 
     val isInitialised: Boolean get() = _config != null
+
+    private var context: TachiContext? = null
+
+    /** Extensions see preference files changed behind their back (a restored backup). */
+    fun reloadPreferences() {
+        context?.reloadPreferences()
+    }
 }

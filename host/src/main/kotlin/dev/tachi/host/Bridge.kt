@@ -120,6 +120,13 @@ object Bridge {
     @JvmStatic
     fun lastError(): ByteArray? = lastError.get()
 
+    /** Preference files were written by the native side; read them again. */
+    @JvmStatic
+    fun reloadPreferences(): ByteArray = guard {
+        TachiRuntime.reloadPreferences()
+        JsonPrimitive(true)
+    }
+
     @JvmStatic
     fun shutdown() {
         for (ext in ExtensionLoader.list()) ExtensionLoader.uninstall(ext.pkg)
