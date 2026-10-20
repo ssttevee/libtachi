@@ -115,22 +115,24 @@ pub const Http = struct {
         return cookies.items;
     }
 
-    /// `name=value&...`, percent-encoded.
-    pub fn form(arena: std.mem.Allocator, fields: []const [2][]const u8) ![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        for (fields, 0..) |field, i| {
-            if (i > 0) try out.append(arena, '&');
-            try encode(arena, &out, field[0]);
-            try out.append(arena, '=');
-            try encode(arena, &out, field[1]);
-        }
-        return out.items;
+    /// `name=value&...`, percent-encoded. The returned slice belongs to the caller.
+    pub fn form(gpa: std.mem.Allocator, fields: []const [2][]const u8) ![]const u8 {
+        return formInner(gpa, fields) catch |err| switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => return err,
+        };
     }
 
-    fn encode(arena: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
-        for (text) |c| {
-            if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') try out.append(arena, c) else try out.print(arena, "%{X:0>2}", .{c});
+    fn formInner(gpa: std.mem.Allocator, fields: []const [2][]const u8) ![]const u8 {
+        var out: Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        for (fields, 0..) |field, i| {
+            if (i > 0) try out.writer.writeByte('&');
+            try (std.Uri.Component{ .raw = field[0] }).formatEscaped(&out.writer);
+            try out.writer.writeByte('=');
+            try (std.Uri.Component{ .raw = field[1] }).formatEscaped(&out.writer);
         }
+        return out.toOwnedSlice();
     }
 };
 
@@ -151,4 +153,21 @@ test "failed CA loading leaves the HTTP client uninitialized" {
     http.ca_file = null;
     const client = try http.get();
     try t.expect(client == try http.get());
+}
+
+test "form encoding preserves escaped wire bytes and cleans up allocation failures" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const encoded = try Http.form(gpa, &.{
+                .{ "a b&=", "AZaz09-_.~ +/%?é" },
+                .{ "", "" },
+            });
+            defer gpa.free(encoded);
+            try std.testing.expectEqualStrings("a%20b%26%3D=AZaz09-_.~%20%2B%2F%25%3F%C3%A9&=", encoded);
+            const empty = try Http.form(gpa, &.{});
+            defer gpa.free(empty);
+            try std.testing.expectEqualStrings("", empty);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
