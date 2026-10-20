@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     });
     // Spawning the worker process and its socket calls.
     tachi_mod.addCSourceFile(.{ .file = b.path("src/worker_posix.c"), .flags = &.{} });
+    tachi_mod.addCSourceFile(.{ .file = b.path("src/formats_time.c"), .flags = &.{} });
 
     // Kotlin host jar: built by Gradle as a cached step unless -Dhost-jar names one.
     const host_jar = if (b.option(

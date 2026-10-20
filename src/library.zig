@@ -50,6 +50,12 @@ pub const Manga = struct {
     id: []const u8,
     title: []const u8,
     author: []const u8 = "",
+    artist: []const u8 = "",
+    genre: []const u8 = "",
+    publishing_status: i32 = 0,
+    web: []const u8 = "",
+    /// Relative page path, including archive entries.
+    cover: ?[]const u8 = null,
     description: []const u8 = "",
     chapters: []const Chapter = &.{},
     /// Null for local titles.
@@ -102,7 +108,7 @@ pub const Manga = struct {
     }
 
     pub fn status(self: Manga) i32 {
-        return if (self.remote) |r| r.status else 0;
+        return if (self.remote) |r| r.status else self.publishing_status;
     }
 
     pub fn onlyFetchOnce(self: Manga) bool {
@@ -181,9 +187,13 @@ pub const ValidateError = error{ UnsupportedLibraryVersion, InvalidManga, Duplic
 
 /// Relative, forward-slash paths that stay inside the library directory.
 pub fn safePath(path: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, path, '#')) |i| {
+        if (std.mem.indexOfScalar(u8, path[i + 1 ..], '#') != null) return false;
+        return safePath(path[0..i]) and safePath(path[i + 1 ..]);
+    }
     if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) return false;
     var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| if (std.mem.eql(u8, part, "..") or part.len == 0) return false;
+    while (it.next()) |part| if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".") or part.len == 0) return false;
     return true;
 }
 
@@ -193,6 +203,7 @@ pub fn validate(gpa: std.mem.Allocator, library: Library) ValidateError!void {
     defer ids.deinit(gpa);
     for (library.manga) |m| {
         if (m.id.len == 0 or m.title.len == 0) return error.InvalidManga;
+        if (m.cover) |cover| if (!safePath(cover)) return error.UnsafePagePath;
         if ((try ids.getOrPut(gpa, m.id)).found_existing) return error.DuplicateManga;
     }
     ids.clearRetainingCapacity();
@@ -367,7 +378,7 @@ pub const Store = struct {
     /// Absolute path of a page file the library refers to.
     pub fn pagePath(self: *const Store, gpa: std.mem.Allocator, relative: []const u8) ![:0]u8 {
         if (!safePath(relative)) return error.UnsafePagePath;
-        return std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ self.dir, relative }, 0);
+        return @import("archive.zig").pagePath(gpa, self.io, self.dir, relative);
     }
 };
 
