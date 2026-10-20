@@ -47,6 +47,33 @@ pub const Page = struct {
     imageUrl: ?[]const u8 = null,
 };
 
+/// One page of a download plan (`Runtime.imageRequests`): the request the
+/// source's client would send, so it can be sent without the JVM.
+pub const ImageRequest = struct {
+    page: Page,
+    url: []const u8,
+    method: []const u8,
+    /// Ordered as the source's client would send them, cookies included.
+    headers: []const std.http.Header,
+    /// The source's rate limits that apply to this request.
+    rates: []const Rate = &.{},
+    /// Set-Cookie strings to restore into a restarted source client before
+    /// falling back to the JVM.
+    cookies: []const []const u8 = &.{},
+    /// Why the request must go through the JVM (an interceptor that rewrites
+    /// responses, a custom client, ...), or null.
+    fallback: ?[]const u8 = null,
+};
+
+/// A source rate limit as conservative even spacing. Requests sharing `key`
+/// share the limit, even across hosts; `initialWaitMs` drains the window the
+/// JVM may have used while planning.
+pub const Rate = struct {
+    key: []const u8,
+    spacingMs: u64,
+    initialWaitMs: u64,
+};
+
 pub const MangasPage = struct {
     mangas: []const Manga,
     hasNextPage: bool,
