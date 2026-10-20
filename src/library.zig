@@ -75,12 +75,43 @@ pub const Manga = struct {
     fetch_interval: i32 = 0,
     /// Chapters from these groups are hidden and skipped by updates.
     excluded_scanlators: []const []const u8 = &.{},
+    /// Tracker entries bound to this title.
+    tracks: []const Track = &.{},
 
     pub fn excludes(self: Manga, scanlator: ?[]const u8) bool {
         const group = scanlator orelse return false;
         for (self.excluded_scanlators) |s| if (std.mem.eql(u8, s, group)) return true;
         return false;
     }
+};
+
+/// A title's entry on a tracking service, in the service's own terms.
+pub const Track = struct {
+    /// Mihon's tracker id: 1 MyAnimeList, 2 AniList, 3 Kitsu, 4 Shikimori,
+    /// 5 Bangumi, 6 Komga, 7 MangaUpdates, 8 Kavita, 9 Suwayomi, ...
+    tracker_id: i32,
+    remote_id: i64 = 0,
+    /// The user's list entry on the service, if it has one.
+    library_id: i64 = 0,
+    title: []const u8 = "",
+    url: []const u8 = "",
+    last_chapter_read: f64 = 0,
+    total_chapters: i32 = 0,
+    /// Service-specific status and score.
+    status: i32 = 0,
+    score: f64 = 0,
+    /// Milliseconds since the epoch; 0 if unset.
+    started: i64 = 0,
+    finished: i64 = 0,
+    private: bool = false,
+};
+
+/// A source's name, remembered so titles from a source whose extension is
+/// gone can still be named (Mihon's source stubs).
+pub const SourceName = struct {
+    id: i64,
+    name: []const u8,
+    lang: []const u8 = "",
 };
 
 pub const Category = struct {
@@ -95,6 +126,7 @@ pub const Library = struct {
     version: u32 = version,
     manga: []const Manga = &.{},
     categories: []const Category = &.{},
+    sources: []const SourceName = &.{},
 
     pub fn find(self: Library, id: []const u8) ?usize {
         for (self.manga, 0..) |m, i| if (std.mem.eql(u8, m.id, id)) return i;
@@ -274,6 +306,11 @@ pub const Store = struct {
 pub fn writeJsonAtomic(gpa: std.mem.Allocator, io: Io, path: []const u8, value: anytype) !void {
     const bytes = try std.json.Stringify.valueAlloc(gpa, value, .{ .emit_null_optional_fields = false });
     defer gpa.free(bytes);
+    try writeAtomic(gpa, io, path, bytes);
+}
+
+/// Writes `bytes` to a temporary file, syncs it and renames it over `path`.
+pub fn writeAtomic(gpa: std.mem.Allocator, io: Io, path: []const u8, bytes: []const u8) !void {
     const temp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
     defer gpa.free(temp);
     errdefer Io.Dir.cwd().deleteFile(io, temp) catch {};
@@ -395,7 +432,7 @@ pub fn syncSource(arena: std.mem.Allocator, library: Library, source_id: i64, de
 
     if (added.items.len == 0 and removed.items.len == 0 and !updated_any) {
         const titles = try replaced(arena, library, index, manga);
-        return .{ .library = .{ .version = library.version, .manga = titles, .categories = library.categories }, .manga_id = id, .new_chapters = &.{}, .changed = false, .found_release = false };
+        return .{ .library = withTitles(library, titles), .manga_id = id, .new_chapters = &.{}, .changed = false, .found_release = false };
     }
 
     var read_numbers: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -461,12 +498,18 @@ pub fn syncSource(arena: std.mem.Allocator, library: Library, source_id: i64, de
     for (added.items) |ch| if (!hidden.contains(ch.id) and !manga.excludes(ch.scanlator)) try new_ids.append(arena, ch.id);
     const titles = try replaced(arena, library, index, manga);
     return .{
-        .library = .{ .version = library.version, .manga = titles, .categories = library.categories },
+        .library = withTitles(library, titles),
         .manga_id = id,
         .new_chapters = new_ids.items,
         .changed = true,
         .found_release = found_release,
     };
+}
+
+fn withTitles(library: Library, titles: []const Manga) Library {
+    var result = library;
+    result.manga = titles;
+    return result;
 }
 
 /// Mihon's `ShouldUpdateDbChapter`.

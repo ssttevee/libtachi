@@ -18,6 +18,7 @@ const manage = @import("manage.zig");
 const library = @import("library.zig");
 const downloads = @import("downloads.zig");
 const local = @import("local.zig");
+const backup = @import("backup.zig");
 const be = @import("backend.zig");
 
 const log = std.log.scoped(.tachi);
@@ -50,10 +51,14 @@ pub const Request = union(enum) {
     remove: []const u8,
     /// Adds the series in the local source to the library.
     scan_local,
+    /// Restores a Mihon backup (`.tachibk`) into the library.
+    import_backup: []const u8,
+    /// Writes the library as a Mihon backup.
+    export_backup: struct { path: []const u8, options: backup.ExportOptions = .{} },
 
     fn usesBackend(self: Request) bool {
         return switch (self) {
-            .delete_download, .remove, .scan_local => false,
+            .delete_download, .remove, .scan_local, .import_backup, .export_backup => false,
             else => true,
         };
     }
@@ -154,7 +159,10 @@ pub const Engine = struct {
     pub fn execute(self: *Engine, job: *Job) !void {
         try self.io.checkCancel();
         switch (job.request) {
-            .sources => job.result.sources = (try job.call(.sources)).sources,
+            .sources => {
+                job.result.sources = (try job.call(.sources)).sources;
+                try self.rememberSources(job, job.result.sources);
+            },
             .extensions => |repo| job.result.extensions = (try job.call(.{ .extensions = repo })).extensions,
             .install => |c| {
                 job.result.sources = (try job.call(.{ .install = .{ .pkg = c.pkg, .repo = c.repo } })).sources;
@@ -207,6 +215,28 @@ pub const Engine = struct {
                 _ = try self.store.update(job.arena.allocator(), Edit{ .id = id }, Edit.apply);
                 job.result = .{ .library_changed = true, .message = "Removed from library" };
             },
+            .import_backup => |path| {
+                const a = job.arena.allocator();
+                const data = try Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(256 << 20));
+                const decoded = try backup.decode(a, data);
+                const Edit = struct {
+                    backup: backup.Backup,
+                    restored: *backup.Restored,
+                    fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                        edit.restored.* = try backup.restore(arena, current, edit.backup, .{});
+                        return edit.restored.library;
+                    }
+                };
+                var restored: backup.Restored = undefined;
+                _ = try self.store.update(a, Edit{ .backup = decoded, .restored = &restored }, Edit.apply);
+                job.result = .{ .library_changed = true, .message = try std.fmt.allocPrint(a, "Restored {d} titles", .{restored.restored}) };
+            },
+            .export_backup => |c| {
+                const a = job.arena.allocator();
+                const bytes = try backup.encodeFile(a, try backup.fromLibrary(a, try self.store.load(a), c.options));
+                try library.writeAtomic(a, self.io, c.path, bytes);
+                job.result = .{ .message = "Backup created" };
+            },
             .scan_local => {
                 const a = job.arena.allocator();
                 const titles = try local.scan(a, self.io, self.options.dir);
@@ -223,6 +253,38 @@ pub const Engine = struct {
                 job.result = .{ .library_changed = true, .message = "Local manga indexed" };
             },
         }
+    }
+
+    /// Remembers installed sources' names, so titles stay named in backups
+    /// and lists after an extension is gone.
+    fn rememberSources(self: *Engine, job: *Job, sources: []const models.SourceInfo) !void {
+        const Edit = struct {
+            sources: []const models.SourceInfo,
+            fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
+                var names: std.ArrayList(library.SourceName) = .empty;
+                try names.appendSlice(arena, current.sources);
+                var changed = false;
+                for (edit.sources) |s| {
+                    const id = s.idInt() catch continue;
+                    for (names.items) |*known| {
+                        if (known.id != id) continue;
+                        if (!std.mem.eql(u8, known.name, s.name) or !std.mem.eql(u8, known.lang, s.lang)) {
+                            known.* = .{ .id = id, .name = s.name, .lang = s.lang };
+                            changed = true;
+                        }
+                        break;
+                    } else {
+                        try names.append(arena, .{ .id = id, .name = s.name, .lang = s.lang });
+                        changed = true;
+                    }
+                }
+                if (!changed) return null;
+                var next = current;
+                next.sources = names.items;
+                return next;
+            }
+        };
+        _ = try self.store.update(job.arena.allocator(), Edit{ .sources = sources }, Edit.apply);
     }
 
     /// Fetches a title's details and chapters in one source call and syncs

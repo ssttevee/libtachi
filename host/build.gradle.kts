@@ -147,3 +147,13 @@ val testHostCompat = tasks.register<JavaExec>("testHostCompat") {
     mainClass.set("dev.tachi.host.HostCompatTest")
 }
 tasks.check { dependsOn(testHostCompat) }
+
+val testMihonBackup = tasks.register<JavaExec>("testMihonBackup") {
+    description = "Check src/testdata/mihon-backup.bin against Mihon's own backup encoding; -PwriteGolden=true rewrites it."
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.tachi.host.mihon.MihonBackupGolden")
+    systemProperty("tachi.golden", rootProject.file("../src/testdata/mihon-backup.bin").absolutePath)
+    systemProperty("tachi.writeGolden", findProperty("writeGolden") ?: "false")
+}
+tasks.check { dependsOn(testMihonBackup) }
