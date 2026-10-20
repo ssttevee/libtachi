@@ -15,13 +15,16 @@ pub fn number(v: Value) f64 {
     return switch (v) {
         .integer => @floatFromInt(v.integer),
         .float => v.float,
-        .number_string => std.fmt.parseFloat(f64, v.number_string) catch 0,
-        .string => std.fmt.parseFloat(f64, v.string) catch 0,
+        .number_string, .string => |text| std.fmt.parseFloat(f64, text) catch 0,
         else => 0,
     };
 }
 pub fn integer(v: Value) i64 {
-    return @intFromFloat(number(v));
+    return switch (v) {
+        .integer => |value| value,
+        .number_string, .string => |text| std.fmt.parseInt(i64, text, 10) catch std.math.lossyCast(i64, number(v)),
+        else => std.math.lossyCast(i64, number(v)),
+    };
 }
 pub fn boolean(v: Value) bool {
     return v == .bool and v.bool;
@@ -220,4 +223,19 @@ pub fn html(ctx: *driver.Context, text: []const u8) ![]const u8 {
         i += 1;
     }
     return out.items;
+}
+
+test "JSON integer conversion preserves IDs and handles floating-point limits" {
+    const t = std.testing;
+    const large_id: i64 = 9_007_199_254_740_993;
+    try t.expectEqual(large_id, integer(.{ .integer = large_id }));
+    try t.expectEqual(large_id, integer(.{ .string = "9007199254740993" }));
+    try t.expectEqual(std.math.maxInt(i64), integer(.{ .number_string = "9223372036854775807" }));
+    try t.expectEqual(std.math.minInt(i64), integer(.{ .integer = std.math.minInt(i64) }));
+    try t.expectEqual(@as(i64, -3), integer(.{ .float = -3.9 }));
+    try t.expectEqual(@as(i64, 12), integer(.{ .string = "12.9" }));
+    try t.expectEqual(@as(i64, 0), integer(.{ .float = std.math.nan(f64) }));
+    try t.expectEqual(std.math.maxInt(i64), integer(.{ .float = std.math.inf(f64) }));
+    try t.expectEqual(std.math.minInt(i64), integer(.{ .float = -std.math.inf(f64) }));
+    try t.expectEqual(@as(i64, 0), integer(.{ .string = "invalid" }));
 }
