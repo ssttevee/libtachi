@@ -421,6 +421,23 @@ pub const Engine = struct {
         return std.json.parseFromSliceLeaky(manage.Registry, a, bytes, models.parse_options);
     }
 
+    /// Installed extensions nothing trusts any more (a store removed, or
+    /// installed before trust was checked), as Mihon lists untrusted ones.
+    pub fn untrustedExtensions(self: *Engine, arena: std.mem.Allocator) ![]const Untrusted {
+        const file = try stores.File.load(arena, self.io, self.options.dir);
+        var out: std.ArrayList(Untrusted) = .empty;
+        for ((try self.registry(arena)).extensions) |e| {
+            const fingerprints = repo.signerFingerprints(arena, self.io, e.path) catch continue;
+            const trusted = for (fingerprints) |fp| {
+                if (file.trusts(e.pkg, e.versionCode, &repo.hex(fp))) break true;
+            } else false;
+            if (trusted) continue;
+            const fingerprint = if (fingerprints.len > 0) try arena.dupe(u8, &repo.hex(fingerprints[fingerprints.len - 1])) else "";
+            try out.append(arena, .{ .pkg = e.pkg, .version_code = e.versionCode, .fingerprint = fingerprint });
+        }
+        return out.items;
+    }
+
     /// Installs a file, then keeps it only if trusted as Mihon trusts
     /// extensions: signed with a store's key, or this version trusted by hand.
     fn installFile(self: *Engine, job: *Job, path: []const u8) !void {
@@ -2892,4 +2909,8 @@ test "engine merges store listings and keeps only trusted extension files" {
     trusted.join();
     try std.testing.expect(trusted.failure == null);
     trusted.deinit();
+    // The unsigned one is still in this registry: it is listed as untrusted.
+    const listed = try engine.untrustedExtensions(a);
+    try std.testing.expectEqual(1, listed.len);
+    try std.testing.expectEqualStrings("eu.unsigned", listed[0].pkg);
 }
