@@ -130,27 +130,27 @@ fn startTls(env: *jni.JNIEnv, _: jni.jclass, h: jni.jlong, host: jni.jbyteArray)
     const name = copyBytes(env, host, &host_buf);
     // Certificate checks need more stack than a JVM thread may have left,
     // especially under Zero's interpreter, so the handshake gets its own.
-    var outcome: Handshake = .{};
+    var outcome: anyerror!void = {};
     const thread = std.Thread.spawn(.{ .stack_size = handshake_stack }, handshake, .{ s, c, name, &outcome }) catch |err| {
         throw(env, "javax/net/ssl/SSLHandshakeException", "{s}: {s}", .{ name, @errorName(err) });
         return 0;
     };
     thread.join();
-    if (outcome.failure) |cause| {
-        throw(env, "javax/net/ssl/SSLHandshakeException", "{s}: {s}", .{ name, cause });
+    outcome catch |err| {
+        throw(env, "javax/net/ssl/SSLHandshakeException", "{s}: {s}", .{ name, @errorName(err) });
         return 0;
-    }
-    return @intFromEnum(c.tls.?.tls_version);
+    };
+    return @backingInt(c.tls.?.tls_version);
 }
 
 const handshake_stack = 1 << 20;
-const Handshake = struct { failure: ?[]const u8 = null };
+// The worker must return void for Thread.spawn; its error union crosses the join.
+fn handshake(s: *State, c: *Connection, name: []const u8, outcome: *anyerror!void) void {
+    outcome.* = handshakeConnection(s, c, name);
+}
 
-fn handshake(s: *State, c: *Connection, name: []const u8, outcome: *Handshake) void {
-    loadBundle(s) catch |err| {
-        outcome.failure = @errorName(err);
-        return;
-    };
+fn handshakeConnection(s: *State, c: *Connection, name: []const u8) !void {
+    try loadBundle(s);
     var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
     s.io.random(&entropy);
     c.tls = tls.Client.init(&c.reader.interface, &c.writer.interface, .{
@@ -163,12 +163,11 @@ fn handshake(s: *State, c: *Connection, name: []const u8, outcome: *Handshake) v
         // HTTP frames its bodies, so a missing close_notify cannot truncate silently.
         .allow_truncation_attacks = true,
     }) catch |err| {
-        outcome.failure = switch (err) {
-            error.ReadFailed => if (c.reader.err) |e| @errorName(e) else "ReadFailed",
-            error.WriteFailed => if (c.writer.err) |e| @errorName(e) else "WriteFailed",
-            else => @errorName(err),
+        return switch (err) {
+            error.ReadFailed => c.reader.err orelse err,
+            error.WriteFailed => c.writer.err orelse err,
+            else => err,
         };
-        return;
     };
 }
 
@@ -240,4 +239,20 @@ fn free(_: *jni.JNIEnv, _: jni.jclass, h: jni.jlong) callconv(.c) void {
     const c = handle(h);
     c.stream.close(s.io);
     s.gpa.destroy(c);
+}
+
+test "handshake worker returns CA errors across the thread join" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/missing.pem", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+    var s: State = .{ .gpa = testing.allocator, .io = testing.io, .ca_file = path };
+    defer s.ca_bundle.deinit(testing.allocator);
+    var connection: Connection = undefined; // CA loading fails before socket access.
+    var outcome: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{ .stack_size = handshake_stack }, handshake, .{ &s, &connection, "example.com", &outcome });
+    thread.join();
+    try testing.expectError(error.FileNotFound, outcome);
+    try testing.expect(!s.ca_loaded);
 }
