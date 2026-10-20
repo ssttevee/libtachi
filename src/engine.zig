@@ -534,6 +534,7 @@ pub const Engine = struct {
         const a = arena_state.allocator();
         const s = try self.loadSettings(a);
         if (s.reader.incognito) return;
+        if (s.reader.incognito_extensions.len > 0 and try self.incognitoSource(a, s, shown.chapter_id)) return;
         const last = shown.pages > 0 and shown.page + 1 >= shown.pages;
         const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
         const hash: u32 = @truncate(std.hash.Wyhash.hash(0, shown.chapter_id));
@@ -543,6 +544,18 @@ pub const Engine = struct {
         const found = findChapter(lib, shown.chapter_id) orelse return;
         if (newly_read) try self.chapterFinished(a, s, found);
         if (ahead) try self.downloadAhead(a, s, found, hash);
+    }
+
+    /// Whether the chapter's source comes from an extension read in
+    /// incognito (Mihon's `incognito_extensions`).
+    fn incognitoSource(self: *Engine, a: std.mem.Allocator, s: settings.Settings, chapter_id: []const u8) !bool {
+        const lib = try self.store.load(a);
+        const found = findChapter(lib, chapter_id) orelse return false;
+        const id = found.manga.source_id orelse return false;
+        for (lib.sources) |source| if (source.id == id) {
+            for (s.reader.incognito_extensions) |pkg| if (std.mem.eql(u8, pkg, source.pkg)) return true;
+        };
+        return false;
     }
 
     /// Deletes the downloads finished chapters queued for deletion, as
@@ -1591,15 +1604,16 @@ pub const Engine = struct {
                 var changed = false;
                 for (edit.sources) |s| {
                     const id = s.idInt() catch continue;
+                    const name: library.SourceName = .{ .id = id, .name = s.name, .lang = s.lang, .pkg = s.extensionPkg };
                     for (names.items) |*known| {
                         if (known.id != id) continue;
-                        if (!std.mem.eql(u8, known.name, s.name) or !std.mem.eql(u8, known.lang, s.lang)) {
-                            known.* = .{ .id = id, .name = s.name, .lang = s.lang };
+                        if (!std.mem.eql(u8, known.name, s.name) or !std.mem.eql(u8, known.lang, s.lang) or !std.mem.eql(u8, known.pkg, s.extensionPkg)) {
+                            known.* = name;
                             changed = true;
                         }
                         break;
                     } else {
-                        try names.append(arena, .{ .id = id, .name = s.name, .lang = s.lang });
+                        try names.append(arena, name);
                         changed = true;
                     }
                 }
@@ -2539,4 +2553,29 @@ test "engine backups carry settings and extensions' settings both ways" {
     try std.testing.expectEqualStrings("LIST", restored.mihon_preferences[0].value.string);
     const prefs = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ two_dir, "prefs", "source_7.json" }), a, .limited(4096));
     try std.testing.expect(std.mem.indexOf(u8, prefs, "\"mirror\"") != null);
+}
+
+test "engine records nothing for sources of extensions read in incognito" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{
+        .manga = &.{.{ .id = "7:/m", .title = "M", .source_id = 7, .chapters = &.{.{ .id = "7:/c", .title = "C" }} }},
+        .sources = &.{.{ .id = 7, .name = "Seven", .pkg = "eu.kanade.seven" }},
+    });
+    var s = try engine.loadSettings(a);
+    s.reader.incognito_extensions = &.{"eu.kanade.seven"};
+    try engine.saveSettings(s);
+    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2 });
+    try std.testing.expectEqual(0, (try engine.loadLibrary(a)).manga[0].chapters[0].last_page_read);
+    s.reader.incognito_extensions = &.{};
+    try engine.saveSettings(s);
+    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2 });
+    try std.testing.expect((try engine.loadLibrary(a)).manga[0].chapters[0].read);
 }

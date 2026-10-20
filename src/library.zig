@@ -158,6 +158,8 @@ pub const SourceName = struct {
     id: i64,
     name: []const u8,
     lang: []const u8 = "",
+    /// The extension package that provides it, if known.
+    pkg: []const u8 = "",
 };
 
 pub const Category = struct {
