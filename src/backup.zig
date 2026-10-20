@@ -203,45 +203,39 @@ const Field = struct {
 };
 
 const Reader = struct {
-    bytes: []const u8,
-    pos: usize = 0,
+    input: std.Io.Reader,
+
+    fn init(bytes: []const u8) Reader {
+        return .{ .input = .fixed(bytes) };
+    }
 
     fn varint(self: *Reader) !u64 {
-        var result: u64 = 0;
-        var shift: u7 = 0;
-        while (true) {
-            if (self.pos >= self.bytes.len or shift > 63) return error.InvalidBackup;
-            const b = self.bytes[self.pos];
-            self.pos += 1;
-            result |= @as(u64, b & 0x7f) << @intCast(shift);
-            if (b & 0x80 == 0) return result;
-            shift += 7;
-        }
+        // Protobuf varints occupy at most ten bytes, including sign extension.
+        const remaining = self.input.buffered();
+        var input: std.Io.Reader = .fixed(remaining[0..@min(10, remaining.len)]);
+        defer self.input.toss(input.seek);
+        return input.takeLeb128(u64) catch return error.InvalidBackup;
     }
 
     fn next(self: *Reader) !?Field {
-        if (self.pos >= self.bytes.len) return null;
+        return self.nextAllowZero(false);
+    }
+
+    fn nextAllowZero(self: *Reader, legacy: bool) !?Field {
+        if (self.input.bufferedLen() == 0) return null;
         const key = try self.varint();
-        const number: u32 = @intCast(key >> 3);
-        if (number == 0) return error.InvalidBackup;
-        const wire: Wire = @fromBackingInt(@intCast(@as(u3, @truncate(key))));
+        // Protobuf field numbers are 29 bits, even on a 64-bit host.
+        const number = std.math.cast(u29, key >> 3) orelse return error.InvalidBackup;
+        if (number == 0 and !legacy) return error.InvalidBackup;
+        const wire: Wire = @fromBackingInt(@as(u3, @truncate(key)));
+        if (number == 0 and wire != .len) return error.InvalidBackup;
         return .{ .number = number, .value = switch (wire) {
             .varint => .{ .varint = try self.varint() },
-            .fixed64 => blk: {
-                if (self.pos + 8 > self.bytes.len) return error.InvalidBackup;
-                defer self.pos += 8;
-                break :blk .{ .fixed64 = std.mem.readInt(u64, self.bytes[self.pos..][0..8], .little) };
-            },
-            .fixed32 => blk: {
-                if (self.pos + 4 > self.bytes.len) return error.InvalidBackup;
-                defer self.pos += 4;
-                break :blk .{ .fixed32 = std.mem.readInt(u32, self.bytes[self.pos..][0..4], .little) };
-            },
+            .fixed64 => .{ .fixed64 = self.input.takeInt(u64, .little) catch return error.InvalidBackup },
+            .fixed32 => .{ .fixed32 = self.input.takeInt(u32, .little) catch return error.InvalidBackup },
             .len => blk: {
-                const n = try self.varint();
-                if (n > self.bytes.len - self.pos) return error.InvalidBackup;
-                defer self.pos += @intCast(n);
-                break :blk .{ .len = self.bytes[self.pos..][0..@intCast(n)] };
+                const n = std.math.cast(usize, try self.varint()) orelse return error.InvalidBackup;
+                break :blk .{ .len = self.input.take(n) catch return error.InvalidBackup };
             },
             _ => return error.InvalidBackup,
         } };
@@ -253,8 +247,8 @@ fn appendInt64(arena: std.mem.Allocator, list: *std.ArrayList(i64), field: Field
     switch (field.value) {
         .varint => |v| try list.append(arena, @bitCast(v)),
         .len => |b| {
-            var r: Reader = .{ .bytes = b };
-            while (r.pos < b.len) try list.append(arena, @bitCast(try r.varint()));
+            var r: Reader = .init(b);
+            while (r.input.bufferedLen() > 0) try list.append(arena, @bitCast(try r.varint()));
         },
         else => return error.InvalidBackup,
     }
@@ -344,7 +338,7 @@ fn gunzip(arena: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var manga: std.ArrayList(Manga) = .empty;
     var categories: std.ArrayList(Category) = .empty;
     var sources: std.ArrayList(Source) = .empty;
@@ -365,7 +359,7 @@ fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
 }
 
 fn decodeExtensionStore(bytes: []const u8) !ExtensionStore {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var store: ExtensionStore = .{ .index_url = "" };
     while (try r.next()) |f| switch (f.number) {
         1 => store.index_url = try f.bytes(),
@@ -383,14 +377,14 @@ fn decodeExtensionStore(bytes: []const u8) !ExtensionStore {
 
 /// A preference, or null for a value class this doesn't know.
 fn decodePreference(arena: std.mem.Allocator, bytes: []const u8) !?Preference {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var key: []const u8 = "";
     var class: []const u8 = "";
     var value_bytes: []const u8 = "";
     while (try r.next()) |f| switch (f.number) {
         1 => key = try f.bytes(),
         2 => {
-            var poly: Reader = .{ .bytes = try f.bytes() };
+            var poly: Reader = .init(try f.bytes());
             while (try poly.next()) |pf| switch (pf.number) {
                 1 => class = try pf.bytes(),
                 2 => value_bytes = try pf.bytes(),
@@ -404,7 +398,7 @@ fn decodePreference(arena: std.mem.Allocator, bytes: []const u8) !?Preference {
     const tag = for (std.enums.values(std.meta.Tag(Preference.Value))) |t| {
         if (std.mem.eql(u8, Preference.class_names.get(t), name)) break t;
     } else return null;
-    var v: Reader = .{ .bytes = value_bytes };
+    var v: Reader = .init(value_bytes);
     var set: std.ArrayList([]const u8) = .empty;
     var value: Preference.Value = switch (tag) {
         .int => .{ .int = 0 },
@@ -427,7 +421,7 @@ fn decodePreference(arena: std.mem.Allocator, bytes: []const u8) !?Preference {
 }
 
 fn decodeSourcePreferences(arena: std.mem.Allocator, bytes: []const u8) !SourcePreferences {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var result: SourcePreferences = .{ .key = "" };
     var prefs: std.ArrayList(Preference) = .empty;
     while (try r.next()) |f| switch (f.number) {
@@ -440,7 +434,7 @@ fn decodeSourcePreferences(arena: std.mem.Allocator, bytes: []const u8) !SourceP
 }
 
 fn decodeManga(arena: std.mem.Allocator, bytes: []const u8) !Manga {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var m: Manga = .{ .source = 0, .url = "" };
     var source_seen = false;
     var url_seen = false;
@@ -497,7 +491,7 @@ fn decodeManga(arena: std.mem.Allocator, bytes: []const u8) !Manga {
 }
 
 fn decodeChapter(bytes: []const u8) !Chapter {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var c: Chapter = .{ .url = "", .name = "" };
     while (try r.next()) |f| switch (f.number) {
         1 => c.url = try f.bytes(),
@@ -517,7 +511,7 @@ fn decodeChapter(bytes: []const u8) !Chapter {
 }
 
 fn decodeCategory(bytes: []const u8) !Category {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var c: Category = .{ .name = "" };
     while (try r.next()) |f| switch (f.number) {
         1 => c.name = try f.bytes(),
@@ -530,7 +524,7 @@ fn decodeCategory(bytes: []const u8) !Category {
 }
 
 fn decodeHistory(bytes: []const u8, legacy: bool) !History {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var h: History = .{ .url = "", .last_read = 0 };
     // Legacy messages numbered their fields from 0.
     const base: u32 = if (legacy) 0 else 1;
@@ -541,7 +535,7 @@ fn decodeHistory(bytes: []const u8, legacy: bool) !History {
 }
 
 fn decodeSource(bytes: []const u8, legacy: bool) !Source {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var s: Source = .{ .source_id = 0 };
     while (try nextLegacy(&r, legacy)) |f| {
         if (legacy) {
@@ -553,23 +547,11 @@ fn decodeSource(bytes: []const u8, legacy: bool) !Source {
 
 /// `Reader.next`, accepting field number 0 inside legacy messages only.
 fn nextLegacy(r: *Reader, legacy: bool) !?Field {
-    if (!legacy) return r.next();
-    if (r.pos >= r.bytes.len) return null;
-    const save = r.pos;
-    const key = try r.varint();
-    if (key >> 3 != 0) {
-        r.pos = save;
-        return r.next();
-    }
-    if (@as(u3, @truncate(key)) != 2) return error.InvalidBackup;
-    const n = try r.varint();
-    if (n > r.bytes.len - r.pos) return error.InvalidBackup;
-    defer r.pos += @intCast(n);
-    return .{ .number = 0, .value = .{ .len = r.bytes[r.pos..][0..@intCast(n)] } };
+    return r.nextAllowZero(legacy);
 }
 
 fn decodeTracking(bytes: []const u8) !Tracking {
-    var r: Reader = .{ .bytes = bytes };
+    var r: Reader = .init(bytes);
     var t: Tracking = .{ .sync_id = 0, .library_id = 0 };
     while (try r.next()) |f| switch (f.number) {
         1 => t.sync_id = try f.int32(),
@@ -1299,4 +1281,27 @@ test "Mihon's own encoding decodes and re-encodes byte for byte" {
     try std.testing.expect(!backup.extension_stores[0].legacy.?);
     try std.testing.expect(backup.extension_stores[1].badge_label == null and backup.extension_stores[1].legacy == null);
     try std.testing.expectEqualSlices(u8, golden, try encode(a, backup));
+}
+
+test "protobuf reader rejects overflow, truncation and invalid field numbers" {
+    const t = std.testing;
+    for ([_][]const u8{
+        "\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x02", // u64 overflow
+        "\x08\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x00", // eleven bytes
+        "\x80", // truncated key
+        "\x09\x00", // truncated fixed64
+        "\x0d\x00", // truncated fixed32
+        "\x0a\x02x", // truncated bytes
+        "\x00", // field zero outside legacy messages
+        "\x80\x80\x80\x80\x10\x00", // field 2^29
+        "\x80\x80\x80\x80\x80\x01\x00", // field 2^32
+    }) |bytes| {
+        var reader: Reader = .init(bytes);
+        try t.expectError(error.InvalidBackup, reader.next());
+    }
+    var reader: Reader = .init("\x08\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01");
+    try t.expectEqual(@as(i64, -1), try (try reader.next()).?.int64());
+    try t.expectEqual(@as(?Field, null), try reader.next());
+    var legacy: Reader = .init("\x02\x01x");
+    try t.expectEqualStrings("x", try (try nextLegacy(&legacy, true)).?.bytes());
 }
