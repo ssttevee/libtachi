@@ -75,6 +75,14 @@ pub fn decode(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     };
 }
 
+const entities = std.StaticStringMap(u21).initComptime(.{
+    .{ "amp", '&' },
+    .{ "lt", '<' },
+    .{ "gt", '>' },
+    .{ "quot", '"' },
+    .{ "apos", '\'' },
+});
+
 fn decodeInner(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
@@ -83,13 +91,7 @@ fn decodeInner(a: std.mem.Allocator, text: []const u8) ![]const u8 {
         if (text[i] == '&') {
             if (std.mem.indexOfScalarPos(u8, text, i, ';')) |end| {
                 const entity = text[i + 1 .. end];
-                const names = [_][]const u8{ "amp", "lt", "gt", "quot", "apos" };
-                const chars = "&<>\"'";
-                var cp: ?u21 = null;
-                for (names, chars) |name, ch| if (std.mem.eql(u8, entity, name)) {
-                    cp = ch;
-                    break;
-                };
+                var cp = entities.get(entity);
                 if (entity.len > 1 and entity[0] == '#') cp = std.fmt.parseInt(u21, entity[if (entity.len > 2 and entity[1] == 'x') @as(usize, 2) else 1..], if (entity.len > 2 and entity[1] == 'x') 16 else 10) catch null;
                 if (cp) |code| {
                     var bytes: [4]u8 = undefined;
@@ -193,9 +195,9 @@ pub fn dateFields(w: *std.Io.Writer, milliseconds: i64) !void {
 test "XML decoding releases buffers on invalid entities and allocation failure" {
     const Check = struct {
         fn run(gpa: std.mem.Allocator) !void {
-            const decoded = try decode(gpa, "text &amp; &#65; &#x1f600; &unknown;");
+            const decoded = try decode(gpa, "text &amp;&lt;&gt;&quot;&apos; &#65; &#x1f600; &unknown; &AMP;");
             defer gpa.free(decoded);
-            try std.testing.expectEqualStrings("text & A 😀 &unknown;", decoded);
+            try std.testing.expectEqualStrings("text &<>\"' A 😀 &unknown; &AMP;", decoded);
             _ = decode(gpa, "allocated prefix &#xD800;") catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 error.InvalidXmlEntity => return,
