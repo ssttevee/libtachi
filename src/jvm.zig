@@ -28,6 +28,9 @@ pub const Vm = struct {
     lib: ?std.DynLib = null,
     /// True if this struct created the VM (and may destroy it).
     owned: bool,
+    /// Archive `saveClassArchive` writes (JDK 17 and 18), owned by `gpa`.
+    pending_archive: ?[:0]u8 = null,
+    gpa: ?std.mem.Allocator = null,
 
     pub const CreateOptions = struct {
         /// JDK/JRE home. Falls back to $TACHI_JAVA_HOME, $JAVA_HOME, then well-known install dirs.
@@ -38,9 +41,10 @@ pub const Vm = struct {
         classpath: []const []const u8 = &.{},
         /// Extra raw JVM options, e.g. "-Xmx512m".
         extra_options: []const []const u8 = &.{},
-        /// Path of a class-data-sharing archive the JVM should use, creating
-        /// it on first exit (`-XX:+AutoCreateSharedArchive`, JDK 19+). Older
-        /// JDKs ignore this. Roughly halves VM start-up on later runs.
+        /// Path of a class-data-sharing archive the JVM should use. JDK 19+
+        /// creates it on first exit (`-XX:+AutoCreateSharedArchive`); on JDK 17
+        /// and 18, `saveClassArchive` writes it from the running VM. Older JDKs
+        /// ignore this. Roughly halves VM start-up on later runs.
         cds_archive: ?[]const u8 = null,
         /// Environment used for $TACHI_LIBJVM / $JAVA_HOME lookups.
         environ: Environ = .empty,
@@ -89,11 +93,29 @@ pub const Vm = struct {
             options.appendAssumeCapacity(.{ .optionString = cp });
         }
         for (base_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
-        if (opts.cds_archive) |archive| if (jdkMajorVersion(arena, io, lib_path) orelse 0 >= 19) {
-            for (cds_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
-            const file = try std.fmt.allocPrintSentinel(arena, "-XX:SharedArchiveFile={s}", .{archive}, 0);
-            options.appendAssumeCapacity(.{ .optionString = file });
-        };
+        var pending: ?[:0]u8 = null;
+        errdefer if (pending) |path| gpa.free(path);
+        if (opts.cds_archive) |archive| {
+            const major = jdkMajorVersion(arena, io, lib_path) orelse 0;
+            if (major >= 19) {
+                for (cds_options) |o| options.appendAssumeCapacity(.{ .optionString = o });
+                const file = try std.fmt.allocPrintSentinel(arena, "-XX:SharedArchiveFile={s}", .{archive}, 0);
+                options.appendAssumeCapacity(.{ .optionString = file });
+            } else if (major >= 17) {
+                // Before 19 the VM never replaces an archive it rejects, so the
+                // name covers the libjvm build and the class path's files.
+                const own = try vmArchive(arena, io, archive, lib_path, opts.classpath);
+                options.appendAssumeCapacity(.{ .optionString = cds_options[1] });
+                if (Io.Dir.cwd().access(io, own, .{})) {
+                    const file = try std.fmt.allocPrintSentinel(arena, "-XX:SharedArchiveFile={s}", .{own}, 0);
+                    options.appendAssumeCapacity(.{ .optionString = file });
+                } else |_| {
+                    removeStaleArchives(io, archive);
+                    options.appendAssumeCapacity(.{ .optionString = "-XX:+RecordDynamicDumpInfo" });
+                    pending = try gpa.dupeSentinel(u8, own, 0);
+                }
+            }
+        }
         for (opts.extra_options) |o| {
             options.appendAssumeCapacity(.{ .optionString = try arena.dupeSentinel(u8, o, 0) });
         }
@@ -107,7 +129,48 @@ pub const Vm = struct {
         var vm: ?*jni.JavaVM = null;
         var main_env: ?*jni.JNIEnv = null;
         if (create_fn(&vm, &main_env, &args) != jni.JNI_OK) return error.JvmCreateFailed;
-        return .{ .vm = vm orelse return error.JvmCreateFailed, .lib = lib, .owned = true };
+        return .{
+            .vm = vm orelse return error.JvmCreateFailed,
+            .lib = lib,
+            .owned = true,
+            .pending_archive = pending,
+            .gpa = gpa,
+        };
+    }
+
+    /// Writes the class-data-sharing archive `create` deferred (JDK 17 and 18)
+    /// from the running VM, covering every class loaded so far. HotSpot dumps
+    /// once per VM, so later calls do nothing. The file appears atomically.
+    pub fn saveClassArchive(self: *Vm) (Error || error{ClassArchiveFailed})!void {
+        const path = self.pending_archive orelse return;
+        self.pending_archive = null;
+        defer self.gpa.?.free(path);
+        const e = try self.env();
+        // jcmd's VM.cds dynamic_dump; JNI calls it despite the package not being exported.
+        const cls = e.f.FindClass(e, "jdk/internal/misc/CDS") orelse {
+            e.f.ExceptionClear(e);
+            return error.ClassArchiveFailed;
+        };
+        defer e.f.DeleteLocalRef(e, cls);
+        const method = e.f.GetStaticMethodID(e, cls, "dumpSharedArchive", "(ZLjava/lang/String;)V") orelse {
+            e.f.ExceptionClear(e);
+            return error.ClassArchiveFailed;
+        };
+        const name = e.f.NewStringUTF(e, path.ptr) orelse {
+            e.f.ExceptionClear(e);
+            return error.ClassArchiveFailed;
+        };
+        defer e.f.DeleteLocalRef(e, name);
+        e.f.CallStaticVoidMethodA(e, cls, method, &[_]jni.jvalue{ .{ .z = jni.JNI_FALSE }, .{ .l = name } });
+        if (e.f.ExceptionCheck(e) != 0) {
+            e.f.ExceptionClear(e);
+            return error.ClassArchiveFailed;
+        }
+    }
+
+    /// Whether `saveClassArchive` would write an archive.
+    pub fn classArchivePending(self: *const Vm) bool {
+        return self.pending_archive != null;
     }
 
     /// Use a VM that already exists in the process (Android, or a Java host
@@ -138,6 +201,7 @@ pub const Vm = struct {
 
     /// Destroys the VM if owned. HotSpot cannot be re-created afterwards.
     pub fn destroy(self: *Vm) void {
+        if (self.pending_archive) |path| self.gpa.?.free(path);
         if (self.owned) _ = self.vm.f.DestroyJavaVM(self.vm);
         if (self.lib) |*l| l.close();
         self.* = undefined;
@@ -152,7 +216,7 @@ pub const Vm = struct {
 const lib_rel_paths: []const []const u8 = switch (builtin.os.tag) {
     .macos => &.{ "lib/server/libjvm.dylib", "lib/libjvm.dylib", "jre/lib/server/libjvm.dylib" },
     .windows => &.{ "bin/server/jvm.dll", "bin/client/jvm.dll", "jre/bin/server/jvm.dll" },
-    else => &.{ "lib/server/libjvm.so", "lib/libjvm.so", "jre/lib/server/libjvm.so", "jre/lib/amd64/server/libjvm.so" },
+    else => &.{ "lib/server/libjvm.so", "lib/client/libjvm.so", "lib/libjvm.so", "jre/lib/server/libjvm.so", "jre/lib/amd64/server/libjvm.so" },
 };
 
 /// A directory whose children are Java installations; `suffix` turns a child into a Java home.
@@ -196,6 +260,39 @@ pub fn jdkMajorVersion(gpa: std.mem.Allocator, io: Io, libjvm_path: []const u8) 
         return parseJavaVersion(text);
     }
     return null;
+}
+
+/// `archive` with an identity suffix before the extension: an archive only
+/// loads into the libjvm that dumped it, with the same class path files, so
+/// the suffix hashes their paths, sizes and modification times.
+fn vmArchive(arena: std.mem.Allocator, io: Io, archive: []const u8, libjvm_path: []const u8, classpath: []const []const u8) Error![:0]u8 {
+    var hash = std.hash.Wyhash.init(0);
+    for ([_][]const []const u8{ &.{libjvm_path}, classpath }) |paths| for (paths) |path| {
+        hash.update(path);
+        if (Io.Dir.cwd().statFile(io, path, .{})) |st| {
+            hash.update(std.mem.asBytes(&st.size));
+            hash.update(std.mem.asBytes(&st.mtime.nanoseconds));
+        } else |_| {}
+    };
+    return std.fmt.allocPrintSentinel(arena, "{s}-{x:0>16}.jsa", .{ archiveStem(archive), hash.final() }, 0);
+}
+
+fn archiveStem(archive: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, archive, ".jsa")) archive[0 .. archive.len - 4] else archive;
+}
+
+/// Deletes archives `vmArchive` named for an earlier libjvm or class path.
+fn removeStaleArchives(io: Io, archive: []const u8) void {
+    const dir_path = std.fs.path.dirname(archive) orelse return;
+    const prefix = std.fs.path.basename(archiveStem(archive));
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return) |entry| {
+        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, prefix)) continue;
+        const rest = entry.name[prefix.len..];
+        if (rest.len > 0 and rest[0] == '-' and std.mem.endsWith(u8, rest, ".jsa")) dir.deleteFile(io, entry.name) catch {};
+    }
 }
 
 fn parseJavaVersion(release: []const u8) ?u32 {

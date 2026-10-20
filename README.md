@@ -73,7 +73,9 @@ the runtime looks for it beside the executable and in `../lib`, so
 `zig-out/bin/tachi-cli` works from any directory.
 
 Start-up: the runtime keeps a JVM class-data-sharing archive of the host in
-the cache dir (JDK 19+, created on the first exit). With it a full
+the cache dir. JDK 19+ creates it on the first exit; on JDK 17 and 18 the
+embedder calls `Runtime.saveStartupCache` once the runtime has done some
+typical work, and the VM writes it while running. With it a full
 `tachi-cli` run that starts the JVM, loads the host and lists extensions
 takes about 70 ms on an M-series Mac, against 170 ms without. Disable with
 `class_data_sharing = false` / `no_class_data_sharing` / `--no-cds`.

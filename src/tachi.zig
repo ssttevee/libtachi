@@ -68,8 +68,9 @@ pub const Options = struct {
     java_home: ?[]const u8 = null,
     libjvm_path: ?[]const u8 = null,
     jvm_options: []const []const u8 = &.{},
-    /// Keep a class-data-sharing archive of the host in `cache_dir`
-    /// (JDK 19+; written on first exit, roughly halves JVM start-up after).
+    /// Keep a class-data-sharing archive of the host in `cache_dir`, which
+    /// roughly halves JVM start-up. JDK 19+ writes it on first exit; on JDK
+    /// 17 and 18 call `Runtime.saveStartupCache`.
     class_data_sharing: bool = true,
     /// Route the host's OkHttp sockets through Zig, including TLS against
     /// `ca_file`. For JVMs without a JIT, where Java's TLS is very slow.
@@ -321,6 +322,23 @@ pub const Runtime = struct {
     /// the runtime exits (not needed for the thread that called `init`).
     pub fn detachThread(self: *Runtime) void {
         self.vm.detach();
+    }
+
+    /// Saves a cache in `cache_dir` that makes later runtimes start faster.
+    /// Call it once after the runtime has done some typical work, ideally
+    /// while the app is idle: everything pauses briefly while it is written.
+    /// Nothing happens if there is nothing to save.
+    ///
+    /// The cache is the JVM's class-data-sharing archive of the classes
+    /// loaded so far. JDK 19+ writes it by itself on exit; JDK 17 and 18 only
+    /// from a running VM, which is what this does.
+    pub fn saveStartupCache(self: *Runtime) !void {
+        return self.vm.saveClassArchive();
+    }
+
+    /// Whether `saveStartupCache` has a cache to save.
+    pub fn startupCachePending(self: *const Runtime) bool {
+        return self.vm.classArchivePending();
     }
 
     // ---- extensions ------------------------------------------------------------
