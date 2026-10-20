@@ -20,6 +20,7 @@ pub const manage = @import("manage.zig");
 pub const library = @import("library.zig");
 pub const recognition = @import("recognition.zig");
 pub const fetch_interval = @import("fetch_interval.zig");
+pub const query = @import("query.zig");
 pub const backup = @import("backup.zig");
 pub const settings = @import("settings.zig");
 pub const queue = @import("queue.zig");
@@ -827,6 +828,7 @@ test {
     _ = library;
     _ = recognition;
     _ = fetch_interval;
+    _ = query;
     _ = backup;
     _ = settings;
     _ = queue;
