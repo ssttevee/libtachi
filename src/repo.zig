@@ -109,36 +109,26 @@ const Field = struct {
 
 /// Schema-less walker over one protobuf message.
 const Decoder = struct {
-    bytes: []const u8,
-    i: usize = 0,
+    input: Io.Reader,
 
     fn init(bytes: []const u8) Decoder {
-        return .{ .bytes = bytes };
+        return .{ .input = .fixed(bytes) };
     }
 
     fn varint(d: *Decoder) Error!u64 {
-        var shift: u6 = 0;
-        var result: u64 = 0;
-        while (true) {
-            if (d.i >= d.bytes.len) return error.InvalidIndex;
-            const c = d.bytes[d.i];
-            d.i += 1;
-            if (shift == 63 and c > 1) return error.InvalidIndex;
-            result |= @as(u64, c & 0x7f) << shift;
-            if (c & 0x80 == 0) return result;
-            if (shift >= 63) return error.InvalidIndex;
-            shift += 7;
-        }
+        const remaining = d.input.buffered();
+        var input: Io.Reader = .fixed(remaining[0..@min(10, remaining.len)]);
+        defer d.input.toss(input.seek);
+        return input.takeLeb128(u64) catch return error.InvalidIndex;
     }
 
     fn take(d: *Decoder, n: usize) Error![]const u8 {
-        if (n > d.bytes.len - d.i) return error.InvalidIndex;
-        defer d.i += n;
-        return d.bytes[d.i..][0..n];
+        if (n > d.input.bufferedLen()) return error.InvalidIndex;
+        return d.input.take(n) catch return error.InvalidIndex;
     }
 
     fn next(d: *Decoder) Error!?Field {
-        if (d.i >= d.bytes.len) return null;
+        if (d.input.bufferedLen() == 0) return null;
         const key = try d.varint();
         const num = std.math.cast(u29, key >> 3) orelse return error.InvalidIndex;
         if (num == 0) return error.InvalidIndex;
@@ -146,9 +136,9 @@ const Decoder = struct {
             .num = num,
             .value = switch (@as(u3, @truncate(key))) {
                 0 => .{ .varint = try d.varint() },
-                1 => .{ .fixed64 = std.mem.readInt(u64, (try d.take(8))[0..8], .little) },
+                1 => .{ .fixed64 = d.input.takeInt(u64, .little) catch return error.InvalidIndex },
                 2 => .{ .bytes = try d.take(std.math.cast(usize, try d.varint()) orelse return error.InvalidIndex) },
-                5 => .{ .fixed32 = std.mem.readInt(u32, (try d.take(4))[0..4], .little) },
+                5 => .{ .fixed32 = d.input.takeInt(u32, .little) catch return error.InvalidIndex },
                 else => return error.InvalidIndex, // groups (3/4) never appear in this format
             },
         };

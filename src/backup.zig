@@ -235,6 +235,7 @@ const Reader = struct {
             .fixed32 => .{ .fixed32 = self.input.takeInt(u32, .little) catch return error.InvalidBackup },
             .len => blk: {
                 const n = std.math.cast(usize, try self.varint()) orelse return error.InvalidBackup;
+                if (n > self.input.bufferedLen()) return error.InvalidBackup;
                 break :blk .{ .len = self.input.take(n) catch return error.InvalidBackup };
             },
             _ => return error.InvalidBackup,
@@ -1292,6 +1293,7 @@ test "protobuf reader rejects overflow, truncation and invalid field numbers" {
         "\x09\x00", // truncated fixed64
         "\x0d\x00", // truncated fixed32
         "\x0a\x02x", // truncated bytes
+        "\x0a\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01", // length overflows reader position
         "\x00", // field zero outside legacy messages
         "\x80\x80\x80\x80\x10\x00", // field 2^29
         "\x80\x80\x80\x80\x80\x01\x00", // field 2^32
