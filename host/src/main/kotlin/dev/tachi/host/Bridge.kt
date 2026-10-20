@@ -66,6 +66,16 @@ object Bridge {
         json.encodeToJsonElement(ListSerializer(ExtensionInfoDto.serializer()), ExtensionLoader.list())
     }
 
+    /** Name of the registered extension `sourceId` belongs to while it is not loaded yet; "" otherwise. */
+    @JvmStatic
+    fun extensionToLoad(sourceId: Long): ByteArray = guard { JsonPrimitive(ExtensionLoader.pendingName(sourceId) ?: "") }
+
+    @JvmStatic
+    fun loadSource(sourceId: Long): ByteArray = guard {
+        ExtensionLoader.source(sourceId)
+        JsonPrimitive(true)
+    }
+
     @JvmStatic
     fun call(sourceId: Long, method: ByteArray, argsJson: ByteArray): ByteArray = guard {
         val source = ExtensionLoader.source(sourceId)

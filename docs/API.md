@@ -25,6 +25,8 @@ so JavaScript consumers do not lose precision, and `int64_t` in the C API.
 | `install(path)` | path to `.jar` or `.apk` | `ExtensionInfo` |
 | `register(entry)` | `{"path", "info": ExtensionInfo}` from an earlier `install` | `ExtensionInfo`; loads on first use |
 | `uninstall(pkg)` | package name | `true`/`false` |
+| `extensionToLoad(sourceId)` | source id | name of its registered, not yet loaded extension; `""` once loaded |
+| `loadSource(sourceId)` | source id | `true` after loading its extension, so the load can be reported on its own |
 | `listExtensions()` | | `ExtensionInfo[]` |
 
 ```json

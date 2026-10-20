@@ -68,6 +68,9 @@ object ExtensionLoader {
 
     fun extension(pkg: String): LoadedExtension? = extensions[pkg]
 
+    /** The extension's name while `id`'s extension is registered but not loaded yet. */
+    fun pendingName(id: Long): String? = sourceOwner[id]?.let { pending[it]?.info?.name }
+
     fun list(): List<ExtensionInfoDto> = (extensions.values.map { it.info } + pending.values.map { it.info }).sortedBy { it.pkg }
 
     /**

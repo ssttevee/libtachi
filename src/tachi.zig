@@ -155,6 +155,8 @@ pub const BridgeMethod = enum {
     register,
     uninstall,
     listExtensions,
+    extensionToLoad,
+    loadSource,
     call,
     fetchImage,
     lastImageMime,
@@ -165,6 +167,7 @@ pub const BridgeMethod = enum {
         return switch (m) {
             .init, .install, .register, .uninstall => "([B)[B",
             .listExtensions, .lastImageMime, .lastError => "()[B",
+            .extensionToLoad, .loadSource => "(J)[B",
             .call => "(J[B[B)[B",
             .fetchImage => "(J[B)[B",
             .shutdown => "()V",
@@ -356,6 +359,21 @@ pub const Runtime = struct {
 
     pub fn listExtensionsParsed(self: *Runtime) Error!Result([]const models.ExtensionInfo) {
         return self.invokeParsed([]const models.ExtensionInfo, .listExtensions, .{});
+    }
+
+    /// Name of the extension `source_id` belongs to while it is registered
+    /// but not loaded yet (see `restore`), or null. Owned by `gpa`.
+    pub fn extensionToLoad(self: *Runtime, gpa: std.mem.Allocator, source_id: i64) Error!?[]u8 {
+        const r = try self.invokeParsed([]const u8, .extensionToLoad, .{source_id});
+        defer r.deinit();
+        if (r.value().len == 0) return null;
+        return try gpa.dupe(u8, r.value());
+    }
+
+    /// Loads the extension `source_id` belongs to now, rather than on its first call.
+    pub fn loadSource(self: *Runtime, source_id: i64) Error!void {
+        const r = try self.invokeParsed(bool, .loadSource, .{source_id});
+        r.deinit();
     }
 
     // ---- source calls ------------------------------------------------------------
