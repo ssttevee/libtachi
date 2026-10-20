@@ -71,6 +71,8 @@ pub const Result = struct {
     library_changed: bool = false,
     /// The library title the request added or changed.
     manga_id: ?[]const u8 = null,
+    /// Chapters new to the reader that an add, refresh or update found.
+    new_chapters: []const []const u8 = &.{},
     message: []const u8 = "Ready",
 };
 
@@ -90,6 +92,8 @@ pub const Options = struct {
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
     release_jvm: bool = true,
+    /// How chapter lists are synced with sources.
+    sync: library.SyncOptions = .{},
 };
 
 pub const Engine = struct {
@@ -116,17 +120,16 @@ pub const Engine = struct {
         return self.store.pagePath(gpa, relative);
     }
 
-    /// Records the page shown in a chapter, and marks it read once requested.
-    pub fn setProgress(self: *Engine, chapter_id: []const u8, page: u32, read: bool) !void {
-        var arena: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena.deinit();
-        const Edit = struct {
-            progress: library.Progress,
-            fn apply(edit: @This(), a: std.mem.Allocator, current: library.Library) !?library.Library {
-                return library.setProgress(a, current, edit.progress);
-            }
-        };
-        _ = try self.store.update(arena.allocator(), Edit{ .progress = .{ .chapter_id = chapter_id, .page = page, .read = read, .now = wallMillis(self.io) } }, Edit.apply);
+    /// Records the page shown in a chapter, marks it read once requested,
+    /// and adds `read_ms` of reading time to its history. Cheap enough for
+    /// every page turn: only the reading-state file is rewritten.
+    pub fn setProgress(self: *Engine, chapter_id: []const u8, page: u32, read: bool, read_ms: i64) !void {
+        try self.store.setProgress(self.gpa, &.{.{ .chapter_id = chapter_id, .page = page, .read = read, .now = wallMillis(self.io), .read_ms = read_ms }});
+    }
+
+    /// Records several chapters' progress in one write, as for an import.
+    pub fn setProgressMany(self: *Engine, progress: []const library.Progress) !void {
+        try self.store.setProgress(self.gpa, progress);
     }
 
     /// Stops extension work and refuses new jobs until `resume`, as for an
@@ -178,15 +181,18 @@ pub const Engine = struct {
                 job.result.message = "Source setting saved";
             },
             .add => |c| {
-                const book = try self.fetchTitle(job, c.source, c.manga);
-                job.result = .{ .library_changed = true, .manga_id = book.id, .message = "Added to library" };
+                const a = job.arena.allocator();
+                const current = try self.store.load(a);
+                const existing = if (current.find(try library.mangaId(a, c.source, c.manga.url))) |i| current.manga[i].chapters else &.{};
+                const fetched = try self.fetchTitle(job, c.source, c.manga, existing);
+                job.result = .{ .library_changed = true, .manga_id = fetched.manga_id, .new_chapters = fetched.new_chapters, .message = "Added to library" };
             },
             .refresh => |id| {
                 const a = job.arena.allocator();
                 const current = try self.store.load(a);
                 const book = current.manga[current.find(id) orelse return error.UnknownManga];
-                _ = try self.fetchTitle(job, book.source_id orelse return error.LocalTitle, book.remote orelse return error.LocalTitle);
-                job.result = .{ .library_changed = true, .manga_id = book.id, .message = "Chapter list updated" };
+                const fetched = try self.fetchTitle(job, book.source_id orelse return error.LocalTitle, book.remote orelse return error.LocalTitle, book.chapters);
+                job.result = .{ .library_changed = true, .manga_id = book.id, .new_chapters = fetched.new_chapters, .message = "Chapter list updated" };
             },
             .update_library => try self.updateLibrary(job),
             .download => |id| try self.download(job, id),
@@ -219,36 +225,32 @@ pub const Engine = struct {
         }
     }
 
-    /// Fetches a title's details and chapters in one source call and stores
-    /// them, keeping read state and downloads.
-    fn fetchTitle(self: *Engine, job: *Job, source: i64, remote: models.Manga) !library.Manga {
+    /// Fetches a title's details and chapters in one source call and syncs
+    /// them into the library as Mihon does; returns the title's id and the
+    /// chapters that are new to the reader.
+    fn fetchTitle(self: *Engine, job: *Job, source: i64, remote: models.Manga, existing: []const library.Chapter) !Fetched {
         const a = job.arena.allocator();
         const started = millis(self.io);
-        const update = (try job.call(.{ .update = .{ .source = source, .manga = remote } })).update orelse return error.InvalidReply;
+        var known: std.ArrayList(models.Chapter) = .empty;
+        for (existing) |ch| if (ch.remote) |r| try known.append(a, r);
+        const update = (try job.call(.{ .update = .{ .source = source, .manga = remote, .chapters = known.items } })).update orelse return error.InvalidReply;
         const fetched = millis(self.io);
-        const chapters = try a.alloc(library.Chapter, update.chapters.len);
-        for (update.chapters, chapters) |ch, *dst| dst.* = .{ .id = try library.chapterId(a, source, ch.url), .title = ch.name, .remote = ch };
-        const book: library.Manga = .{
-            .id = try library.mangaId(a, source, remote.url),
-            .title = update.manga.title,
-            .author = update.manga.author orelse "",
-            .description = update.manga.description orelse "",
-            .chapters = chapters,
-            .source_id = source,
-            .remote = update.manga,
-        };
         try self.io.checkCancel();
         const Edit = struct {
-            book: library.Manga,
+            source: i64,
+            update: models.MangaUpdate,
             now: i64,
+            options: library.SyncOptions,
+            synced: *library.Synced,
             fn apply(edit: @This(), arena: std.mem.Allocator, current: library.Library) !?library.Library {
-                return try library.refresh(arena, current, edit.book, edit.now);
+                edit.synced.* = try library.syncSource(arena, current, edit.source, edit.update.manga, edit.update.chapters, edit.now, edit.options);
+                return edit.synced.library;
             }
         };
-        const built = millis(self.io);
-        _ = try self.store.update(a, Edit{ .book = book, .now = wallMillis(self.io) }, Edit.apply);
-        log.info("refresh chapters={d} source_ms={d} parse_ms={d} save_ms={d}", .{ chapters.len, fetched - started, built - fetched, millis(self.io) - built });
-        return book;
+        var synced: library.Synced = undefined;
+        _ = try self.store.update(a, Edit{ .source = source, .update = update, .now = wallMillis(self.io), .options = self.options.sync, .synced = &synced }, Edit.apply);
+        log.info("refresh chapters={d} new={d} source_ms={d} save_ms={d}", .{ update.chapters.len, synced.new_chapters.len, fetched - started, millis(self.io) - fetched });
+        return .{ .manga_id = synced.manga_id, .new_chapters = synced.new_chapters };
     }
 
     /// Refreshes every source title; one that fails is reported and skipped.
@@ -257,12 +259,14 @@ pub const Engine = struct {
         const current = try self.store.load(a);
         var failed: usize = 0;
         var updated: usize = 0;
+        var new_chapters: std.ArrayList([]const u8) = .empty;
         for (current.manga) |book| {
             try self.io.checkCancel();
             const source = book.source_id orelse continue;
             const remote = book.remote orelse continue;
-            if (self.fetchTitle(job, source, remote)) |_| {
+            if (self.fetchTitle(job, source, remote, book.chapters)) |fetched| {
                 updated += 1;
+                try new_chapters.appendSlice(a, fetched.new_chapters);
             } else |err| switch (err) {
                 error.Canceled => return err,
                 else => {
@@ -273,6 +277,7 @@ pub const Engine = struct {
         }
         job.result = .{
             .library_changed = updated > 0,
+            .new_chapters = new_chapters.items,
             .message = if (failed == 0) "Library updated" else try std.fmt.allocPrint(a, "Library updated; {d} title(s) failed", .{failed}),
         };
     }
@@ -341,6 +346,7 @@ pub const Engine = struct {
 };
 
 const Found = struct { manga: library.Manga, chapter: library.Chapter };
+const Fetched = struct { manga_id: []const u8, new_chapters: []const []const u8 };
 
 fn findChapter(lib: library.Library, chapter_id: []const u8) ?Found {
     for (lib.manga) |m| for (m.chapters) |ch| {
@@ -421,16 +427,27 @@ pub const Job = struct {
     }
     fn loading(context: *anyopaque, extension: ?[]const u8) void {
         const self: *Job = @ptrCast(@alignCast(context));
-        const name = extension orelse {
-            self.phase.store(.operation, .release);
-            return;
-        };
+        if (extension) |name| self.setExtensionLoading(name) else self.setPhase(.operation);
+    }
+
+    /// Sets the phase; for executors (`Engine.execute_fn`) that report their own.
+    pub fn setPhase(self: *Job, phase: Phase) void {
+        self.phase.store(phase, .release);
+    }
+
+    /// Reports that `name` is loading; see `extensionLoading`.
+    pub fn setExtensionLoading(self: *Job, name: []const u8) void {
         while (!self.extension_lock.tryLock()) std.atomic.spinLoopHint();
         const n = @min(name.len, self.extension_buf.len);
         @memcpy(self.extension_buf[0..n], name[0..n]);
         self.extension_len = n;
         self.extension_lock.unlock();
         self.phase.store(.extension_loading, .release);
+    }
+
+    /// Fails with `Canceled` once `cancel` has been called.
+    pub fn checkCancelled(self: *Job) !void {
+        try self.engine.io.checkCancel();
     }
 
     fn fetchFallback(context: *anyopaque, gpa: std.mem.Allocator, request: models.ImageRequest, reason: []const u8) anyerror![]u8 {
@@ -534,7 +551,7 @@ test "engine adds, downloads, records progress and indexes local series through 
     try std.testing.expectEqual(1, download.pages_done.load(.acquire));
     download.deinit();
 
-    try engine.setProgress("7:/c1", 0, true);
+    try engine.setProgress("7:/c1", 0, true, 0);
     const scan = try Job.start(&engine, .scan_local);
     scan.join();
     scan.deinit();

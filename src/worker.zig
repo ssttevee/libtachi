@@ -213,7 +213,7 @@ pub const Client = struct {
     /// The worker's memory at its last response, in KiB.
     last_rss_kib: std.atomic.Value(usize) = .init(0),
     /// Milliseconds from spawn to ready for the last start.
-    last_start_ms: std.atomic.Value(u64) = .init(0),
+    last_start_ms: std.atomic.Value(u32) = .init(0),
     /// Makes the next call crash its worker (needs `ServeOptions.testing`).
     test_crash_next: bool = false,
 
@@ -451,7 +451,7 @@ pub const Client = struct {
             switch (response.kind) {
                 .ready => {
                     if (!self.is_ready.swap(true, .acq_rel)) {
-                        self.last_start_ms.store(tachi_now_ms() - self.spawned_ms, .release);
+                        self.last_start_ms.store(@intCast(@min(tachi_now_ms() - self.spawned_ms, std.math.maxInt(u32))), .release);
                         log.info("worker ready startup_ms={d}", .{tachi_now_ms() - self.spawned_ms});
                     }
                     if (status) |s| s.ready(s.context);
@@ -596,9 +596,11 @@ const Job = struct {
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     is_ready: std.atomic.Value(bool) = .init(false),
-    extension_lock: std.atomic.Mutex = .unlocked,
-    extension: ?[]const u8 = null,
-    extension_changed: std.atomic.Value(bool) = .init(false),
+    /// Extension loads reported so far, in order (null once one has
+    /// loaded): a load can start and finish between two polls, and the
+    /// client must still hear about it.
+    events_lock: std.atomic.Mutex = .unlocked,
+    events: std.ArrayList(?[]const u8) = .empty,
 
     fn work(self: *Job) void {
         defer self.done.store(true, .release);
@@ -616,10 +618,18 @@ const Job = struct {
     }
     fn loading(context: *anyopaque, extension: ?[]const u8) void {
         const self: *Job = @ptrCast(@alignCast(context));
-        while (!self.extension_lock.tryLock()) std.atomic.spinLoopHint();
-        defer self.extension_lock.unlock();
-        self.extension = if (extension) |name| self.arena.allocator().dupe(u8, name) catch null else null;
-        self.extension_changed.store(true, .release);
+        while (!self.events_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.events_lock.unlock();
+        const name = if (extension) |n| self.arena.allocator().dupe(u8, n) catch return else null;
+        self.events.append(self.arena.allocator(), name) catch {};
+    }
+
+    /// Takes the events reported since the last call, into `out`.
+    fn takeEvents(self: *Job, out: *std.ArrayList(?[]const u8), gpa: std.mem.Allocator) !void {
+        while (!self.events_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.events_lock.unlock();
+        try out.appendSlice(gpa, self.events.items);
+        self.events.clearRetainingCapacity();
     }
 };
 
@@ -637,12 +647,10 @@ fn serveLoop(gpa: std.mem.Allocator, runtime: *be.InProcess, options: ServeOptio
                 try send(fd, gpa, Response{ .id = id, .kind = .ready, .rss_kib = tachi_rss_kib() });
                 sent_ready = true;
             }
-            if (job.extension_changed.swap(false, .acq_rel)) {
-                while (!job.extension_lock.tryLock()) std.atomic.spinLoopHint();
-                const extension = job.extension;
-                job.extension_lock.unlock();
-                try send(fd, gpa, Response{ .id = id, .kind = .loading, .extension = extension, .rss_kib = tachi_rss_kib() });
-            }
+            var events: std.ArrayList(?[]const u8) = .empty;
+            defer events.deinit(gpa);
+            try job.takeEvents(&events, gpa);
+            for (events.items) |extension| try send(fd, gpa, Response{ .id = id, .kind = .loading, .extension = extension, .rss_kib = tachi_rss_kib() });
             if (job.done.load(.acquire)) {
                 job.thread.?.join();
                 if (options.after_call) |after| after();

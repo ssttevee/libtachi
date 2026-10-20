@@ -18,6 +18,7 @@ pub const models = @import("models.zig");
 pub const repo = @import("repo.zig");
 pub const manage = @import("manage.zig");
 pub const library = @import("library.zig");
+pub const recognition = @import("recognition.zig");
 pub const downloads = @import("downloads.zig");
 pub const backend = @import("backend.zig");
 pub const worker = @import("worker.zig");
@@ -819,6 +820,7 @@ test {
     _ = repo;
     _ = manage;
     _ = library;
+    _ = recognition;
     _ = downloads;
     std.testing.refAllDecls(backend.InProcess);
     std.testing.refAllDecls(worker);

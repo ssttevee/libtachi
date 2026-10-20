@@ -123,6 +123,18 @@ pub const Backend = struct {
     }
 };
 
+/// A backend for engines whose jobs never reach extensions, such as tests
+/// that set `Engine.execute_fn`. Every call fails with `error.NoBackend`.
+pub const none: Backend = .{ .ptr = &none_state, .vtable = &.{ .run = noneRun, .warm = noneWarm, .cancel = noneQuiet, .release = noneQuiet, .idle = noneQuiet } };
+var none_state: u8 = 0;
+fn noneRun(_: *anyopaque, _: std.mem.Allocator, _: Call, _: ?Status) anyerror!Reply {
+    return error.NoBackend;
+}
+fn noneWarm(_: *anyopaque) bool {
+    return true;
+}
+fn noneQuiet(_: *anyopaque) void {}
+
 /// Runs calls on a `Runtime` in this process, creating it on first use.
 pub const InProcess = struct {
     gpa: std.mem.Allocator,
@@ -132,8 +144,10 @@ pub const InProcess = struct {
     /// HotSpot cannot be created twice in a process, so a failed start is final.
     attempted: bool = false,
     lock: Io.Mutex = .init,
-    /// Source of the call in progress, for `cancel`; 0 when none.
-    current: std.atomic.Value(i64) = .init(0),
+    /// Source of the call in progress, for `cancel`; 0 when none. Locked
+    /// rather than atomic: 32-bit ARM has no 64-bit atomics.
+    current: i64 = 0,
+    current_lock: std.atomic.Mutex = .unlocked,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, options: tachi.Options) InProcess {
         return .{ .gpa = gpa, .io = io, .options = options };
@@ -192,9 +206,9 @@ pub const InProcess = struct {
                 try rt.loadSource(id);
                 if (status) |s| s.loading(s.context, null);
             }
-            self.current.store(id, .release);
+            self.setCurrent(id);
         }
-        defer self.current.store(0, .release);
+        defer self.setCurrent(0);
         return switch (call) {
             .sources => .{ .sources = try sources(rt, arena) },
             .extensions => |repo| .{ .extensions = try rt.repoList(arena, repo.options()) },
@@ -239,8 +253,18 @@ pub const InProcess = struct {
 
     /// Cancels the source client's in-flight requests; JNI calls cannot be
     /// interrupted otherwise.
+    fn setCurrent(self: *InProcess, id: i64) void {
+        while (!self.current_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.current_lock.unlock();
+        self.current = id;
+    }
+
     pub fn cancel(self: *InProcess) void {
-        const id = self.current.load(.acquire);
+        const id = blk: {
+            while (!self.current_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.current_lock.unlock();
+            break :blk self.current;
+        };
         if (id == 0) return;
         const rt = self.rt orelse return;
         rt.cancelRequests(id) catch {};
