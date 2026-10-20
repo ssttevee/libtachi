@@ -115,7 +115,17 @@ normally needed (plus `title`/`name`, which may be empty), but pass back the
 whole object you received: some sources stash state in `memo`.
 
 `update` is the extensions-lib 1.6 primitive the others are built on; use it
-when you want details and chapters in one round trip.
+when you want details and chapters in one round trip. Sources whose details
+and chapters come from the same page then fetch and parse it once.
+
+As in Mihon, `details` and `update` keep the input manga's `url` when the
+source's parsed details leave it unset, and its `title` when the parsed one
+is blank; many `mangaDetailsParse` implementations rely on this.
+
+The host bundles jsoup with one change: `StringUtil.stripControlChars`, which
+runs on every resolved link, is a loop rather than a regex replace that
+matches at every position. On JVMs without a JIT it dominated parsing
+link-heavy pages. `./gradlew testHostCompat` checks it against the regex.
 
 ### Documents
 

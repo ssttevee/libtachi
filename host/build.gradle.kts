@@ -137,3 +137,11 @@ val testImageRequests = tasks.register<JavaExec>("testImageRequests") {
     if (findProperty("liveMangaDex") == "true") args("--live")
 }
 tasks.check { dependsOn(testImageRequests) }
+
+val testHostCompat = tasks.register<JavaExec>("testHostCompat") {
+    description = "Check the host's fast paths (URL trimming, patched jsoup) against the code they replace."
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.tachi.host.HostCompatTest")
+}
+tasks.check { dependsOn(testHostCompat) }

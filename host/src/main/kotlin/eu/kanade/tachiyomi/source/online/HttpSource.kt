@@ -14,8 +14,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import uy.kohesive.injekt.injectLazy
-import java.net.URI
-import java.net.URISyntaxException
+import dev.tachi.host.urlWithoutDomain
 import java.security.MessageDigest
 
 /** A simple implementation for sources from a website. */
@@ -83,17 +82,7 @@ abstract class HttpSource : CatalogueSource {
         this.url = getUrlWithoutDomain(url)
     }
 
-    private fun getUrlWithoutDomain(orig: String): String {
-        return try {
-            val uri = URI(orig.replace(" ", "%20"))
-            var out = uri.path
-            if (uri.query != null) out += "?" + uri.query
-            if (uri.fragment != null) out += "#" + uri.fragment
-            out
-        } catch (_: URISyntaxException) {
-            orig
-        }
-    }
+    private fun getUrlWithoutDomain(orig: String): String = urlWithoutDomain(orig)
 
     /** Returns the url of the provided manga, suitable for opening in a browser. */
     abstract fun getMangaUrl(manga: SManga): String

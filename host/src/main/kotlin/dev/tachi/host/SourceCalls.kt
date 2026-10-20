@@ -17,6 +17,7 @@ import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.source.sourcePreferences
 import kotlinx.coroutines.Dispatchers
@@ -66,19 +67,25 @@ object SourceCalls {
                 )
             }
 
-            "update" -> json.encodeToJsonElement(
-                source.getMangaUpdate(
-                    manga = args.manga("manga"),
+            "update" -> {
+                val manga = args.manga("manga")
+                val update = source.getMangaUpdate(
+                    manga = manga,
                     chapters = args.chapters("chapters"),
                     fetchDetails = args.bool("fetchDetails", true),
                     fetchChapters = args.bool("fetchChapters", true),
-                ).toDto(),
-            )
+                )
+                update.manga.keepIdentityOf(manga)
+                json.encodeToJsonElement(update.toDto())
+            }
 
-            "details" -> json.encodeToJsonElement(
-                source.getMangaUpdate(args.manga("manga"), emptyList(), fetchDetails = true, fetchChapters = false)
-                    .manga.toDto(),
-            )
+            "details" -> {
+                val manga = args.manga("manga")
+                json.encodeToJsonElement(
+                    source.getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false)
+                        .manga.keepIdentityOf(manga).toDto(),
+                )
+            }
 
             "chapters" -> json.encodeToJsonElement(
                 ListSerializer(ChapterDto.serializer()),
@@ -224,6 +231,16 @@ object SourceCalls {
     }
 
     // ---- helpers -----------------------------------------------------------------
+
+    /**
+     * Mihon keeps the stored URL, and the stored title when the parsed one is
+     * blank; many extensions' mangaDetailsParse relies on that.
+     */
+    private fun SManga.keepIdentityOf(original: SManga): SManga {
+        if (runCatching { url }.isFailure) url = original.url
+        if (runCatching { title }.getOrNull().isNullOrBlank()) title = original.title
+        return this
+    }
 
     private fun http(source: Source): HttpSource =
         source as? HttpSource ?: throw IllegalArgumentException("${source.name} is not an HttpSource")
