@@ -15,14 +15,16 @@ pub const Http = struct {
     }
 
     fn get(self: *Http) !*std.http.Client {
-        if (self.client == null) {
-            self.client = .{ .allocator = self.gpa, .io = self.io };
-            if (self.ca_file) |ca| {
-                const now = Io.Clock.real.now(self.io);
-                try self.client.?.ca_bundle.addCertsFromFilePath(self.gpa, self.io, now, Io.Dir.cwd(), ca);
-                self.client.?.now = now;
-            }
+        if (self.client) |*client| return client;
+        var client: std.http.Client = .{ .allocator = self.gpa, .io = self.io };
+        errdefer client.deinit();
+        if (self.ca_file) |ca| {
+            const now = Io.Clock.real.now(self.io);
+            try client.ca_bundle.addCertsFromFilePath(self.gpa, self.io, now, Io.Dir.cwd(), ca);
+            client.now = now;
         }
+        // Publish only a fully configured client; failures must retry CA loading.
+        self.client = client;
         return &self.client.?;
     }
 
@@ -131,3 +133,22 @@ pub const Http = struct {
         }
     }
 };
+
+test "failed CA loading leaves the HTTP client uninitialized" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const missing_ca = try std.fs.path.join(t.allocator, &.{ dir, "missing.pem" });
+    defer t.allocator.free(missing_ca);
+    var http: Http = .{ .gpa = t.allocator, .io = t.io, .ca_file = missing_ca };
+    defer http.deinit();
+    for (0..2) |_| {
+        try t.expectError(error.FileNotFound, http.get());
+        try t.expect(http.client == null);
+    }
+    http.ca_file = null;
+    const client = try http.get();
+    try t.expect(client == try http.get());
+}
