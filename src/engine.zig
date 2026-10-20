@@ -19,6 +19,8 @@ const library = @import("library.zig");
 const downloads = @import("downloads.zig");
 const local = @import("local.zig");
 const backup = @import("backup.zig");
+const settings = @import("settings.zig");
+const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
 
 const log = std.log.scoped(.tachi);
@@ -41,8 +43,9 @@ pub const Request = union(enum) {
     add: struct { source: i64, manga: models.Manga },
     /// Fetches a library title's details and chapters again.
     refresh: []const u8,
-    /// Refreshes every source title in the library.
-    update_library,
+    /// Refreshes library titles from their sources, with Mihon's rules for
+    /// which to skip; `category` limits it to one category instead.
+    update_library: struct { category: ?u32 = null },
     /// Downloads a library chapter, resuming pages an earlier attempt saved.
     download: []const u8,
     /// Deletes a chapter's downloaded pages.
@@ -78,8 +81,14 @@ pub const Result = struct {
     manga_id: ?[]const u8 = null,
     /// Chapters new to the reader that an add, refresh or update found.
     new_chapters: []const []const u8 = &.{},
+    /// Titles a library update could not refresh, and why.
+    update_errors: []const UpdateError = &.{},
+    /// Titles a library update skipped by its rules.
+    update_skipped: usize = 0,
     message: []const u8 = "Ready",
 };
+
+pub const UpdateError = struct { manga_id: []const u8, title: []const u8, message: []const u8 };
 
 pub const Phase = enum(u8) {
     /// The operation itself is running.
@@ -97,8 +106,9 @@ pub const Options = struct {
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
     release_jvm: bool = true,
-    /// How chapter lists are synced with sources.
-    sync: library.SyncOptions = .{},
+    /// The user's offset from UTC in seconds, for "today" in update
+    /// schedules and the updates feed.
+    utc_offset_s: i32 = 0,
 };
 
 pub const Engine = struct {
@@ -108,6 +118,8 @@ pub const Engine = struct {
     store: library.Store,
     options: Options,
     paused: std.atomic.Value(bool) = .init(false),
+    /// Mihon's download queue; see `queue.Queue`.
+    queue: queue_mod.Queue = .{},
     /// Runs jobs instead of the engine, for tests without a JVM.
     execute_fn: ?*const fn (*Engine, *Job) anyerror!void = null,
 
@@ -147,6 +159,15 @@ pub const Engine = struct {
 
     pub fn @"resume"(self: *Engine) void {
         self.paused.store(false, .release);
+    }
+
+    /// The engine settings (`settings.json` in the library directory).
+    pub fn loadSettings(self: *Engine, arena: std.mem.Allocator) !settings.Settings {
+        return settings.Settings.load(arena, self.io, self.options.dir);
+    }
+
+    pub fn saveSettings(self: *Engine, value: settings.Settings) !void {
+        try value.save(self.gpa, self.io, self.options.dir);
     }
 
     /// No job is running: lets the backend do its upkeep.
@@ -200,10 +221,11 @@ pub const Engine = struct {
                 const current = try self.store.load(a);
                 const book = current.manga[current.find(id) orelse return error.UnknownManga];
                 const fetched = try self.fetchTitle(job, book.source_id orelse return error.LocalTitle, book.remote orelse return error.LocalTitle, book.chapters);
+                try self.autoDownload(job, fetched.new_chapters);
                 job.result = .{ .library_changed = true, .manga_id = book.id, .new_chapters = fetched.new_chapters, .message = "Chapter list updated" };
             },
-            .update_library => try self.updateLibrary(job),
-            .download => |id| try self.download(job, id),
+            .update_library => |c| try self.updateLibrary(job, c.category),
+            .download => |id| try self.downloadChapter(job, id),
             .delete_download => |id| try self.deleteDownload(job, id),
             .remove => |id| {
                 const Edit = struct {
@@ -253,6 +275,31 @@ pub const Engine = struct {
                 job.result = .{ .library_changed = true, .message = "Local manga indexed" };
             },
         }
+    }
+
+    /// Queues new chapters as Mihon's auto-download does: when enabled, for
+    /// library titles in the allowed categories, and optionally only when no
+    /// chapter with the same number was read.
+    fn autoDownload(self: *Engine, job: *Job, new_chapters: []const []const u8) !void {
+        if (new_chapters.len == 0) return;
+        const a = job.arena.allocator();
+        const s = try self.loadSettings(a);
+        if (!s.downloads.new_chapters) return;
+        const lib = try self.store.load(a);
+        var selected: std.ArrayList([]const u8) = .empty;
+        for (new_chapters) |id| {
+            const found = findChapter(lib, id) orelse continue;
+            if (!found.manga.favorite) continue;
+            if (!settings.categoryAllowed(found.manga.categories, s.downloads.new_categories, s.downloads.new_exclude_categories)) continue;
+            if (s.downloads.new_unread_only and found.chapter.recognized()) {
+                const read_before = for (found.manga.chapters) |ch| {
+                    if (ch.read and ch.number == found.chapter.number) break true;
+                } else false;
+                if (read_before) continue;
+            }
+            try selected.append(a, id);
+        }
+        if (selected.items.len > 0) _ = try self.queue.enqueue(self, selected.items, true);
     }
 
     /// Remembers installed sources' names, so titles stay named in backups
@@ -309,42 +356,80 @@ pub const Engine = struct {
                 return edit.synced.library;
             }
         };
+        const s = try self.loadSettings(a);
         var synced: library.Synced = undefined;
-        _ = try self.store.update(a, Edit{ .source = source, .update = update, .now = wallMillis(self.io), .options = self.options.sync, .synced = &synced }, Edit.apply);
+        _ = try self.store.update(a, Edit{ .source = source, .update = update, .now = wallMillis(self.io), .options = .{ .mark_duplicate_read = s.update.mark_new_duplicates_read, .update_title = s.update.titles }, .synced = &synced }, Edit.apply);
         log.info("refresh chapters={d} new={d} source_ms={d} save_ms={d}", .{ update.chapters.len, synced.new_chapters.len, fetched - started, millis(self.io) - fetched });
         return .{ .manga_id = synced.manga_id, .new_chapters = synced.new_chapters };
     }
 
-    /// Refreshes every source title; one that fails is reported and skipped.
-    fn updateLibrary(self: *Engine, job: *Job) !void {
+    /// Refreshes library titles as Mihon's library update does: favorites
+    /// only, in the categories the settings allow (or just `category`),
+    /// skipping titles that fetch once, are completed, have unread chapters,
+    /// were never started, or aren't expected to release yet, as the
+    /// settings say. A title that fails is reported and the rest go on.
+    fn updateLibrary(self: *Engine, job: *Job, category: ?u32) !void {
         const a = job.arena.allocator();
         const current = try self.store.load(a);
-        var failed: usize = 0;
+        const s = try self.loadSettings(a);
+        const window_upper = dayStart(wallMillis(self.io), self.options.utc_offset_s) + std.time.ms_per_day;
+        var queue: std.ArrayList(library.Manga) = .empty;
+        var skipped: usize = 0;
+        for (current.manga) |book| {
+            if (!book.favorite or book.local() or book.remote == null) continue;
+            const allowed = if (category) |c| for (if (book.categories.len == 0) &[_]u32{0} else book.categories) |own| {
+                if (own == c) break true;
+            } else false else settings.categoryAllowed(book.categories, s.update.categories, s.update.exclude_categories);
+            if (!allowed) continue;
+            const counts = book.counts();
+            const skip = (book.onlyFetchOnce() and counts.total > 0) or
+                (s.update.skip_completed and book.status() == 2) or
+                (s.update.skip_unread and counts.unread != 0) or
+                (s.update.skip_not_started and counts.total > 0 and counts.read == 0) or
+                (s.update.skip_outside_release_period and book.next_update != 0 and book.next_update > window_upper);
+            if (skip) {
+                skipped += 1;
+                continue;
+            }
+            try queue.append(a, book);
+        }
+        std.mem.sort(library.Manga, queue.items, {}, struct {
+            fn less(_: void, x: library.Manga, y: library.Manga) bool {
+                return std.ascii.lessThanIgnoreCase(x.title, y.title);
+            }
+        }.less);
+        var errors: std.ArrayList(UpdateError) = .empty;
         var updated: usize = 0;
         var new_chapters: std.ArrayList([]const u8) = .empty;
-        for (current.manga) |book| {
+        job.pages_total.store(queue.items.len, .release);
+        for (queue.items, 1..) |book, done| {
             try self.io.checkCancel();
-            const source = book.source_id orelse continue;
-            const remote = book.remote orelse continue;
-            if (self.fetchTitle(job, source, remote, book.chapters)) |fetched| {
+            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters)) |fetched| {
                 updated += 1;
                 try new_chapters.appendSlice(a, fetched.new_chapters);
             } else |err| switch (err) {
                 error.Canceled => return err,
                 else => {
-                    failed += 1;
-                    log.warn("update {s}: {s}: {s}", .{ book.title, @errorName(err), tachi.lastError() });
+                    const message = try std.fmt.allocPrint(a, "{s}: {s}", .{ @errorName(err), tachi.lastError() });
+                    try errors.append(a, .{ .manga_id = book.id, .title = book.title, .message = message });
+                    log.warn("update {s}: {s}", .{ book.title, message });
                 },
             }
+            job.pages_done.store(done, .release);
         }
+        try self.autoDownload(job, new_chapters.items);
         job.result = .{
             .library_changed = updated > 0,
             .new_chapters = new_chapters.items,
-            .message = if (failed == 0) "Library updated" else try std.fmt.allocPrint(a, "Library updated; {d} title(s) failed", .{failed}),
+            .update_errors = errors.items,
+            .update_skipped = skipped,
+            .message = if (errors.items.len == 0) "Library updated" else try std.fmt.allocPrint(a, "Library updated; {d} title(s) failed", .{errors.items.len}),
         };
     }
 
-    fn download(self: *Engine, job: *Job, chapter_id: []const u8) !void {
+    /// Downloads a library chapter for `job`, resuming saved pages, and
+    /// records its pages in the library.
+    pub fn downloadChapter(self: *Engine, job: *Job, chapter_id: []const u8) !void {
         const a = job.arena.allocator();
         const chapter_started = millis(self.io);
         const current = try self.store.load(a);
@@ -562,6 +647,12 @@ fn millis(io: Io) u64 {
     return @intCast(@divTrunc(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
+/// Midnight before `ms` in the zone `utc_offset_s` from UTC, as UTC milliseconds.
+fn dayStart(ms: i64, utc_offset_s: i32) i64 {
+    const offset_ms = @as(i64, utc_offset_s) * std.time.ms_per_s;
+    return @divFloor(ms + offset_ms, std.time.ms_per_day) * std.time.ms_per_day - offset_ms;
+}
+
 fn wallMillis(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
 }
@@ -629,4 +720,15 @@ test "engine adds, downloads, records progress and indexes local series through 
     const bytes = try Io.Dir.cwd().readFileAlloc(io, page, arena, .limited(64));
     try std.testing.expect(std.mem.startsWith(u8, bytes, "\x89PNG"));
     try std.testing.expectEqualStrings("local:Mine", lib.manga[lib.find("local:Mine").?].id);
+
+    // The queue downloads what is left, oldest first, and empties.
+    try std.testing.expectEqual(1, try engine.queue.enqueue(&engine, &.{ "7:/c2", "7:/c1" }, true));
+    var waited: usize = 0;
+    while ((try engine.queue.snapshot(&engine, arena)).len > 0) : (waited += 1) {
+        if (waited > 5000) return error.QueueStuck;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    engine.queue.deinit(&engine);
+    const after = try engine.loadLibrary(arena);
+    try std.testing.expectEqual(1, after.manga[after.find("7:/m").?].chapters[1].pages.len);
 }

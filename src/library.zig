@@ -83,6 +83,46 @@ pub const Manga = struct {
         for (self.excluded_scanlators) |s| if (std.mem.eql(u8, s, group)) return true;
         return false;
     }
+
+    /// Counts Mihon's library uses, leaving out excluded groups' chapters.
+    pub fn counts(self: Manga) Counts {
+        var c: Counts = .{};
+        for (self.chapters) |ch| {
+            if (self.excludes(ch.scanlator)) continue;
+            c.total += 1;
+            if (ch.read) c.read += 1;
+            if (ch.bookmark) c.bookmarked += 1;
+            if (ch.downloaded()) c.downloaded += 1;
+            c.latest_upload = @max(c.latest_upload, ch.date_upload);
+            c.latest_fetch = @max(c.latest_fetch, ch.date_fetch);
+            c.last_read = @max(c.last_read, ch.last_read);
+        }
+        c.unread = c.total - c.read;
+        return c;
+    }
+
+    pub fn status(self: Manga) i32 {
+        return if (self.remote) |r| r.status else 0;
+    }
+
+    pub fn onlyFetchOnce(self: Manga) bool {
+        return if (self.remote) |r| std.mem.eql(u8, r.updateStrategy, "ONLY_FETCH_ONCE") else false;
+    }
+
+    pub fn local(self: Manga) bool {
+        return self.source_id == null;
+    }
+};
+
+pub const Counts = struct {
+    total: usize = 0,
+    read: usize = 0,
+    unread: usize = 0,
+    bookmarked: usize = 0,
+    downloaded: usize = 0,
+    latest_upload: i64 = 0,
+    latest_fetch: i64 = 0,
+    last_read: i64 = 0,
 };
 
 /// A title's entry on a tracking service, in the service's own terms.
