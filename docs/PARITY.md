@@ -54,7 +54,10 @@ differs on purpose.
 |---|---|
 | Source list: languages, hidden, pinned, last used, local source | Same (`views.sourceList`) |
 | Global search: pinned or all, one page per source, Mihon's result order | Same; sources are searched one at a time because extension calls are serialized |
-| Extension stores: multiple stores, every index format, trust, content warnings, obsolete detection | In progress |
+| Extension stores: multiple stores, every index format, refresh rules | Same (`stores.zig`, `repo.zig`) |
+| Listings merged by package and key, language and content-warning filters, obsolete installs | Same |
+| Trust: store keys, version-scoped manual trust, untrusted listing | Same; checked when a file is installed and listed by `untrustedExtensions` |
+| Extension updates across stores | Same |
 | Source preferences | Through the extension's own preference screen (`preferences`, `set_preference`) |
 | Covers: URL-keyed cache, custom covers | Same; fetched through the source's client |
 
@@ -65,7 +68,7 @@ differs on purpose.
 | Manga, chapters, categories, tracking, history, sources, read entries | Same, byte-identical to kotlinx.serialization's encoding |
 | App settings | Same keys and types; mapped onto libtachi's settings, category ids matched by name on restore; Mihon settings libtachi has no use for are kept for the next backup; app state never, private values on request |
 | Source settings | Same; read from and written to the runtime's preference files |
-| Extension stores | Kept through a round trip; restoring them pending the store work |
+| Extension stores | Same, upserted by index URL on restore |
 
 ## Tracking
 
