@@ -26,6 +26,8 @@ const views = @import("views.zig");
 const fetch_interval = @import("fetch_interval.zig");
 const mihon_downloads = @import("mihon_downloads.zig");
 const preferences = @import("preferences.zig");
+const stores = @import("stores.zig");
+const repo = @import("repo.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -78,6 +80,11 @@ pub const Request = union(enum) {
     /// `browse.migration` says. With `replace` false the old title stays in
     /// the library too.
     migrate: struct { from: []const u8, source: i64, manga: models.Manga, replace: bool = true },
+    /// Adds an extension store by its index URL, fetching its name and
+    /// signing key; a legacy `index.min.json` URL becomes its `repo.json`.
+    add_store: []const u8,
+    /// Fetches every store's details again, as Mihon's store refresh does.
+    refresh_stores,
     /// Writes every downloaded chapter of source titles into a Mihon
     /// downloads folder at `root` (its `downloads` directory), named and
     /// packed as the settings say.
@@ -92,7 +99,7 @@ pub const Request = union(enum) {
 
     fn usesBackend(self: Request) bool {
         return switch (self) {
-            .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads => false,
+            .delete_download, .remove, .scan_local, .import_backup, .export_backup, .export_downloads, .import_downloads, .add_store, .refresh_stores => false,
             else => true,
         };
     }
@@ -102,6 +109,11 @@ pub const Result = struct {
     sources: []const models.SourceInfo = &.{},
     extensions: []const manage.RepoEntry = &.{},
     extension_updates: ?manage.UpdateResult = null,
+    /// Installed extensions no store lists any more.
+    obsolete: []const []const u8 = &.{},
+    /// An installed file nothing trusts: it was taken out again; see
+    /// `Engine.trustExtension`.
+    untrusted: ?Untrusted = null,
     page: ?models.MangasPage = null,
     filters: []const models.Filter = &.{},
     mangas: []const models.Manga = &.{},
@@ -128,6 +140,8 @@ pub const Result = struct {
 };
 
 pub const UpdateError = struct { manga_id: []const u8, title: []const u8, message: []const u8 };
+
+pub const Untrusted = struct { pkg: []const u8, version_code: i64, fingerprint: []const u8 };
 
 pub const SearchResult = struct {
     source: models.SourceInfo,
@@ -270,6 +284,171 @@ pub const Engine = struct {
     /// Where extensions keep their settings.
     fn prefsDir(self: *Engine, a: std.mem.Allocator) ![]const u8 {
         return std.fs.path.join(a, &.{ self.options.host_dir orelse self.options.dir, "prefs" });
+    }
+
+    // ---- extension stores ----------------------------------------------------------
+
+    /// The extension stores, in the order they were added.
+    pub fn extensionStores(self: *Engine, arena: std.mem.Allocator) ![]const stores.Store {
+        return (try stores.File.load(arena, self.io, self.options.dir)).stores;
+    }
+
+    pub fn removeStore(self: *Engine, index_url: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const file = try stores.File.load(a, self.io, self.options.dir);
+        try (try file.remove(a, index_url)).save(a, self.io, self.options.dir);
+    }
+
+    /// Trusts one version of an extension signed by `fingerprint`, as
+    /// Mihon's "trust" does for an untrusted extension; install it again.
+    pub fn trustExtension(self: *Engine, untrusted: Untrusted) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const file = try stores.File.load(a, self.io, self.options.dir);
+        try (try file.trust(a, untrusted.pkg, untrusted.version_code, untrusted.fingerprint)).save(a, self.io, self.options.dir);
+    }
+
+    fn fetchStore(self: *Engine, a: std.mem.Allocator, url: []const u8) !stores.Store {
+        var http: repo.Http = .init(self.gpa, self.io);
+        defer http.deinit();
+        if (self.options.ca_file) |ca| try http.useCaFile(ca);
+        return stores.Store.fromIndex(try repo.fetchIndex(&http, a, url), url);
+    }
+
+    /// Mihon's refresh: each store fetched again in turn, failures logged;
+    /// a store whose URL moved is kept under its new URL.
+    fn refreshStores(self: *Engine, job: *Job) !void {
+        const a = job.arena.allocator();
+        const before = try stores.File.load(a, self.io, self.options.dir);
+        const Refreshed = struct { old: []const u8, store: stores.Store };
+        var refreshed: std.ArrayList(Refreshed) = .empty;
+        var failed: usize = 0;
+        for (before.stores) |s| {
+            try self.io.checkCancel();
+            const store = self.fetchStore(a, s.index_url) catch |err| {
+                log.warn("store {s} not refreshed: {s}", .{ s.index_url, @errorName(err) });
+                failed += 1;
+                continue;
+            };
+            try refreshed.append(a, .{ .old = s.index_url, .store = store });
+        }
+        // Stores removed meanwhile stay removed.
+        var file = try stores.File.load(a, self.io, self.options.dir);
+        for (refreshed.items) |r| {
+            const present = for (file.stores) |s| {
+                if (std.mem.eql(u8, s.index_url, r.old)) break true;
+            } else false;
+            if (!present) continue;
+            file = try file.upsert(a, r.store);
+            if (!std.mem.eql(u8, r.old, r.store.index_url)) file = try file.remove(a, r.old);
+        }
+        try file.save(a, self.io, self.options.dir);
+        job.result.message = if (failed == 0) "Stores refreshed" else try std.fmt.allocPrint(a, "Stores refreshed; {d} could not be reached", .{failed});
+    }
+
+    /// One store's listing, or every configured store's merged as Mihon
+    /// shows them, filtered by language and content warning unless `all`.
+    fn listExtensions(self: *Engine, job: *Job, r: be.Call.Repo) !void {
+        const a = job.arena.allocator();
+        const file = try stores.File.load(a, self.io, self.options.dir);
+        if (r.url != null or file.stores.len == 0) {
+            job.result.extensions = (try job.call(.{ .extensions = r })).extensions;
+            return;
+        }
+        var listings: std.ArrayList([]const manage.RepoEntry) = .empty;
+        for (file.stores) |s| {
+            try self.io.checkCancel();
+            // A store that fails contributes nothing, as in Mihon.
+            const reply = job.call(.{ .extensions = .{ .url = s.index_url, .refresh = r.refresh } }) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    log.warn("store {s} not listed: {s}", .{ s.index_url, @errorName(err) });
+                    continue;
+                },
+            };
+            try listings.append(a, reply.extensions);
+        }
+        const merged = try stores.merge(a, listings.items);
+        var installed: std.ArrayList([]const u8) = .empty;
+        for (merged) |e| if (e.installed) try installed.append(a, e.pkg);
+        for (try self.installedPackages(a)) |pkg| {
+            const known = for (installed.items) |p| {
+                if (std.mem.eql(u8, p, pkg)) break true;
+            } else false;
+            if (!known) try installed.append(a, pkg);
+        }
+        job.result.obsolete = try stores.obsolete(a, merged, installed.items);
+        if (r.all) {
+            job.result.extensions = merged;
+        } else {
+            const s = try self.loadSettings(a);
+            job.result.extensions = try stores.filter(a, merged, s.browse.languages, s.browse.content_warnings);
+        }
+    }
+
+    /// Updates installed extensions from every store (or `r.url`'s).
+    fn updateExtensions(self: *Engine, job: *Job, r: be.Call.Repo) !?manage.UpdateResult {
+        const a = job.arena.allocator();
+        const file = try stores.File.load(a, self.io, self.options.dir);
+        if (r.url != null or file.stores.len == 0) return (try job.call(.{ .update_extensions = r })).extension_updates;
+        var updated: std.ArrayList(models.ExtensionInfo) = .empty;
+        var failed: std.ArrayList(manage.RestoreResult.Failure) = .empty;
+        for (file.stores) |s| {
+            const result = (try job.call(.{ .update_extensions = .{ .url = s.index_url, .refresh = r.refresh } })).extension_updates orelse continue;
+            try updated.appendSlice(a, result.updated);
+            try failed.appendSlice(a, result.failed);
+        }
+        return .{ .updated = updated.items, .failed = failed.items, .missing = &.{} };
+    }
+
+    /// Packages the runtime has installed, from its registry.
+    fn installedPackages(self: *Engine, a: std.mem.Allocator) ![]const []const u8 {
+        const installed = try self.registry(a);
+        const out = try a.alloc([]const u8, installed.extensions.len);
+        for (installed.extensions, out) |e, *pkg| pkg.* = e.pkg;
+        return out;
+    }
+
+    fn registry(self: *Engine, a: std.mem.Allocator) !manage.Registry {
+        const path = try std.fs.path.join(a, &.{ self.options.host_dir orelse self.options.dir, "extensions", "installed.json" });
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(16 << 20)) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => return err,
+        };
+        return std.json.parseFromSliceLeaky(manage.Registry, a, bytes, models.parse_options);
+    }
+
+    /// Installs a file, then keeps it only if trusted as Mihon trusts
+    /// extensions: signed with a store's key, or this version trusted by hand.
+    fn installFile(self: *Engine, job: *Job, path: []const u8) !void {
+        const a = job.arena.allocator();
+        const sources = (try job.call(.{ .install_file = path })).sources;
+        const absolute = Io.Dir.cwd().realPathFileAlloc(self.io, path, a) catch path;
+        const entry = for ((try self.registry(a)).extensions) |e| {
+            if (std.mem.eql(u8, e.path, absolute)) break e;
+        } else {
+            job.result = .{ .sources = sources, .message = "Extension installed" };
+            return;
+        };
+        const fingerprints = repo.signerFingerprints(a, self.io, absolute) catch &.{};
+        const file = try stores.File.load(a, self.io, self.options.dir);
+        for (fingerprints) |fp| {
+            if (file.trusts(entry.pkg, entry.versionCode, &repo.hex(fp))) {
+                job.result = .{ .sources = sources, .message = "Extension installed" };
+                return;
+            }
+        }
+        _ = try job.call(.{ .uninstall = entry.pkg });
+        const fingerprint = if (fingerprints.len > 0) try a.dupe(u8, &repo.hex(fingerprints[fingerprints.len - 1])) else "";
+        job.result.untrusted = .{ .pkg = entry.pkg, .version_code = entry.versionCode, .fingerprint = fingerprint };
+        job.failure = if (fingerprint.len == 0)
+            try std.fmt.allocPrint(a, "{s} is not signed, so it can't be trusted", .{entry.pkg})
+        else
+            try std.fmt.allocPrint(a, "{s} {d} is signed by a key no store has: trust it to install", .{ entry.pkg, entry.versionCode });
+        return error.UntrustedExtension;
     }
 
     // ---- covers ------------------------------------------------------------------
@@ -1442,23 +1621,28 @@ pub const Engine = struct {
                 job.result.sources = (try job.call(.sources)).sources;
                 try self.rememberSources(job, job.result.sources);
             },
-            .extensions => |repo| job.result.extensions = (try job.call(.{ .extensions = repo })).extensions,
+            .extensions => |r| try self.listExtensions(job, r),
             .install => |c| {
                 job.result.sources = (try job.call(.{ .install = .{ .pkg = c.pkg, .repo = c.repo } })).sources;
                 job.result.message = "Extension installed";
             },
-            .install_file => |path| {
-                job.result.sources = (try job.call(.{ .install_file = path })).sources;
-                job.result.message = "Extension installed";
-            },
+            .install_file => |path| try self.installFile(job, path),
             .uninstall => |pkg| {
                 job.result.sources = (try job.call(.{ .uninstall = pkg })).sources;
                 job.result.message = "Extension removed";
             },
-            .update_extensions => |repo| {
-                job.result.extension_updates = (try job.call(.{ .update_extensions = repo })).extension_updates;
+            .update_extensions => |r| {
+                job.result.extension_updates = try self.updateExtensions(job, r);
                 job.result.message = "Extensions updated";
             },
+            .add_store => |url| {
+                const a = job.arena.allocator();
+                const store = try self.fetchStore(a, url);
+                const file = try stores.File.load(a, self.io, self.options.dir);
+                try (try file.upsert(a, store)).save(a, self.io, self.options.dir);
+                job.result.message = try std.fmt.allocPrint(a, "Added {s}", .{store.name});
+            },
+            .refresh_stores => try self.refreshStores(job),
             .browse => |c| job.result.page = (try job.call(.{ .browse = .{ .source = c.source, .page = c.page, .kind = c.kind } })).page,
             .filters => |id| job.result.filters = (try job.call(.{ .filters = id })).filters,
             .related => |c| job.result.mangas = (try job.call(.{ .related = .{ .source = c.source, .manga = c.manga } })).mangas,

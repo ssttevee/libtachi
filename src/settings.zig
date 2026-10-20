@@ -112,6 +112,9 @@ pub const Settings = struct {
         last_source: i64 = -1,
         /// Global search only searches pinned sources.
         search_pinned_only: bool = true,
+        /// Extensions shown by content warning (`enabled_content_warnings`):
+        /// any of "safe", "mixed", "nsfw".
+        content_warnings: []const []const u8 = &.{ "safe", "mixed", "nsfw" },
         /// What a migration carries over (`migration_flags`).
         migration: Migration = .{},
     };

@@ -27,6 +27,7 @@ pub const queue = @import("queue.zig");
 pub const views = @import("views.zig");
 pub const mihon_downloads = @import("mihon_downloads.zig");
 pub const preferences = @import("preferences.zig");
+pub const stores = @import("stores.zig");
 pub const downloads = @import("downloads.zig");
 pub const backend = @import("backend.zig");
 pub const worker = @import("worker.zig");
@@ -854,6 +855,7 @@ test {
     _ = views;
     _ = mihon_downloads;
     _ = preferences;
+    _ = stores;
     _ = downloads;
     std.testing.refAllDecls(backend.InProcess);
     std.testing.refAllDecls(worker);

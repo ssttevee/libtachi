@@ -230,6 +230,11 @@ pub const RepoEntry = struct {
     installedVersionCode: ?i64,
     hasUpdate: bool,
     sources: []const RepoSource,
+    /// Index URL of the store that lists it, and that store's signing key.
+    store: ?[]const u8 = null,
+    signingKey: []const u8 = "",
+    /// "safe", "mixed" or "nsfw", as Mihon's content warnings.
+    contentWarning: []const u8 = "safe",
 };
 
 pub const RepoSource = struct {
@@ -260,7 +265,11 @@ pub fn repoList(rt: *Runtime, arena: Allocator, opts: RepoOptions) Error![]RepoE
     const reg = try loadRegistry(rt, arena);
 
     const out = try arena.alloc(RepoEntry, store.extensions.len);
-    for (out, store.extensions) |*dst, e| dst.* = try toEntry(rt, arena, e, reg.find(e.pkg));
+    for (out, store.extensions) |*dst, e| {
+        dst.* = try toEntry(rt, arena, e, reg.find(e.pkg));
+        dst.store = opts.url orelse repo.default_index_url;
+        dst.signingKey = store.signing_key;
+    }
     return out;
 }
 
@@ -402,6 +411,11 @@ fn toEntry(rt: *Runtime, arena: Allocator, e: repo.Extension, installed: ?*Insta
         .versionCode = e.version_code,
         .libVersion = e.lib_version,
         .nsfw = e.nsfw(),
+        .contentWarning = switch (e.content_warning) {
+            .mixed => "mixed",
+            .nsfw => "nsfw",
+            else => "safe",
+        },
         .lang = e.lang(),
         .jarUrl = e.jar_url,
         .apkUrl = e.apk_url,

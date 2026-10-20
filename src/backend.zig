@@ -39,6 +39,9 @@ pub const Call = union(enum) {
         url: ?[]const u8 = null,
         /// Ignore the cached index.
         refresh: bool = false,
+        /// With stores configured and no `url`: every extension, not just
+        /// those in enabled languages and content warnings.
+        all: bool = false,
 
         fn options(self: Repo) manage.RepoOptions {
             return .{ .url = self.url, .refresh = self.refresh };

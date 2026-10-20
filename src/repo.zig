@@ -1,4 +1,4 @@
-//! Extension repository client: fetches a Mihon-style `index.pb`, decodes it,
+//! Extension repository client: fetches Mihon JSON and protobuf stores,
 //! downloads extension packages and checks who signed them.
 //!
 //! Everything here is pure Zig on `std.Io`; the JVM is never involved. The
@@ -29,6 +29,8 @@ pub const Source = struct {
     name: []const u8 = "",
     lang: []const u8 = "",
     base_url: []const u8 = "",
+    mirror_urls: []const []const u8 = &.{},
+    message: ?[]const u8 = null,
 };
 
 pub const Extension = struct {
@@ -50,7 +52,7 @@ pub const Extension = struct {
 
     /// "en" when every source shares a language, "all" otherwise.
     pub fn lang(e: Extension) []const u8 {
-        if (e.sources.len == 0) return "";
+        if (e.sources.len == 0) return "all";
         const first = e.sources[0].lang;
         for (e.sources[1..]) |s| if (!std.mem.eql(u8, s.lang, first)) return "all";
         return first;
@@ -64,11 +66,14 @@ pub const Extension = struct {
 };
 
 pub const Store = struct {
+    index_url: []const u8 = "",
+    legacy: bool = false,
     name: []const u8 = "",
     badge: []const u8 = "",
     /// SHA-256 of the signing certificate, lower-case hex, as Mihon stores it.
     signing_key: []const u8 = "",
     website: []const u8 = "",
+    discord: ?[]const u8 = null,
     /// Set when the extension list lives at a separate URL (index field 102).
     extension_list_url: ?[]const u8 = null,
     extensions: []const Extension = &.{},
@@ -150,11 +155,13 @@ const Decoder = struct {
     }
 };
 
-/// Decodes an index. Accepts gzip or raw protobuf. All slices point into
+/// Decodes a modern JSON or protobuf index, optionally gzipped. All slices point into
 /// `arena` allocations or into `bytes` (strings are not copied), so keep
 /// `bytes` alive as long as the `Store`.
 pub fn parseIndex(arena: Allocator, bytes: []const u8) Error!Store {
     const raw = if (isGzip(bytes)) try gunzip(arena, bytes) else bytes;
+    if (raw.len == 0) return error.InvalidIndex;
+    if (raw[0] == '{') return (try jsonDecode(JsonStore, arena, raw)).store(arena);
     var store: Store = .{};
     var exts: std.ArrayList(Extension) = .empty;
     var d: Decoder = .init(raw);
@@ -164,8 +171,10 @@ pub fn parseIndex(arena: Allocator, bytes: []const u8) Error!Store {
         3 => store.signing_key = f.str(),
         4 => {
             var c: Decoder = .init(f.str());
-            while (try c.next()) |cf| if (cf.num == 1) {
-                store.website = cf.str();
+            while (try c.next()) |cf| switch (cf.num) {
+                1 => store.website = cf.str(),
+                2 => store.discord = cf.str(),
+                else => {},
             };
         },
         101 => {
@@ -184,6 +193,8 @@ pub fn parseIndex(arena: Allocator, bytes: []const u8) Error!Store {
 /// Decodes a bare extension list (what `extension_list_url` points at).
 pub fn parseExtensionList(arena: Allocator, bytes: []const u8) Error![]const Extension {
     const raw = if (isGzip(bytes)) try gunzip(arena, bytes) else bytes;
+    if (raw.len == 0) return error.InvalidIndex;
+    if (raw[0] == '{') return (try jsonDecode(JsonList, arena, raw)).extensionsInto(arena);
     var exts: std.ArrayList(Extension) = .empty;
     var d: Decoder = .init(raw);
     while (try d.next()) |f| if (f.num == 1) {
@@ -220,6 +231,8 @@ fn parseExtension(arena: Allocator, bytes: []const u8) Error!Extension {
                 2 => s.name = sf.str(),
                 3 => s.lang = sf.str(),
                 4 => s.base_url = sf.str(),
+                5 => s.mirror_urls = try std.mem.concat(arena, []const u8, &.{ s.mirror_urls, &.{sf.str()} }),
+                7 => s.message = sf.str(),
                 else => {},
             };
             try sources.append(arena, s);
@@ -228,6 +241,108 @@ fn parseExtension(arena: Allocator, bytes: []const u8) Error!Extension {
     };
     e.sources = sources.items;
     return e;
+}
+
+// ---- JSON formats --------------------------------------------------------------
+
+fn jsonDecode(comptime T: type, arena: Allocator, bytes: []const u8) Error!T {
+    return std.json.parseFromSliceLeaky(T, arena, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidIndex,
+    };
+}
+
+const JsonSource = struct {
+    id: i64,
+    name: []const u8,
+    language: []const u8,
+    homeUrl: []const u8 = "",
+    mirrorUrls: []const []const u8 = &.{},
+    message: ?[]const u8 = null,
+};
+
+const JsonExtension = struct {
+    name: []const u8,
+    packageName: []const u8,
+    resources: struct { apkUrl: []const u8, iconUrl: []const u8, jarUrl: ?[]const u8 = null },
+    extensionLib: []const u8,
+    versionCode: i64,
+    versionName: []const u8,
+    contentWarning: []const u8,
+    sources: []const JsonSource,
+
+    fn extension(e: JsonExtension, arena: Allocator) Error!Extension {
+        const warning = std.mem.startsWith(u8, e.contentWarning, "CONTENT_WARNING_");
+        const name = if (warning) e.contentWarning["CONTENT_WARNING_".len..] else e.contentWarning;
+        const cw: ContentWarning = if (std.mem.eql(u8, name, "SAFE") or std.mem.eql(u8, name, "UNSPECIFIED")) .safe else if (std.mem.eql(u8, name, "MIXED")) .mixed else if (std.mem.eql(u8, name, "NSFW")) .nsfw else return error.InvalidIndex;
+        const sources = try arena.alloc(Source, e.sources.len);
+        for (sources, e.sources) |*dst, src| dst.* = .{ .id = src.id, .name = src.name, .lang = src.language, .base_url = src.homeUrl, .mirror_urls = src.mirrorUrls, .message = src.message };
+        return .{ .name = e.name, .pkg = e.packageName, .apk_url = e.resources.apkUrl, .icon_url = e.resources.iconUrl, .jar_url = e.resources.jarUrl, .lib_version = e.extensionLib, .version_code = e.versionCode, .version_name = e.versionName, .content_warning = cw, .sources = sources };
+    }
+};
+
+const JsonList = struct {
+    extensions: []const JsonExtension,
+
+    fn extensionsInto(list: JsonList, arena: Allocator) Error![]const Extension {
+        const extensions = try arena.alloc(Extension, list.extensions.len);
+        for (extensions, list.extensions) |*dst, e| dst.* = try e.extension(arena);
+        return extensions;
+    }
+};
+
+const JsonStore = struct {
+    name: []const u8,
+    badgeLabel: []const u8,
+    signingKey: []const u8,
+    contact: struct { website: []const u8, discord: ?[]const u8 = null },
+    extensionList: ?JsonList = null,
+    extensionListUrl: ?[]const u8 = null,
+
+    fn store(s: JsonStore, arena: Allocator) Error!Store {
+        return .{ .name = s.name, .badge = s.badgeLabel, .signing_key = s.signingKey, .website = s.contact.website, .discord = s.contact.discord, .extension_list_url = s.extensionListUrl, .extensions = if (s.extensionList) |list| try list.extensionsInto(arena) else &.{} };
+    }
+};
+
+const LegacyRepo = struct {
+    index_v2: ?[]const u8 = null,
+    meta: struct { name: []const u8, shortName: ?[]const u8 = null, website: []const u8, signingKeyFingerprint: []const u8 },
+};
+
+const LegacyExtension = struct {
+    name: []const u8,
+    pkg: []const u8,
+    apk: []const u8,
+    lang: []const u8,
+    code: i64,
+    version: []const u8,
+    nsfw: i32,
+    sources: ?[]const struct { id: i64, lang: []const u8, name: []const u8, baseUrl: []const u8 } = null,
+};
+
+fn parseLegacyList(arena: Allocator, bytes: []const u8, base: []const u8) Error![]const Extension {
+    const raw = if (isGzip(bytes)) try gunzip(arena, bytes) else bytes;
+    const list = try jsonDecode([]const LegacyExtension, arena, raw);
+    const extensions = try arena.alloc(Extension, list.len);
+    for (extensions, list) |*dst, e| {
+        const sources = try arena.alloc(Source, if (e.sources) |ss| @max(1, ss.len) else 1);
+        if (e.sources != null and e.sources.?.len > 0) {
+            for (sources, e.sources.?) |*out, src| out.* = .{ .id = src.id, .name = src.name, .lang = src.lang, .base_url = src.baseUrl };
+        } else sources[0] = .{ .id = 0, .name = e.name, .lang = e.lang };
+        dst.* = .{
+            // Kotlin's substringAfter: from the first "Tachiyomi: " anywhere.
+            .name = if (std.mem.indexOf(u8, e.name, "Tachiyomi: ")) |at| e.name[at + "Tachiyomi: ".len ..] else e.name,
+            .pkg = e.pkg,
+            .apk_url = try std.fmt.allocPrint(arena, "{s}/apk/{s}", .{ base, e.apk }),
+            .icon_url = try std.fmt.allocPrint(arena, "{s}/icon/{s}.png", .{ base, e.pkg }),
+            .lib_version = e.version[0 .. std.mem.lastIndexOfScalar(u8, e.version, '.') orelse e.version.len],
+            .version_code = e.code,
+            .version_name = e.version,
+            .content_warning = if (e.nsfw == 1) .nsfw else .safe,
+            .sources = sources,
+        };
+    }
+    return extensions;
 }
 
 fn isGzip(bytes: []const u8) bool {
@@ -328,8 +443,46 @@ pub fn fetchIndex(h: *Http, arena: Allocator, url: []const u8) Error!Store {
 pub const FetchedIndex = struct { store: Store, bytes: []const u8 };
 
 pub fn fetchIndexWithBytes(h: *Http, arena: Allocator, url: []const u8) Error!FetchedIndex {
+    return fetchDepth(h, arena, url, 0);
+}
+
+fn fetchDepth(h: *Http, arena: Allocator, url: []const u8, depth: usize) Error!FetchedIndex {
+    if (depth >= 16) return error.InvalidIndex;
     const bytes = try h.getAlloc(arena, url, max_index_len);
-    return .{ .store = try resolveExtensionList(h, arena, try parseIndex(arena, bytes)), .bytes = bytes };
+    const raw = if (isGzip(bytes)) try gunzip(arena, bytes) else bytes;
+    if (raw.len == 0) return error.InvalidIndex;
+    var canonical = url;
+    var metadata = raw;
+    var legacy_list: ?[]const u8 = null;
+    if (raw[0] == '[') {
+        if (!std.mem.endsWith(u8, url, "/index.min.json")) return error.InvalidIndex;
+        canonical = try std.mem.concat(arena, u8, &.{ url[0 .. url.len - "index.min.json".len], "repo.json" });
+        metadata = try h.getAlloc(arena, canonical, max_index_len);
+        if (isGzip(metadata)) metadata = try gunzip(arena, metadata);
+        legacy_list = raw;
+    }
+    if (metadata.len > 0 and metadata[0] == '{') {
+        if (jsonDecode(LegacyRepo, arena, metadata)) |legacy| {
+            if (legacy.index_v2) |next| return fetchDepth(h, arena, next, depth + 1);
+            const base = if (std.mem.endsWith(u8, canonical, "/repo.json")) canonical[0 .. canonical.len - "/repo.json".len] else canonical;
+            const list = legacy_list orelse try h.getAlloc(arena, try std.mem.concat(arena, u8, &.{ base, "/index.min.json" }), max_index_len);
+            return .{ .bytes = bytes, .store = .{
+                .index_url = canonical,
+                .legacy = true,
+                .name = legacy.meta.name,
+                .badge = legacy.meta.shortName orelse legacy.meta.name,
+                .signing_key = legacy.meta.signingKeyFingerprint,
+                .website = legacy.meta.website,
+                .extensions = try parseLegacyList(arena, list, base),
+            } };
+        } else |err| {
+            if (err == error.OutOfMemory) return err;
+            if (legacy_list != null) return error.InvalidIndex;
+        }
+    }
+    var store = try parseIndex(arena, raw);
+    store.index_url = canonical;
+    return .{ .store = try resolveExtensionList(h, arena, store), .bytes = bytes };
 }
 
 /// Completes either a freshly downloaded or cached index with its external list.
@@ -611,4 +764,78 @@ test "HTTP allocation limits apply to decoded bodies and preserve redirects" {
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("abc", body);
     try fixture.finish();
+}
+
+fn testResponse(a: Allocator, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+}
+
+test "legacy stores: index.min.json fetches its repo.json, as Mihon does" {
+    const Fixture = @import("testing_http.zig").Fixture;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try Fixture.init(&.{
+        try testResponse(a,
+            \\[{"name":"Tachiyomi: MangaDex","pkg":"eu.dex","apk":"dex.apk","lang":"all","code":7,"version":"1.4.7","nsfw":1,
+            \\  "sources":[{"id":1,"lang":"en","name":"MangaDex","baseUrl":"https://dex"},{"id":2,"lang":"fr","name":"MangaDex","baseUrl":"https://dex"}]},
+            \\ {"name":"Plain","pkg":"eu.plain","apk":"plain.apk","lang":"en","code":1,"version":"1.5.1","nsfw":0}]
+        ),
+        try testResponse(a,
+            \\{"meta":{"name":"Legacy Repo","website":"https://legacy","signingKeyFingerprint":"abcd"}}
+        ),
+    });
+    defer fixture.deinit();
+    try fixture.start();
+    var http = Http.init(testing.allocator, testing.io);
+    defer http.deinit();
+    const store = try fetchIndex(&http, a, try fixture.url(a, "/repo/index.min.json"));
+    try fixture.finish();
+    try testing.expect(store.legacy);
+    try testing.expect(std.mem.endsWith(u8, store.index_url, "/repo/repo.json"));
+    try testing.expectEqualStrings("Legacy Repo", store.badge);
+    try testing.expectEqualStrings("abcd", store.signing_key);
+    const dex = store.extensions[0];
+    try testing.expectEqualStrings("MangaDex", dex.name);
+    try testing.expect(std.mem.endsWith(u8, dex.apk_url, "/repo/apk/dex.apk"));
+    try testing.expect(std.mem.endsWith(u8, dex.icon_url, "/repo/icon/eu.dex.png"));
+    try testing.expectEqualStrings("1.4", dex.lib_version);
+    try testing.expect(dex.nsfw());
+    try testing.expectEqualStrings("all", dex.lang());
+    // No sources: one with id 0 stands in.
+    try testing.expectEqual(0, store.extensions[1].sources[0].id);
+    try testing.expectEqualStrings("en", store.extensions[1].lang());
+}
+
+test "a legacy repo.json can point to a JSON store, whose list may live elsewhere" {
+    const Fixture = @import("testing_http.zig").Fixture;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = try Fixture.init(&.{});
+    defer fixture.deinit();
+    const next = try fixture.url(a, "/v2/index.json");
+    const list = try fixture.url(a, "/v2/list.json");
+    fixture.responses = &.{
+        try testResponse(a, try std.fmt.allocPrint(a, "{{\"index_v2\":\"{s}\",\"meta\":{{\"name\":\"Old\",\"website\":\"w\",\"signingKeyFingerprint\":\"x\"}}}}", .{next})),
+        try testResponse(a, try std.fmt.allocPrint(a,
+            \\{{"name":"New","badgeLabel":"N","signingKey":"beef","contact":{{"website":"https://new","discord":"d"}},"extensionListUrl":"{s}"}}
+        , .{list})),
+        try testResponse(a,
+            \\{"extensions":[{"name":"Weeb","packageName":"eu.weeb","resources":{"apkUrl":"https://new/weeb.apk","iconUrl":"https://new/weeb.png"},
+            \\  "extensionLib":"1.6","versionCode":3,"versionName":"1.6.3","contentWarning":"CONTENT_WARNING_MIXED",
+            \\  "sources":[{"id":9,"name":"Weeb","language":"en","mirrorUrls":["https://m"]}]}]}
+        ),
+    };
+    try fixture.start();
+    var http = Http.init(testing.allocator, testing.io);
+    defer http.deinit();
+    const store = try fetchIndex(&http, a, try fixture.url(a, "/old/repo.json"));
+    try fixture.finish();
+    try testing.expect(!store.legacy);
+    try testing.expectEqualStrings(next, store.index_url);
+    try testing.expectEqualStrings("beef", store.signing_key);
+    try testing.expectEqualStrings("d", store.discord.?);
+    try testing.expectEqual(ContentWarning.mixed, store.extensions[0].content_warning);
+    try testing.expectEqualStrings("https://m", store.extensions[0].sources[0].mirror_urls[0]);
 }

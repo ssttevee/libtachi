@@ -166,6 +166,9 @@ pub fn fromSettings(a: std.mem.Allocator, s: Settings) ![]const Preference {
 
     const b = s.browse;
     try P.add(&out, a, "source_languages", .{ .string_set = b.languages });
+    var warnings: std.ArrayList([]const u8) = .empty;
+    for (b.content_warnings) |w| try warnings.append(a, try std.ascii.allocUpperString(a, w));
+    try P.add(&out, a, "enabled_content_warnings", .{ .string_set = warnings.items });
     try P.add(&out, a, "hidden_catalogues", .{ .string_set = try idSetI64(a, b.hidden_sources) });
     try P.add(&out, a, "pinned_catalogues", .{ .string_set = try idSetI64(a, b.pinned_sources) });
     const m = b.migration;
@@ -334,6 +337,11 @@ fn applyOne(a: std.mem.Allocator, s: *Settings, p: Preference, categories: []con
         if (v == .string_set) s.reader.incognito_extensions = v.string_set;
     } else if (eql(u8, key, "source_languages")) {
         if (v == .string_set) s.browse.languages = v.string_set;
+    } else if (eql(u8, key, "enabled_content_warnings")) {
+        if (v != .string_set) return true;
+        const lower = try a.alloc([]const u8, v.string_set.len);
+        for (v.string_set, lower) |w, *l| l.* = try std.ascii.allocLowerString(a, w);
+        s.browse.content_warnings = lower;
     } else if (eql(u8, key, "hidden_catalogues")) {
         if (v == .string_set) s.browse.hidden_sources = try parseIds(a, v.string_set);
     } else if (eql(u8, key, "pinned_catalogues")) {
