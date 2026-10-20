@@ -24,6 +24,7 @@ const queue_mod = @import("queue.zig");
 const be = @import("backend.zig");
 const views = @import("views.zig");
 const tracking = @import("tracking.zig");
+const track_drivers = @import("track/driver.zig");
 const fetch_interval = @import("fetch_interval.zig");
 const mihon_downloads = @import("mihon_downloads.zig");
 const preferences = @import("preferences.zig");
@@ -212,9 +213,17 @@ pub const Engine = struct {
     tracking_job: ?*Job = null,
     /// Runs jobs instead of the engine, for tests without a JVM.
     execute_fn: ?*const fn (*Engine, *Job) anyerror!void = null,
+    /// The built-in tracking services, used unless `Options.tracker_driver`.
+    drivers: track_drivers.Drivers,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, backend: be.Backend, options: Options) Engine {
-        return .{ .gpa = gpa, .io = io, .backend = backend, .store = .{ .io = io, .dir = options.dir }, .options = options };
+        return .{ .gpa = gpa, .io = io, .backend = backend, .store = .{ .io = io, .dir = options.dir }, .options = options, .drivers = .init(gpa, io, options.ca_file, options.host_dir orelse options.dir) };
+    }
+
+    /// Frees what the tracking services hold. Stop the queue first
+    /// (`queue.deinit`).
+    pub fn deinit(self: *Engine) void {
+        self.drivers.deinit();
     }
 
     /// The library, allocated in `arena`.
@@ -1761,7 +1770,7 @@ pub const Engine = struct {
     fn trackerCall(self: *Engine, job: *Job, state: *tracking.State, id: i32, op: tracking.Operation) !tracking.Reply {
         try job.checkCancelled();
         _ = tracking.get(id) orelse return error.UnknownTracker;
-        const driver = self.options.tracker_driver orelse return error.TrackerNotImplemented;
+        const driver = self.options.tracker_driver orelse self.drivers.driver();
         const reply = driver.call(driver.context, job.arena.allocator(), self.io, id, state.credential(id), state.formats, op) catch |err| {
             if (err == error.AuthenticationExpired) {
                 var c = state.credential(id);
