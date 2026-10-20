@@ -77,16 +77,23 @@ pub const Queue = struct {
     /// Loads the saved queue once; the caller holds the lock.
     fn ensureLoaded(self: *Queue, engine: *Engine) !void {
         if (self.loaded) return;
-        self.loaded = true;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const bytes = Io.Dir.cwd().readFileAlloc(engine.io, try path(engine, a), a, .limited(16 << 20)) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => {
+                self.loaded = true;
+                return;
+            },
             else => return err,
         };
         const saved = try std.json.parseFromSliceLeaky(Saved, a, bytes, models.parse_options);
         const lib = try engine.store.load(a);
+        const original_len = self.items.items.len;
+        errdefer {
+            for (self.items.items[original_len..]) |item| freeItem(engine.gpa, item);
+            self.items.shrinkRetainingCapacity(original_len);
+        }
         for (saved.chapters) |id| {
             var source: i64 = 0;
             find: for (lib.manga) |m| for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id)) {
@@ -95,6 +102,7 @@ pub const Queue = struct {
             };
             try self.append(engine.gpa, id, source);
         }
+        self.loaded = true;
     }
 
     /// Saves the queue; the caller holds the lock.
@@ -400,4 +408,52 @@ test "queue append releases owned IDs when list growth fails" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "queue restoration rolls back allocation failures and remains retryable" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "downloads");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = "{\"chapters\":[\"first\",\"second\"]}" });
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator, root: []const u8) !void {
+            var engine: Engine = .init(gpa, std.testing.io, @import("backend.zig").none, .{ .dir = root });
+            defer engine.deinit();
+            defer engine.queue.deinit(&engine);
+            engine.queue.ensureLoaded(&engine) catch |err| {
+                try std.testing.expect(!engine.queue.loaded);
+                try std.testing.expectEqual(0, engine.queue.items.items.len);
+                return err;
+            };
+            try engine.queue.ensureLoaded(&engine);
+            try std.testing.expect(engine.queue.loaded);
+            try std.testing.expectEqual(2, engine.queue.items.items.len);
+            try std.testing.expectEqualStrings("first", engine.queue.items.items[0].chapter_id);
+            try std.testing.expectEqualStrings("second", engine.queue.items.items[1].chapter_id);
+        }
+    };
+    try t.checkAllAllocationFailures(t.allocator, Check.run, .{dir});
+}
+
+test "queue restoration retries a corrected file after a parse failure" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(t.io, "downloads");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = "{" });
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    var engine: Engine = .init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = dir });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    try t.expectError(error.UnexpectedEndOfInput, engine.queue.ensureLoaded(&engine));
+    try t.expect(!engine.queue.loaded);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = "{\"chapters\":[\"recovered\"]}" });
+    try engine.queue.ensureLoaded(&engine);
+    try t.expect(engine.queue.loaded);
+    try t.expectEqual(1, engine.queue.items.items.len);
+    try t.expectEqualStrings("recovered", engine.queue.items.items[0].chapter_id);
 }
