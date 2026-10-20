@@ -25,6 +25,7 @@ const be = @import("backend.zig");
 const views = @import("views.zig");
 const fetch_interval = @import("fetch_interval.zig");
 const mihon_downloads = @import("mihon_downloads.zig");
+const preferences = @import("preferences.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -155,6 +156,9 @@ pub const Options = struct {
     /// The user's offset from UTC in seconds, for "today" in update
     /// schedules and the updates feed.
     utc_offset_s: i32 = 0,
+    /// The runtime's data directory, where extensions keep their settings
+    /// (`prefs/`); null if it is `dir`.
+    host_dir: ?[]const u8 = null,
 };
 
 pub const Engine = struct {
@@ -234,6 +238,11 @@ pub const Engine = struct {
         const s = try self.loadSettings(arena);
         const lib = try self.store.load(arena);
         return views.libraryView(arena, lib, try views.libraryOptions(arena, lib, s, search, self.options.utc_offset_s));
+    }
+
+    /// Where extensions keep their settings.
+    fn prefsDir(self: *Engine, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ self.options.host_dir orelse self.options.dir, "prefs" });
     }
 
     // ---- covers ------------------------------------------------------------------
@@ -1492,12 +1501,31 @@ pub const Engine = struct {
                     }
                 };
                 var restored: backup.Restored = undefined;
-                _ = try self.store.update(a, Edit{ .backup = decoded, .restored = &restored }, Edit.apply);
+                const after = try self.store.update(a, Edit{ .backup = decoded, .restored = &restored }, Edit.apply);
+                // Settings name categories by the backup's ids; Mihon maps them by name.
+                var mapping: std.ArrayList(preferences.CategoryMapping) = .empty;
+                for (decoded.categories) |bc| for (after.categories) |c| if (std.mem.eql(u8, c.name, bc.name)) try mapping.append(a, .{ .backup_id = bc.id, .id = c.id });
+                if (decoded.preferences.len > 0) try self.saveSettings(try preferences.applyToSettings(a, try self.loadSettings(a), decoded.preferences, mapping.items));
+                if (decoded.source_preferences.len > 0) {
+                    try preferences.writeSourcePreferences(a, self.io, try self.prefsDir(a), decoded.source_preferences);
+                    // A running runtime has the old values; the next one reads these.
+                    self.backend.release();
+                }
                 job.result = .{ .library_changed = true, .message = try std.fmt.allocPrint(a, "Restored {d} titles", .{restored.restored}) };
             },
             .export_backup => |c| {
                 const a = job.arena.allocator();
-                const bytes = try backup.encodeFile(a, try backup.fromLibrary(a, try self.store.load(a), c.options));
+                var b = try backup.fromLibrary(a, try self.store.load(a), c.options);
+                if (c.options.app_settings) {
+                    var kept: std.ArrayList(backup.Preference) = .empty;
+                    for (try preferences.fromSettings(a, try self.loadSettings(a))) |p| {
+                        if (preferences.isAppState(p.key) or (!c.options.private_settings and preferences.isPrivate(p.key))) continue;
+                        try kept.append(a, p);
+                    }
+                    b.preferences = kept.items;
+                }
+                if (c.options.source_settings) b.source_preferences = try preferences.readSourcePreferences(a, self.io, try self.prefsDir(a), c.options.private_settings);
+                const bytes = try backup.encodeFile(a, b);
                 try library.writeAtomic(a, self.io, c.path, bytes);
                 job.result = .{ .message = "Backup created" };
             },
@@ -2456,4 +2484,51 @@ test "engine exports downloads in Mihon's layout and imports them back" {
     // Deleting an imported chapter removes its archive.
     try std.testing.expectEqual(1, try engine.deleteDownloads(&.{"1:/c1"}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fs.path.join(a, &.{ "lib", page[0..std.mem.indexOfScalar(u8, page, '#').?] }), .{}));
+}
+
+test "engine backups carry settings and extensions' settings both ways" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "one/prefs");
+    try tmp.dir.createDirPath(io, "two");
+    try tmp.dir.writeFile(io, .{ .sub_path = "one/prefs/source_7.json", .data = "{\"mirror\": {\"t\": \"s\", \"v\": \"b\"}}" });
+    const one_dir = try tmp.dir.realPathFileAlloc(io, "one", a);
+    const two_dir = try tmp.dir.realPathFileAlloc(io, "two", a);
+    const file = try std.fs.path.join(a, &.{ one_dir, "backup.tachibk" });
+
+    var one: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = one_dir });
+    defer one.queue.deinit(&one);
+    try one.store.save(a, .{ .categories = &.{.{ .id = 4, .name = "Later" }} });
+    var s = try one.loadSettings(a);
+    s.reader.skip_read = true;
+    s.downloads.new_categories = &.{4};
+    s.mihon_preferences = &.{.{ .key = "pref_display_mode_library", .value = .{ .string = "LIST" } }};
+    try one.saveSettings(s);
+    const out = try Job.start(&one, .{ .export_backup = .{ .path = file } });
+    out.join();
+    try std.testing.expect(out.failure == null);
+    out.deinit();
+
+    // The other library already has a category, so "Later" gets another id.
+    var two: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = two_dir });
+    defer two.queue.deinit(&two);
+    try two.store.save(a, .{ .categories = &.{.{ .id = 1, .name = "First" }} });
+    const in = try Job.start(&two, .{ .import_backup = file });
+    in.join();
+    try std.testing.expect(in.failure == null);
+    in.deinit();
+    const restored = try two.loadSettings(a);
+    try std.testing.expect(restored.reader.skip_read);
+    const lib = try two.loadLibrary(a);
+    const later = for (lib.categories) |c| {
+        if (std.mem.eql(u8, c.name, "Later")) break c.id;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u32, &.{later}, restored.downloads.new_categories);
+    try std.testing.expectEqualStrings("LIST", restored.mihon_preferences[0].value.string);
+    const prefs = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ two_dir, "prefs", "source_7.json" }), a, .limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, prefs, "\"mirror\"") != null);
 }

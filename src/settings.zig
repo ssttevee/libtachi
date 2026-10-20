@@ -7,6 +7,7 @@ const Io = std.Io;
 const models = @import("models.zig");
 const library = @import("library.zig");
 const views = @import("views.zig");
+const backup = @import("backup.zig");
 
 pub const Settings = struct {
     update: Update = .{},
@@ -15,6 +16,9 @@ pub const Settings = struct {
     browse: Browse = .{},
     library: Library = .{},
     updates: Updates = .{},
+    /// Mihon preferences from a restored backup that libtachi has no
+    /// setting for, kept for the next backup.
+    mihon_preferences: []const backup.Preference = &.{},
 
     pub const Update = struct {
         /// Skip completed titles (`manga_ongoing`).

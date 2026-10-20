@@ -707,6 +707,11 @@ pub const ExportOptions = struct {
     history: bool = true,
     /// Also titles outside the library that have reading progress.
     read_entries: bool = true,
+    /// The engine adds these: app settings, extensions' settings, and
+    /// private values (tokens, passwords) in either.
+    app_settings: bool = true,
+    source_settings: bool = true,
+    private_settings: bool = false,
 };
 
 /// The library as a backup.
