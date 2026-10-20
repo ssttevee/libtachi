@@ -7,8 +7,9 @@
 //! Encoding follows kotlinx.serialization's ProtoBuf: integers are
 //! two's-complement varints (not ZigZag), floats are little-endian fixed32,
 //! repeated fields are unpacked, and fields equal to their default are left
-//! out. Unknown fields are skipped; app preferences, source preferences and
-//! extension stores are kept as encoded messages.
+//! out. Preference values are kotlinx's polymorphic form: a message with
+//! the value's class name and the value message, which is always written.
+//! Unknown fields are skipped; extension stores are kept as encoded messages.
 const std = @import("std");
 const library = @import("library.zig");
 const models = @import("models.zig");
@@ -19,12 +20,50 @@ pub const Backup = struct {
     manga: []const Manga = &.{},
     categories: []const Category = &.{},
     sources: []const Source = &.{},
-    /// Encoded `BackupPreference` messages (field 104), kept as they are.
-    preferences: []const []const u8 = &.{},
-    /// Encoded `BackupSourcePreferences` messages (field 105).
-    source_preferences: []const []const u8 = &.{},
+    /// App settings (field 104).
+    preferences: []const Preference = &.{},
+    /// Each configurable source's settings (field 105).
+    source_preferences: []const SourcePreferences = &.{},
     /// Encoded `BackupExtensionStore` messages (field 106).
     extension_stores: []const []const u8 = &.{},
+};
+
+/// One Android SharedPreferences entry.
+pub const Preference = struct {
+    key: []const u8,
+    value: Value,
+
+    pub const Value = union(enum) {
+        int: i32,
+        long: i64,
+        float: f32,
+        string: []const u8,
+        boolean: bool,
+        string_set: []const []const u8,
+
+        /// kotlinx's serial name for the value's class in Mihon.
+        fn className(self: Value) []const u8 {
+            return switch (self) {
+                inline else => |_, tag| comptime class_prefix ++ class_names.get(tag),
+            };
+        }
+    };
+
+    const class_prefix = "eu.kanade.tachiyomi.data.backup.models.";
+    const class_names: std.EnumArray(std.meta.Tag(Value), []const u8) = .init(.{
+        .int = "IntPreferenceValue",
+        .long = "LongPreferenceValue",
+        .float = "FloatPreferenceValue",
+        .string = "StringPreferenceValue",
+        .boolean = "BooleanPreferenceValue",
+        .string_set = "StringSetPreferenceValue",
+    });
+};
+
+/// A source's settings: `source_<id>` and its entries.
+pub const SourcePreferences = struct {
+    key: []const u8,
+    prefs: []const Preference = &.{},
 };
 
 pub const Manga = struct {
@@ -297,20 +336,78 @@ fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
     var manga: std.ArrayList(Manga) = .empty;
     var categories: std.ArrayList(Category) = .empty;
     var sources: std.ArrayList(Source) = .empty;
-    var preferences: std.ArrayList([]const u8) = .empty;
-    var source_preferences: std.ArrayList([]const u8) = .empty;
+    var preferences: std.ArrayList(Preference) = .empty;
+    var source_preferences: std.ArrayList(SourcePreferences) = .empty;
     var stores: std.ArrayList([]const u8) = .empty;
     while (try r.next()) |f| switch (f.number) {
         1 => try manga.append(arena, try decodeManga(arena, try f.bytes())),
         2 => try categories.append(arena, try decodeCategory(try f.bytes())),
         // 100 held the broken legacy source list; 101 replaced it.
         100, 101 => try sources.append(arena, try decodeSource(try f.bytes(), f.number == 100)),
-        104 => try preferences.append(arena, try f.bytes()),
-        105 => try source_preferences.append(arena, try f.bytes()),
+        104 => if (try decodePreference(arena, try f.bytes())) |p| try preferences.append(arena, p),
+        105 => try source_preferences.append(arena, try decodeSourcePreferences(arena, try f.bytes())),
         106 => try stores.append(arena, try f.bytes()),
         else => {},
     };
     return .{ .manga = manga.items, .categories = categories.items, .sources = sources.items, .preferences = preferences.items, .source_preferences = source_preferences.items, .extension_stores = stores.items };
+}
+
+/// A preference, or null for a value class this doesn't know.
+fn decodePreference(arena: std.mem.Allocator, bytes: []const u8) !?Preference {
+    var r: Reader = .{ .bytes = bytes };
+    var key: []const u8 = "";
+    var class: []const u8 = "";
+    var value_bytes: []const u8 = "";
+    while (try r.next()) |f| switch (f.number) {
+        1 => key = try f.bytes(),
+        2 => {
+            var poly: Reader = .{ .bytes = try f.bytes() };
+            while (try poly.next()) |pf| switch (pf.number) {
+                1 => class = try pf.bytes(),
+                2 => value_bytes = try pf.bytes(),
+                else => {},
+            };
+        },
+        else => {},
+    };
+    if (!std.mem.startsWith(u8, class, Preference.class_prefix)) return null;
+    const name = class[Preference.class_prefix.len..];
+    const tag = for (std.enums.values(std.meta.Tag(Preference.Value))) |t| {
+        if (std.mem.eql(u8, Preference.class_names.get(t), name)) break t;
+    } else return null;
+    var v: Reader = .{ .bytes = value_bytes };
+    var set: std.ArrayList([]const u8) = .empty;
+    var value: Preference.Value = switch (tag) {
+        .int => .{ .int = 0 },
+        .long => .{ .long = 0 },
+        .float => .{ .float = 0 },
+        .string => .{ .string = "" },
+        .boolean => .{ .boolean = false },
+        .string_set => .{ .string_set = &.{} },
+    };
+    while (try v.next()) |f| if (f.number == 1) switch (value) {
+        .int => value = .{ .int = try f.int32() },
+        .long => value = .{ .long = try f.int64() },
+        .float => value = .{ .float = try f.float() },
+        .string => value = .{ .string = try f.bytes() },
+        .boolean => value = .{ .boolean = try f.boolean() },
+        .string_set => try set.append(arena, try f.bytes()),
+    };
+    if (value == .string_set) value = .{ .string_set = set.items };
+    return .{ .key = key, .value = value };
+}
+
+fn decodeSourcePreferences(arena: std.mem.Allocator, bytes: []const u8) !SourcePreferences {
+    var r: Reader = .{ .bytes = bytes };
+    var result: SourcePreferences = .{ .key = "" };
+    var prefs: std.ArrayList(Preference) = .empty;
+    while (try r.next()) |f| switch (f.number) {
+        1 => result.key = try f.bytes(),
+        2 => if (try decodePreference(arena, try f.bytes())) |p| try prefs.append(arena, p),
+        else => {},
+    };
+    result.prefs = prefs.items;
+    return result;
 }
 
 fn decodeManga(arena: std.mem.Allocator, bytes: []const u8) !Manga {
@@ -472,8 +569,8 @@ pub fn encode(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
     for (backup.manga) |m| try w.message(1, m, encodeManga);
     for (backup.categories) |c| try w.message(2, c, encodeCategory);
     for (backup.sources) |s| try w.message(101, s, encodeSource);
-    for (backup.preferences) |p| try w.bytes(104, p);
-    for (backup.source_preferences) |p| try w.bytes(105, p);
+    for (backup.preferences) |p| try w.message(104, p, encodePreference);
+    for (backup.source_preferences) |p| try w.message(105, p, encodeSourcePreferences);
     for (backup.extension_stores) |p| try w.bytes(106, p);
     return w.out.items;
 }
@@ -488,6 +585,33 @@ pub fn encodeFile(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
     try compress.writer.writeAll(raw);
     try compress.finish();
     return out.toOwnedSlice();
+}
+
+fn encodePreference(w: *Writer, p: Preference) !void {
+    try w.bytes(1, p.key);
+    try w.message(2, p.value, encodePolymorphic);
+}
+
+fn encodePolymorphic(w: *Writer, value: Preference.Value) !void {
+    try w.bytes(1, value.className());
+    try w.message(2, value, encodeValue);
+}
+
+/// The value has no default, so it is always written.
+fn encodeValue(w: *Writer, value: Preference.Value) !void {
+    switch (value) {
+        .int => |v| try w.int32(1, v),
+        .long => |v| try w.int64(1, v),
+        .float => |v| try w.float(1, v),
+        .string => |v| try w.bytes(1, v),
+        .boolean => |v| try w.boolean(1, v),
+        .string_set => |set| for (set) |v| try w.bytes(1, v),
+    }
+}
+
+fn encodeSourcePreferences(w: *Writer, p: SourcePreferences) !void {
+    try w.bytes(1, p.key);
+    for (p.prefs) |pref| try w.message(2, pref, encodePreference);
 }
 
 fn encodeManga(w: *Writer, m: Manga) !void {
@@ -988,7 +1112,7 @@ test "a backup survives encode and decode, gzipped" {
         }},
         .categories = &.{.{ .name = "Reading", .order = 2, .id = 5 }},
         .sources = &.{.{ .name = "MangaDex", .source_id = 2499283573021220255 }},
-        .preferences = &.{"\x0a\x03key"},
+        .preferences = &.{.{ .key = "skip_read", .value = .{ .boolean = true } }},
     };
     const file = try encodeFile(a, original);
     try std.testing.expect(file[0] == 0x1f and file[1] == 0x8b);
@@ -1004,7 +1128,8 @@ test "a backup survives encode and decode, gzipped" {
     try std.testing.expectEqual(2, back.manga[0].viewer_flags.?);
     try std.testing.expectEqualStrings("Reading", back.categories[0].name);
     try std.testing.expectEqualStrings("MangaDex", back.sources[0].name);
-    try std.testing.expectEqualStrings("\x0a\x03key", back.preferences[0]);
+    try std.testing.expectEqualStrings("skip_read", back.preferences[0].key);
+    try std.testing.expect(back.preferences[0].value.boolean);
     // Raw protobuf decodes too; JSON is refused.
     _ = try decode(a, try encode(a, original));
     try std.testing.expectError(error.JsonBackupUnsupported, decode(a, "{\"a\":1}"));
@@ -1111,5 +1236,16 @@ test "Mihon's own encoding decodes and re-encodes byte for byte" {
     try std.testing.expect(backup.manga[1].viewer_flags == null);
     try std.testing.expectEqual(64, backup.categories[0].flags);
     try std.testing.expectEqualStrings("MangaDex", backup.sources[0].name);
+    const prefs = backup.preferences;
+    try std.testing.expectEqual(9, prefs.len);
+    try std.testing.expectEqual(-1, prefs[0].value.int);
+    try std.testing.expectEqual(256, prefs[2].value.long);
+    try std.testing.expectEqual(1.5, prefs[3].value.float);
+    try std.testing.expectEqualStrings("UNREAD_COUNT,DESCENDING", prefs[4].value.string);
+    try std.testing.expect(!prefs[5].value.boolean);
+    try std.testing.expectEqualStrings("manga_started", prefs[7].value.string_set[1]);
+    try std.testing.expectEqual(0, prefs[8].value.string_set.len);
+    try std.testing.expectEqualStrings("source_2499283573021220255", backup.source_preferences[0].key);
+    try std.testing.expect(backup.source_preferences[0].prefs[0].value.boolean);
     try std.testing.expectEqualSlices(u8, golden, try encode(a, backup));
 }

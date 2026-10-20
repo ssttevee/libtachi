@@ -8,6 +8,7 @@
 package dev.tachi.host.mihon
 
 import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToByteArray
 import kotlinx.serialization.decodeFromByteArray
@@ -25,7 +26,50 @@ data class Backup(
     @ProtoNumber(1) val backupManga: List<BackupManga>,
     @ProtoNumber(2) var backupCategories: List<BackupCategory> = emptyList(),
     @ProtoNumber(101) var backupSources: List<BackupSource> = emptyList(),
+    @ProtoNumber(104) var backupPreferences: List<BackupPreference> = emptyList(),
+    @ProtoNumber(105) var backupSourcePreferences: List<BackupSourcePreferences> = emptyList(),
 )
+
+// Mihon's classes carry no @SerialName, so kotlinx names them by their
+// package there; the names here say so explicitly.
+@Serializable
+data class BackupPreference(
+    @ProtoNumber(1) val key: String,
+    @ProtoNumber(2) val value: PreferenceValue,
+)
+
+@Serializable
+data class BackupSourcePreferences(
+    @ProtoNumber(1) val sourceKey: String,
+    @ProtoNumber(2) val prefs: List<BackupPreference>,
+)
+
+@Serializable
+sealed class PreferenceValue
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.IntPreferenceValue")
+data class IntPreferenceValue(val value: Int) : PreferenceValue()
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.LongPreferenceValue")
+data class LongPreferenceValue(val value: Long) : PreferenceValue()
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.FloatPreferenceValue")
+data class FloatPreferenceValue(val value: Float) : PreferenceValue()
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.StringPreferenceValue")
+data class StringPreferenceValue(val value: String) : PreferenceValue()
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.BooleanPreferenceValue")
+data class BooleanPreferenceValue(val value: Boolean) : PreferenceValue()
+
+@Serializable
+@SerialName("eu.kanade.tachiyomi.data.backup.models.StringSetPreferenceValue")
+data class StringSetPreferenceValue(val value: Set<String>) : PreferenceValue()
 
 @Serializable
 class BackupManga(
@@ -148,6 +192,20 @@ fun sample() = Backup(
     ),
     backupCategories = listOf(BackupCategory("Reading", order = 2, id = 5, flags = 64), BackupCategory("Later", id = 6)),
     backupSources = listOf(BackupSource("MangaDex", 2499283573021220255L)),
+    backupPreferences = listOf(
+        BackupPreference("remove_after_read_slots", IntPreferenceValue(-1)),
+        BackupPreference("download_parallel_page_limit", IntPreferenceValue(0)),
+        BackupPreference("default_chapter_sort_by_source_or_number", LongPreferenceValue(256)),
+        BackupPreference("float_pref", FloatPreferenceValue(1.5f)),
+        BackupPreference("library_sorting_mode", StringPreferenceValue("UNREAD_COUNT,DESCENDING")),
+        BackupPreference("skip_read", BooleanPreferenceValue(false)),
+        BackupPreference("download_new", BooleanPreferenceValue(true)),
+        BackupPreference("library_update_manga_restriction", StringSetPreferenceValue(setOf("manga_ongoing", "manga_started"))),
+        BackupPreference("hidden_catalogues", StringSetPreferenceValue(emptySet())),
+    ),
+    backupSourcePreferences = listOf(
+        BackupSourcePreferences("source_2499283573021220255", listOf(BackupPreference("dataSaver", BooleanPreferenceValue(true)))),
+    ),
 )
 
 object MihonBackupGolden {
@@ -157,6 +215,7 @@ object MihonBackupGolden {
         // The bytes must also read back as the same backup.
         val back = ProtoBuf.decodeFromByteArray<Backup>(bytes)
         check(back.backupManga[0].title == "Solo Leveling ☆")
+        check(back.backupPreferences[0].value == IntPreferenceValue(-1))
         if (System.getProperty("tachi.writeGolden") == "true") {
             golden.parentFile.mkdirs()
             golden.writeBytes(bytes)
