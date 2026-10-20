@@ -24,7 +24,7 @@ var state: ?State = null;
 
 const Connection = struct {
     stream: Io.net.Stream,
-    reader: Io.net.Stream.Reader,
+    reader: SocketReader,
     writer: Io.net.Stream.Writer,
     tls: ?tls.Client = null,
     socket_read: [tls.Client.min_buffer_len]u8 = undefined,
@@ -37,6 +37,57 @@ const Connection = struct {
     }
     fn output(c: *Connection) *Io.Writer {
         return if (c.tls) |*t| &t.writer else &c.writer.interface;
+    }
+};
+
+/// A socket reader whose raw reads share the current Java read's deadline.
+/// Applying the deadline here also bounds reads of fragmented TLS records.
+const SocketReader = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    interface: Io.Reader,
+    timeout: Io.Timeout = .none,
+    err: ?Error = null,
+
+    const Error = Io.OperateTimeoutError || Io.Operation.NetRead.Error;
+
+    fn init(stream: Io.net.Stream, io: Io, buffer: []u8) SocketReader {
+        return .{ .io = io, .stream = stream, .interface = .{
+            .vtable = &.{ .stream = streamImpl, .readVec = readVec },
+            .buffer = buffer,
+            .seek = 0,
+            .end = 0,
+        } };
+    }
+
+    fn streamImpl(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        var data = [_][]u8{limit.slice(try w.writableSliceGreedy(1))};
+        const n = try readVec(r, &data);
+        w.advance(n);
+        return n;
+    }
+
+    fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
+        var vectors: [8][]u8 = undefined;
+        const count, const data_size = try r.writableVector(&vectors, data);
+        const result = self.io.operateTimeout(.{ .net_read = .{
+            .socket_handle = self.stream.socket.handle,
+            .data = vectors[0..count],
+        } }, self.timeout) catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+        const read_result = result.net_read catch |err| {
+            self.err = err;
+            return error.ReadFailed;
+        };
+        if (read_result.data_len == 0) return error.EndOfStream;
+        if (read_result.data_len > data_size) {
+            r.end += read_result.data_len - data_size;
+            return data_size;
+        }
+        return read_result.data_len;
     }
 };
 
@@ -99,13 +150,14 @@ fn connect(env: *jni.JNIEnv, _: jni.jclass, address: jni.jbyteArray, port: jni.j
         throw(env, "java/lang/OutOfMemoryError", "native socket", .{});
         return 0;
     };
-    // Io.net cannot time out a connect yet; the OS default bounds it.
+    // This Zig 0.17 Threaded backend panics for a non-none connect timeout.
+    // Use the OS connect timeout until that backend supports timed connects.
     c.* = .{ .stream = ip.connect(s.io, .{ .mode = .stream }) catch |err| {
         s.gpa.destroy(c);
         throw(env, "java/net/ConnectException", "{s}:{d}: {s}", .{ text, port, @errorName(err) });
         return 0;
     }, .reader = undefined, .writer = undefined };
-    c.reader = c.stream.reader(s.io, &c.socket_read);
+    c.reader = SocketReader.init(c.stream, s.io, &c.socket_read);
     c.writer = c.stream.writer(s.io, &c.socket_write);
     return @intCast(@intFromPtr(c));
 }
@@ -176,23 +228,19 @@ fn handshakeConnection(s: *State, c: *Connection, name: []const u8) !void {
 fn read(env: *jni.JNIEnv, _: jni.jclass, h: jni.jlong, out: jni.jbyteArray, offset: jni.jint, length: jni.jint, timeout_ms: jni.jint) callconv(.c) jni.jint {
     const c = handle(h);
     const r = c.input();
+    c.reader.err = null;
+    c.reader.timeout = if (timeout_ms > 0)
+        (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } }).toDeadline(c.reader.io)
+    else
+        .none;
+    defer c.reader.timeout = .none;
     // A TLS record can carry no application data (a session ticket, say),
     // so one fill may add nothing; Java streams must not report 0 bytes.
     while (r.bufferedLen() == 0) {
-        // A TLS record may already sit in the ciphertext buffer; then the
-        // socket can be idle while there is still something to decrypt.
-        const ciphertext = c.tls != null and c.reader.interface.bufferedLen() > 0;
-        if (!ciphertext and timeout_ms > 0) {
-            var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&fds, timeout_ms) catch |err| {
-                throw(env, "java/net/SocketException", "poll: {s}", .{@errorName(err)});
-                return 0;
-            };
-            if (ready == 0) return -2;
-        }
         r.fillMore() catch |err| switch (err) {
             error.EndOfStream => return -1,
             error.ReadFailed => {
+                if (c.reader.err) |cause| if (cause == error.Timeout) return -2;
                 if (c.tls) |t| if (t.read_err) |e| {
                     throw(env, "javax/net/ssl/SSLException", "{s}", .{@errorName(e)});
                     return 0;
@@ -255,4 +303,29 @@ test "handshake worker returns CA errors across the thread join" {
     thread.join();
     try testing.expectError(error.FileNotFound, outcome);
     try testing.expect(!s.ca_loaded);
+}
+
+test "socket reader deadlines preserve buffered fragments and allow retry" {
+    const testing = std.testing;
+    const io = testing.io;
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const server = try listener.accept(io);
+    defer server.close(io);
+    var buffer: [64]u8 = undefined;
+    var reader = SocketReader.init(client, io, &buffer);
+    var writer = server.writer(io, &.{});
+    try writer.interface.writeAll("ab");
+    reader.timeout = .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
+    try testing.expectError(error.ReadFailed, reader.interface.peek(5));
+    try testing.expectEqual(error.Timeout, reader.err.?);
+    try testing.expectEqualStrings("ab", reader.interface.buffered());
+    try writer.interface.writeAll("cde");
+    reader.timeout = .none;
+    try testing.expectEqualStrings("abcde", try reader.interface.take(5));
+    try server.shutdown(io, .send);
+    try testing.expectError(error.EndOfStream, reader.interface.takeByte());
 }
