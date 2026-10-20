@@ -5,9 +5,33 @@ const tachi = @import("tachi");
 
 const c_allocator = std.heap.c_allocator;
 
-/// C callers have no `std.Io` to hand us, so the library owns a
-/// single-threaded instance; discovery only does `access` and `readdir`.
-var threaded: std.Io.Threaded = .init_single_threaded;
+/// C callers cannot supply an Io. Share one initialized backend while any C
+/// runtime is alive, including during failed initialization. A single owner
+/// also keeps Threaded's process-wide signal-handler setup/restoration paired.
+const Backend = struct {
+    var bootstrap: std.Io.Threaded = .init_single_threaded;
+    var lock: std.Io.Mutex = .init;
+    var threaded: std.Io.Threaded = undefined;
+    var users: usize = 0;
+
+    fn acquire() std.Io {
+        const io = bootstrap.io();
+        lock.lockUncancelable(io);
+        defer lock.unlock(io);
+        if (users == 0) threaded = .init(c_allocator, .{ .environ = processEnviron() });
+        users += 1;
+        return threaded.io();
+    }
+
+    fn release() void {
+        const io = bootstrap.io();
+        lock.lockUncancelable(io);
+        defer lock.unlock(io);
+        std.debug.assert(users > 0);
+        users -= 1;
+        if (users == 0) threaded.deinit();
+    }
+};
 
 /// The libc environment block, viewed through `std.process.Environ`.
 fn processEnviron() std.process.Environ {
@@ -115,7 +139,8 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
     const jvm_opts = collect(c_allocator, c.jvm_options) catch return fail(.out_of_memory, "OutOfMemory");
     defer c_allocator.free(jvm_opts);
 
-    const rt = tachi.Runtime.init(c_allocator, threaded.io(), .{
+    const io = Backend.acquire();
+    const rt = tachi.Runtime.init(c_allocator, io, .{
         .data_dir = data_dir,
         .cache_dir = optSlice(c.cache_dir),
         .host_jar = optSlice(c.host_jar),
@@ -134,13 +159,22 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
         .jvm_options = jvm_opts,
         .existing_vm = @ptrCast(@alignCast(c.existing_jvm)),
         .environ = processEnviron(),
-    }) catch |e| return mapError(e);
-    if (out) |o| o.* = rt else rt.deinit();
+    }) catch |e| {
+        Backend.release();
+        return mapError(e);
+    };
+    if (out) |o| o.* = rt else {
+        rt.deinit();
+        Backend.release();
+    }
     return ErrorCode.ok.int();
 }
 
 pub export fn tachi_runtime_free(rt: ?*tachi.Runtime) void {
-    if (rt) |r| r.deinit();
+    if (rt) |r| {
+        r.deinit();
+        Backend.release();
+    }
 }
 
 pub export fn tachi_thread_detach(rt: ?*tachi.Runtime) void {
@@ -284,4 +318,35 @@ test "error mapping preserves runtime diagnostics only for detailed errors" {
         try std.testing.expectEqual(case[1].int(), mapError(case[0]));
         try std.testing.expectEqualStrings(if (case[2]) "runtime detail" else @errorName(case[0]), tachi.lastError());
     }
+}
+
+test "C backend supports concurrency and cancellation until the last owner releases it" {
+    const Work = struct {
+        fn wait(io: std.Io) std.Io.Cancelable!void {
+            try std.Io.sleep(io, .fromSeconds(3600), .awake);
+        }
+        fn answer() u32 {
+            return 42;
+        }
+    };
+    for (0..2) |_| {
+        const io = Backend.acquire();
+        _ = Backend.acquire();
+        Backend.release();
+        {
+            defer Backend.release();
+            var future = try std.Io.concurrent(io, Work.answer, .{});
+            try std.testing.expectEqual(42, future.await(io));
+            var waiting = try std.Io.concurrent(io, Work.wait, .{io});
+            try std.testing.expectError(error.Canceled, waiting.cancel(io));
+        }
+        try std.testing.expectEqual(0, Backend.users);
+    }
+}
+
+test "failed C runtime initialization releases its I/O backend" {
+    const config: tachi_config = .{ .data_dir = "/dev/null/not-a-directory" };
+    try std.testing.expectEqual(ErrorCode.file_system_error.int(), tachi_runtime_new(&config, null));
+    try std.testing.expectEqual(0, Backend.users);
+    tachi_runtime_free(null);
 }
