@@ -52,10 +52,13 @@ pub const Http = struct {
     pub fn send(self: *Http, arena: std.mem.Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: Body) !Response {
         var all: std.ArrayList(std.http.Header) = .empty;
         try all.appendSlice(arena, headers);
+        const explicit_content_type = for (headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Content-Type")) break true;
+        } else false;
         switch (body) {
             .none => {},
-            .json => try all.append(arena, .{ .name = "Content-Type", .value = "application/json" }),
-            .form => try all.append(arena, .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }),
+            .json => if (!explicit_content_type) try all.append(arena, .{ .name = "Content-Type", .value = "application/json" }),
+            .form => if (!explicit_content_type) try all.append(arena, .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }),
         }
         var out: Io.Writer.Allocating = .init(arena);
         const result = try (try self.get()).fetch(.{

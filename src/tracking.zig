@@ -240,9 +240,11 @@ pub const Reply = struct {
     matches: []const Search = &.{},
     credential: ?Credential = null,
     login_url: ?[]const u8 = null,
-    /// Pass this verifier to login after completing the authorization URL.
+    /// Keep this with the OAuth request and pass it to login on callback.
     verifier: ?[]const u8 = null,
-    /// The remote preference read during MangaBaka login.
+    /// Score formats read from the account at login.
+    anilist_score_type: ?AnilistScore = null,
+    kitsu_score_type: ?KitsuScore = null,
     mangabaka_score_type: ?MangaBakaScore = null,
 };
 

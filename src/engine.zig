@@ -1788,6 +1788,11 @@ pub const Engine = struct {
             state.formats.mangabaka_score_type = format;
             try state.save(self.gpa, self.io, self.options.dir);
         }
+        if (reply.anilist_score_type != null or reply.kitsu_score_type != null) {
+            if (reply.anilist_score_type) |format| state.formats.anilist_score_type = format;
+            if (reply.kitsu_score_type) |format| state.formats.kitsu_score_type = format;
+            try state.save(self.gpa, self.io, self.options.dir);
+        }
         if (reply.credential) |c| {
             if (c.tracker_id != id) return error.InvalidTrackerResponse;
             try state.putCredential(job.arena.allocator(), c);
@@ -3259,7 +3264,7 @@ test "tracking jobs bind prefixes, preserve automatic semantics, retry and gate 
         fn call(ctx: ?*anyopaque, _: std.mem.Allocator, _: Io, id: i32, _: tracking.Credential, _: tracking.Formats, op: tracking.Operation) anyerror!tracking.Reply {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             switch (op) {
-                .login => return .{ .credential = .{ .tracker_id = id, .username = "u", .password = "token" } },
+                .login => return .{ .credential = .{ .tracker_id = id, .username = "u", .password = "token" }, .anilist_score_type = .POINT_10_DECIMAL },
                 .bind, .refresh => return .{ .track = self.remote },
                 .update => |u| {
                     if (self.fail) return error.Offline;
@@ -3299,6 +3304,8 @@ test "tracking jobs bind prefixes, preserve automatic semantics, retry and gate 
         .{ .id = "c10", .title = "10", .number = 10 },
     } }} });
     (try Fake.run(&engine, .{ .tracker = .{ .id = 2, .operation = .{ .login = .{ .username = "u", .password = "t" } } } })).deinit();
+    const account = try tracking.State.load(a, io, dir);
+    try std.testing.expectEqual(tracking.AnilistScore.POINT_10_DECIMAL, account.formats.anilist_score_type);
     (try Fake.run(&engine, .{ .track_bind = .{ .manga_id = "m", .track = .{ .tracker_id = 2, .remote_id = 42 } } })).deinit();
     var bound = (try engine.loadLibrary(a)).manga[0].tracks[0];
     try std.testing.expectEqual(@as(f64, 1), bound.last_chapter_read);
@@ -3337,7 +3344,7 @@ test "tracking jobs bind prefixes, preserve automatic semantics, retry and gate 
     try std.testing.expectEqual(@as(i32, 1), bound.status);
     (try Fake.run(&engine, .{ .track_refresh = .{} })).deinit();
     try std.testing.expectEqual(@as(i32, 2), (try engine.loadLibrary(a)).manga[0].tracks[0].status);
-    (try Fake.run(&engine, .{ .track_set = .{ .manga_id = "m", .tracker_id = 2, .value = .{ .score_index = 8 } } })).deinit();
+    (try Fake.run(&engine, .{ .track_set = .{ .manga_id = "m", .tracker_id = 2, .value = .{ .score_index = 80 } } })).deinit();
     try std.testing.expectEqual(@as(f64, 8), (try engine.stats(a)).mean_score);
     try engine.trackerLogout(2);
     try std.testing.expectEqual(@as(usize, 0), (try engine.stats(a)).tracked);

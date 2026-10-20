@@ -9,9 +9,12 @@ pub const Fixture = struct {
     requests: usize = 0,
     /// Each request as received, head and body.
     captured: std.ArrayList([]const u8) = .empty,
-    /// Optional substrings required in each request, including its body.
+    /// Optional substrings required in each request, including its body;
+    /// a miss is reported at `finish`.
     expected: []const []const []const u8 = &.{},
     requests_match: bool = true,
+    /// The same, failing at once.
+    expected_requests: []const []const []const u8 = &.{},
 
     pub fn init(responses: []const []const u8) !Fixture {
         const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -54,12 +57,22 @@ pub const Fixture = struct {
             while (true) {
                 const line = try reader.interface.takeDelimiterInclusive('\n');
                 try request.appendSlice(std.testing.allocator, line);
-                if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \r\n"), 10);
+                if (std.ascii.startsWithIgnoreCase(line, "content-length:")) content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \r\n"), 10);
                 if (std.mem.eql(u8, line, "\r\n")) break;
             }
-            try request.appendSlice(std.testing.allocator, try reader.interface.take(content_length));
+            var remaining = content_length;
+            while (remaining > 0) {
+                const chunk = try reader.interface.take(@min(remaining, read_buffer.len));
+                try request.appendSlice(std.testing.allocator, chunk);
+                remaining -= chunk.len;
+            }
             const received = try request.toOwnedSlice(std.testing.allocator);
             try self.captured.append(std.testing.allocator, received);
+            if (self.expected_requests.len > 0) {
+                for (self.expected_requests[self.requests]) |expected| {
+                    try std.testing.expect(std.mem.indexOf(u8, received, expected) != null);
+                }
+            }
             if (self.expected.len > 0) {
                 for (self.expected[self.requests]) |needle| {
                     if (std.mem.indexOf(u8, received, needle) == null) {
