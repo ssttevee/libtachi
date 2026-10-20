@@ -124,25 +124,36 @@ pub fn pagePath(gpa: std.mem.Allocator, io: Io, dir: []const u8, relative: []con
 /// Writes an uncompressed ZIP, supported by Mihon and ordinary ZIP readers.
 /// Zig provides a ZIP reader but no ZIP writer.
 pub fn zip(a: std.mem.Allocator, entries: []const Entry) ![]u8 {
+    return zipInner(a, entries) catch |err| switch (err) {
+        // An allocating writer has no I/O failure beyond allocation failure.
+        error.WriteFailed => error.OutOfMemory,
+        else => return err,
+    };
+}
+
+fn zipInner(a: std.mem.Allocator, entries: []const Entry) ![]u8 {
+    const count = std.math.cast(u16, entries.len) orelse return error.ArchiveTooLarge;
     var out: Io.Writer.Allocating = .init(a);
+    defer out.deinit();
     const w = &out.writer;
     const offsets = try a.alloc(u32, entries.len);
+    defer a.free(offsets);
     for (entries, 0..) |e, i| {
         if (!library.safePath(e.name)) return error.UnsafePagePath;
-        offsets[i] = @intCast(w.end);
+        offsets[i] = std.math.cast(u32, w.end) orelse return error.ArchiveTooLarge;
         try w.writeInt(u32, 0x04034b50, .little);
         try w.writeInt(u16, 20, .little);
         try w.writeInt(u16, 0x800, .little);
         try w.splatByteAll(0, 6);
         try w.writeInt(u32, std.hash.Crc32.hash(e.data), .little);
-        try w.writeInt(u32, @intCast(e.data.len), .little);
-        try w.writeInt(u32, @intCast(e.data.len), .little);
-        try w.writeInt(u16, @intCast(e.name.len), .little);
+        try w.writeInt(u32, std.math.cast(u32, e.data.len) orelse return error.ArchiveTooLarge, .little);
+        try w.writeInt(u32, std.math.cast(u32, e.data.len) orelse return error.ArchiveTooLarge, .little);
+        try w.writeInt(u16, std.math.cast(u16, e.name.len) orelse return error.ArchiveTooLarge, .little);
         try w.writeInt(u16, 0, .little);
         try w.writeAll(e.name);
         try w.writeAll(e.data);
     }
-    const start: u32 = @intCast(w.end);
+    const start = std.math.cast(u32, w.end) orelse return error.ArchiveTooLarge;
     for (entries, offsets) |e, offset| {
         try w.writeInt(u32, 0x02014b50, .little);
         try w.writeInt(u16, 20, .little);
@@ -150,18 +161,18 @@ pub fn zip(a: std.mem.Allocator, entries: []const Entry) ![]u8 {
         try w.writeInt(u16, 0x800, .little);
         try w.splatByteAll(0, 6);
         try w.writeInt(u32, std.hash.Crc32.hash(e.data), .little);
-        try w.writeInt(u32, @intCast(e.data.len), .little);
-        try w.writeInt(u32, @intCast(e.data.len), .little);
-        try w.writeInt(u16, @intCast(e.name.len), .little);
+        try w.writeInt(u32, std.math.cast(u32, e.data.len) orelse return error.ArchiveTooLarge, .little);
+        try w.writeInt(u32, std.math.cast(u32, e.data.len) orelse return error.ArchiveTooLarge, .little);
+        try w.writeInt(u16, std.math.cast(u16, e.name.len) orelse return error.ArchiveTooLarge, .little);
         try w.splatByteAll(0, 12);
         try w.writeInt(u32, offset, .little);
         try w.writeAll(e.name);
     }
-    const size: u32 = @as(u32, @intCast(w.end)) - start;
+    const size = (std.math.cast(u32, w.end) orelse return error.ArchiveTooLarge) - start;
     try w.writeInt(u32, 0x06054b50, .little);
     try w.splatByteAll(0, 4);
-    try w.writeInt(u16, @intCast(entries.len), .little);
-    try w.writeInt(u16, @intCast(entries.len), .little);
+    try w.writeInt(u16, count, .little);
+    try w.writeInt(u16, count, .little);
     try w.writeInt(u32, size, .little);
     try w.writeInt(u32, start, .little);
     try w.writeInt(u16, 0, .little);
@@ -189,4 +200,33 @@ test "deflated ZIP pages and cache invalidation" {
     const second = try pagePath(a, io, dir, "chapter.cbz#001.png");
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expectEqualStrings("deflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated page", try Io.Dir.cwd().readFileAlloc(io, second, a, .limited(1024)));
+}
+
+test "ZIP writer releases temporary allocations on success and failure" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const bytes = try zip(gpa, &.{.{ .name = "page.png", .data = "image" }});
+            defer gpa.free(bytes);
+            try std.testing.expectEqualSlices(u8, "PK\x03\x04", bytes[0..4]);
+            _ = zip(gpa, &.{.{ .name = "../page.png", .data = "image" }}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.UnsafePagePath => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "ZIP writer rejects names and counts beyond ZIP32 limits" {
+    const gpa = std.testing.allocator;
+    const name = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(name);
+    @memset(name, 'a');
+    try std.testing.expectError(error.ArchiveTooLarge, zip(gpa, &.{.{ .name = name, .data = "" }}));
+    const entries = try gpa.alloc(Entry, 1 << 16);
+    defer gpa.free(entries);
+    @memset(entries, .{ .name = "page.png", .data = "" });
+    try std.testing.expectError(error.ArchiveTooLarge, zip(gpa, entries));
 }
