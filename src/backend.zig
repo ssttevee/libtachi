@@ -51,15 +51,9 @@ pub const Call = union(enum) {
     /// The source a call runs on, if any.
     pub fn source(self: Call) ?i64 {
         return switch (self) {
-            .browse => |c| c.source,
-            .update => |c| c.source,
-            .pages => |c| c.source,
-            .image_requests => |c| c.source,
-            .image => |c| c.source,
+            inline .browse, .update, .pages, .image_requests, .image, .related, .set_preference => |c| c.source,
             .filters, .preferences => |id| id,
-            .related => |c| c.source,
-            .set_preference => |c| c.source,
-            else => null,
+            .sources, .extensions, .install, .install_file, .uninstall, .update_extensions, .reload_preferences => null,
         };
     }
 };
