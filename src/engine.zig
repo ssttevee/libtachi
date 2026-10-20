@@ -166,8 +166,9 @@ pub const Engine = struct {
     paused: std.atomic.Value(bool) = .init(false),
     /// Mihon's download queue; see `queue.Queue`.
     queue: queue_mod.Queue = .{},
-    /// The chapter `pageShown` last checked for downloading ahead (a hash).
-    ahead_checked: std.atomic.Value(u64) = .init(0),
+    /// The chapter `pageShown` last checked for downloading ahead (a hash;
+    /// 32 bits, as 32-bit ARM has no 64-bit atomics).
+    ahead_checked: std.atomic.Value(u32) = .init(0),
     pending_lock: Io.Mutex = .init,
     /// Runs jobs instead of the engine, for tests without a JVM.
     execute_fn: ?*const fn (*Engine, *Job) anyerror!void = null,
@@ -525,7 +526,7 @@ pub const Engine = struct {
         if (s.reader.incognito) return;
         const last = shown.pages > 0 and shown.page + 1 >= shown.pages;
         const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
-        const hash = std.hash.Wyhash.hash(0, shown.chapter_id);
+        const hash: u32 = @truncate(std.hash.Wyhash.hash(0, shown.chapter_id));
         const ahead = s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash;
         if (!newly_read and !ahead) return;
         const lib = try self.store.load(a);
@@ -588,7 +589,7 @@ pub const Engine = struct {
         }
     }
 
-    fn downloadAhead(self: *Engine, a: std.mem.Allocator, s: settings.Settings, found: Found, hash: u64) !void {
+    fn downloadAhead(self: *Engine, a: std.mem.Allocator, s: settings.Settings, found: Found, hash: u32) !void {
         const manga = found.manga;
         if (manga.local() or !found.chapter.downloaded()) return self.ahead_checked.store(hash, .release);
         const list = (try views.readerChapters(a, manga, found.chapter.id, s.reader, s.library.downloaded_only)).?;
