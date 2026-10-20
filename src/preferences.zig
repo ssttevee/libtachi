@@ -24,31 +24,40 @@ pub fn isPrivate(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "__PRIVATE_");
 }
 
-const tri_names = [_][]const u8{ "DISABLED", "ENABLED_IS", "ENABLED_NOT" };
+const tri_names: std.EnumArray(views.TriState, []const u8) = .init(.{
+    .disabled = "DISABLED",
+    .include = "ENABLED_IS",
+    .exclude = "ENABLED_NOT",
+});
 
 fn triName(state: views.TriState) []const u8 {
-    return tri_names[@backingInt(state)];
+    return tri_names.get(state);
 }
 
 fn triState(name: []const u8) views.TriState {
-    for (tri_names, 0..) |n, i| if (std.mem.eql(u8, n, name)) return @fromBackingInt(@intCast(i));
+    for (std.enums.values(views.TriState)) |state| {
+        if (std.mem.eql(u8, tri_names.get(state), name)) return state;
+    }
     return .disabled;
 }
 
-const sort_names = [_]struct { []const u8, views.SortMode }{
-    .{ "ALPHABETICAL", .alphabetical },             .{ "LAST_READ", .last_read },
-    .{ "LAST_MANGA_UPDATE", .last_update },         .{ "UNREAD_COUNT", .unread_count },
-    .{ "TOTAL_CHAPTERS", .total_chapters },         .{ "LATEST_CHAPTER", .latest_chapter },
-    .{ "CHAPTER_FETCH_DATE", .chapter_fetch_date }, .{ "DATE_ADDED", .date_added },
-    .{ "TRACKER_MEAN", .tracker_mean },             .{ "RANDOM", .random },
-};
+const sort_names: std.EnumArray(views.SortMode, []const u8) = .init(.{
+    .alphabetical = "ALPHABETICAL",
+    .last_read = "LAST_READ",
+    .last_update = "LAST_MANGA_UPDATE",
+    .unread_count = "UNREAD_COUNT",
+    .total_chapters = "TOTAL_CHAPTERS",
+    .latest_chapter = "LATEST_CHAPTER",
+    .chapter_fetch_date = "CHAPTER_FETCH_DATE",
+    .date_added = "DATE_ADDED",
+    .tracker_mean = "TRACKER_MEAN",
+    .random = "RANDOM",
+});
 
 /// Mihon's `LibrarySort` string, e.g. "ALPHABETICAL,ASCENDING".
 fn sortString(a: std.mem.Allocator, flags: u32) ![]const u8 {
     const sort: views.LibrarySort = .decode(flags);
-    const name = for (sort_names) |entry| {
-        if (entry[1] == sort.mode) break entry[0];
-    } else "ALPHABETICAL";
+    const name = sort_names.get(sort.mode);
     return std.fmt.allocPrint(a, "{s},{s}", .{ name, if (sort.ascending) "ASCENDING" else "DESCENDING" });
 }
 
@@ -56,8 +65,8 @@ fn sortFlags(text: []const u8) u32 {
     var parts = std.mem.splitScalar(u8, text, ',');
     const type_name = parts.next() orelse "";
     const direction = parts.next() orelse "";
-    const mode = for (sort_names) |entry| {
-        if (std.mem.eql(u8, entry[0], type_name)) break entry[1];
+    const mode = for (std.enums.values(views.SortMode)) |mode| {
+        if (std.mem.eql(u8, sort_names.get(mode), type_name)) break mode;
     } else .alphabetical;
     return (views.LibrarySort{ .mode = mode, .ascending = std.mem.eql(u8, direction, "ASCENDING") }).encode(0);
 }
@@ -94,13 +103,7 @@ const migration_bits = struct {
     const notes: i32 = 0b100000;
 };
 
-fn idSet(a: std.mem.Allocator, ids: []const u32) ![]const []const u8 {
-    const out = try a.alloc([]const u8, ids.len);
-    for (ids, out) |id, *s| s.* = try std.fmt.allocPrint(a, "{d}", .{id});
-    return out;
-}
-
-fn idSetI64(a: std.mem.Allocator, ids: []const i64) ![]const []const u8 {
+fn idSet(a: std.mem.Allocator, ids: anytype) ![]const []const u8 {
     const out = try a.alloc([]const u8, ids.len);
     for (ids, out) |id, *s| s.* = try std.fmt.allocPrint(a, "{d}", .{id});
     return out;
@@ -176,8 +179,8 @@ pub fn fromSettings(a: std.mem.Allocator, s: Settings) ![]const Preference {
     var warnings: std.ArrayList([]const u8) = .empty;
     for (b.content_warnings) |w| try warnings.append(a, try std.ascii.allocUpperString(a, w));
     try P.add(&out, a, "enabled_content_warnings", .{ .string_set = warnings.items });
-    try P.add(&out, a, "hidden_catalogues", .{ .string_set = try idSetI64(a, b.hidden_sources) });
-    try P.add(&out, a, "pinned_catalogues", .{ .string_set = try idSetI64(a, b.pinned_sources) });
+    try P.add(&out, a, "hidden_catalogues", .{ .string_set = try idSet(a, b.hidden_sources) });
+    try P.add(&out, a, "pinned_catalogues", .{ .string_set = try idSet(a, b.pinned_sources) });
     const m = b.migration;
     const flags: i32 = (if (m.chapters) migration_bits.chapters else 0) | (if (m.categories) migration_bits.categories else 0) |
         migration_bits.custom_cover | (if (m.remove_downloads) migration_bits.remove_downloads else 0) | (if (m.notes) migration_bits.notes else 0);
