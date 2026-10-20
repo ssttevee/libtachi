@@ -39,7 +39,7 @@ differs on purpose.
 | Download deletion protections (bookmarks, excluded categories) | Same, explicit deletes included |
 | Download storage | **Deviation:** libtachi keeps its own layout (`downloads/`), and imports and exports Mihon's (`import_downloads`, `export_downloads`) with Mihon's names, legacy names, CBZ and ComicInfo.xml |
 | Image formats | Saves every format Mihon decodes (PNG, JPEG, GIF, WebP, JPEG XL, AVIF, HEIF); whether the app can show them is the app's concern |
-| Wi-Fi-only downloads | App concern: the engine doesn't know the network |
+| Wi-Fi-only downloads | Same, with the network the app reports (`Engine.setNetwork`); off Wi-Fi the queue waits with its entries kept |
 
 ## Local source
 
