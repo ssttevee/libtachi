@@ -118,6 +118,7 @@ const Decoder = struct {
             if (d.i >= d.bytes.len) return error.InvalidIndex;
             const c = d.bytes[d.i];
             d.i += 1;
+            if (shift == 63 and c > 1) return error.InvalidIndex;
             result |= @as(u64, c & 0x7f) << shift;
             if (c & 0x80 == 0) return result;
             if (shift >= 63) return error.InvalidIndex;
@@ -134,13 +135,14 @@ const Decoder = struct {
     fn next(d: *Decoder) Error!?Field {
         if (d.i >= d.bytes.len) return null;
         const key = try d.varint();
-        const num: u32 = @intCast(key >> 3);
+        const num = std.math.cast(u29, key >> 3) orelse return error.InvalidIndex;
+        if (num == 0) return error.InvalidIndex;
         return .{
             .num = num,
             .value = switch (@as(u3, @truncate(key))) {
                 0 => .{ .varint = try d.varint() },
                 1 => .{ .fixed64 = std.mem.readInt(u64, (try d.take(8))[0..8], .little) },
-                2 => .{ .bytes = try d.take(@intCast(try d.varint())) },
+                2 => .{ .bytes = try d.take(std.math.cast(usize, try d.varint()) orelse return error.InvalidIndex) },
                 5 => .{ .fixed32 = std.mem.readInt(u32, (try d.take(4))[0..4], .little) },
                 else => return error.InvalidIndex, // groups (3/4) never appear in this format
             },
@@ -209,7 +211,7 @@ fn parseExtension(arena: Allocator, bytes: []const u8) Error!Extension {
         4 => e.lib_version = f.str(),
         5 => e.version_code = f.int(),
         6 => e.version_name = f.str(),
-        7 => e.content_warning = @fromBackingInt(@intCast(@as(u8, @truncate(@as(u64, @bitCast(f.int())))))),
+        7 => e.content_warning = @fromBackingInt(std.math.cast(u8, f.int()) orelse return error.InvalidIndex),
         8 => {
             var s: Source = .{ .id = 0 };
             var sd: Decoder = .init(f.str());
@@ -501,4 +503,31 @@ test "certificateFingerprints hashes the keiyoushi signing certificate" {
     try certificateFingerprints(testing.allocator, block, &fps);
     try testing.expectEqual(1, fps.items.len);
     try testing.expect(signedBy(fps.items, "9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2"));
+}
+
+test "Decoder rejects overflowing varints and invalid field numbers" {
+    const invalid = [_][]const u8{
+        &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2 },
+        &.{0}, // field zero is never valid
+        &.{ 0x80, 0x80, 0x80, 0x80, 0x10, 0 }, // field number exceeds 29 bits
+        &.{ 0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1 }, // length exceeds addressable input
+    };
+    for (invalid) |bytes| {
+        var d: Decoder = .init(bytes);
+        try testing.expectError(error.InvalidIndex, d.next());
+    }
+    var d: Decoder = .init(&.{ 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1 });
+    const field = (try d.next()).?;
+    try testing.expectEqual(std.math.maxInt(u64), field.value.varint);
+    try testing.expectEqual(-1, field.int());
+    try testing.expectEqual(null, try d.next());
+}
+
+test "parseExtension preserves unknown content warnings within the backing type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ext = try parseExtension(arena.allocator(), &.{ 0x38, 0xff, 1 });
+    try testing.expectEqual(@as(u8, 255), @backingInt(ext.content_warning));
+    try testing.expect(!ext.nsfw());
+    try testing.expectError(error.InvalidIndex, parseExtension(arena.allocator(), &.{ 0x38, 0x80, 2 }));
 }
