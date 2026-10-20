@@ -24,8 +24,20 @@ pub const Backup = struct {
     preferences: []const Preference = &.{},
     /// Each configurable source's settings (field 105).
     source_preferences: []const SourcePreferences = &.{},
-    /// Encoded `BackupExtensionStore` messages (field 106).
-    extension_stores: []const []const u8 = &.{},
+    /// Extension stores (field 106).
+    extension_stores: []const ExtensionStore = &.{},
+};
+
+/// Mihon's `BackupExtensionStore`.
+pub const ExtensionStore = struct {
+    index_url: []const u8,
+    name: []const u8 = "",
+    badge_label: ?[]const u8 = null,
+    signing_key: []const u8 = "",
+    contact_website: []const u8 = "",
+    contact_discord: ?[]const u8 = null,
+    legacy: ?bool = null,
+    extension_list_url: ?[]const u8 = null,
 };
 
 /// One Android SharedPreferences entry.
@@ -338,7 +350,7 @@ fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
     var sources: std.ArrayList(Source) = .empty;
     var preferences: std.ArrayList(Preference) = .empty;
     var source_preferences: std.ArrayList(SourcePreferences) = .empty;
-    var stores: std.ArrayList([]const u8) = .empty;
+    var stores: std.ArrayList(ExtensionStore) = .empty;
     while (try r.next()) |f| switch (f.number) {
         1 => try manga.append(arena, try decodeManga(arena, try f.bytes())),
         2 => try categories.append(arena, try decodeCategory(try f.bytes())),
@@ -346,10 +358,27 @@ fn decodeBackup(arena: std.mem.Allocator, bytes: []const u8) !Backup {
         100, 101 => try sources.append(arena, try decodeSource(try f.bytes(), f.number == 100)),
         104 => if (try decodePreference(arena, try f.bytes())) |p| try preferences.append(arena, p),
         105 => try source_preferences.append(arena, try decodeSourcePreferences(arena, try f.bytes())),
-        106 => try stores.append(arena, try f.bytes()),
+        106 => try stores.append(arena, try decodeExtensionStore(try f.bytes())),
         else => {},
     };
     return .{ .manga = manga.items, .categories = categories.items, .sources = sources.items, .preferences = preferences.items, .source_preferences = source_preferences.items, .extension_stores = stores.items };
+}
+
+fn decodeExtensionStore(bytes: []const u8) !ExtensionStore {
+    var r: Reader = .{ .bytes = bytes };
+    var store: ExtensionStore = .{ .index_url = "" };
+    while (try r.next()) |f| switch (f.number) {
+        1 => store.index_url = try f.bytes(),
+        2 => store.name = try f.bytes(),
+        3 => store.badge_label = try f.bytes(),
+        4 => store.contact_website = try f.bytes(),
+        5 => store.signing_key = try f.bytes(),
+        6 => store.contact_discord = try f.bytes(),
+        7 => store.legacy = try f.boolean(),
+        8 => store.extension_list_url = try f.bytes(),
+        else => {},
+    };
+    return store;
 }
 
 /// A preference, or null for a value class this doesn't know.
@@ -571,7 +600,7 @@ pub fn encode(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
     for (backup.sources) |s| try w.message(101, s, encodeSource);
     for (backup.preferences) |p| try w.message(104, p, encodePreference);
     for (backup.source_preferences) |p| try w.message(105, p, encodeSourcePreferences);
-    for (backup.extension_stores) |p| try w.bytes(106, p);
+    for (backup.extension_stores) |p| try w.message(106, p, encodeExtensionStore);
     return w.out.items;
 }
 
@@ -585,6 +614,19 @@ pub fn encodeFile(arena: std.mem.Allocator, backup: Backup) ![]const u8 {
     try compress.writer.writeAll(raw);
     try compress.finish();
     return out.toOwnedSlice();
+}
+
+/// In the class's declaration order, which kotlinx writes: the signing
+/// key (5) comes before the website (4).
+fn encodeExtensionStore(w: *Writer, s: ExtensionStore) !void {
+    try w.bytes(1, s.index_url);
+    try w.bytes(2, s.name);
+    try w.nullable(3, s.badge_label);
+    try w.bytes(5, s.signing_key);
+    try w.bytes(4, s.contact_website);
+    try w.nullable(6, s.contact_discord);
+    if (s.legacy) |legacy| try w.boolean(7, legacy);
+    try w.nullable(8, s.extension_list_url);
 }
 
 fn encodePreference(w: *Writer, p: Preference) !void {
@@ -711,6 +753,7 @@ pub const ExportOptions = struct {
     /// private values (tokens, passwords) in either.
     app_settings: bool = true,
     source_settings: bool = true,
+    extension_stores: bool = true,
     private_settings: bool = false,
 };
 
@@ -1252,5 +1295,8 @@ test "Mihon's own encoding decodes and re-encodes byte for byte" {
     try std.testing.expectEqual(0, prefs[8].value.string_set.len);
     try std.testing.expectEqualStrings("source_2499283573021220255", backup.source_preferences[0].key);
     try std.testing.expect(backup.source_preferences[0].prefs[0].value.boolean);
+    try std.testing.expectEqualStrings("9add655a", backup.extension_stores[0].signing_key);
+    try std.testing.expect(!backup.extension_stores[0].legacy.?);
+    try std.testing.expect(backup.extension_stores[1].badge_label == null and backup.extension_stores[1].legacy == null);
     try std.testing.expectEqualSlices(u8, golden, try encode(a, backup));
 }

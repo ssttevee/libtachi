@@ -1730,6 +1730,12 @@ pub const Engine = struct {
                 var mapping: std.ArrayList(preferences.CategoryMapping) = .empty;
                 for (decoded.categories) |bc| for (after.categories) |c| if (std.mem.eql(u8, c.name, bc.name)) try mapping.append(a, .{ .backup_id = bc.id, .id = c.id });
                 if (decoded.preferences.len > 0) try self.saveSettings(try preferences.applyToSettings(a, try self.loadSettings(a), decoded.preferences, mapping.items));
+                if (decoded.extension_stores.len > 0) {
+                    var file = try stores.File.load(a, self.io, self.options.dir);
+                    // Mihon upserts by index URL.
+                    for (decoded.extension_stores) |st| file = try file.upsert(a, .{ .index_url = st.index_url, .name = st.name, .badge_label = st.badge_label orelse st.name, .signing_key = st.signing_key, .website = st.contact_website, .discord = st.contact_discord, .legacy = st.legacy orelse true, .extension_list_url = st.extension_list_url });
+                    try file.save(a, self.io, self.options.dir);
+                }
                 if (decoded.source_preferences.len > 0) {
                     try preferences.writeSourcePreferences(a, self.io, try self.prefsDir(a), decoded.source_preferences);
                     // A running runtime has the old values in memory; a
@@ -1750,6 +1756,12 @@ pub const Engine = struct {
                     b.preferences = kept.items;
                 }
                 if (c.options.source_settings) b.source_preferences = try preferences.readSourcePreferences(a, self.io, try self.prefsDir(a), c.options.private_settings);
+                if (c.options.extension_stores) {
+                    const file = try stores.File.load(a, self.io, self.options.dir);
+                    const out = try a.alloc(backup.ExtensionStore, file.stores.len);
+                    for (file.stores, out) |st, *o| o.* = .{ .index_url = st.index_url, .name = st.name, .badge_label = st.badge_label, .signing_key = st.signing_key, .contact_website = st.website, .contact_discord = st.discord, .legacy = st.legacy, .extension_list_url = st.extension_list_url };
+                    b.extension_stores = out;
+                }
                 const bytes = try backup.encodeFile(a, b);
                 try library.writeAtomic(a, self.io, c.path, bytes);
                 job.result = .{ .message = "Backup created" };
@@ -2734,6 +2746,7 @@ test "engine backups carry settings and extensions' settings both ways" {
     s.downloads.new_categories = &.{4};
     s.mihon_preferences = &.{.{ .key = "pref_display_mode_library", .value = .{ .string = "LIST" } }};
     try one.saveSettings(s);
+    try (stores.File{ .stores = &.{.{ .index_url = "https://k/index.min.json", .name = "K", .signing_key = "abcd" }} }).save(a, io, one_dir);
     const out = try Job.start(&one, .{ .export_backup = .{ .path = file } });
     out.join();
     try std.testing.expect(out.failure == null);
@@ -2757,6 +2770,9 @@ test "engine backups carry settings and extensions' settings both ways" {
     try std.testing.expectEqualStrings("LIST", restored.mihon_preferences[0].value.string);
     const prefs = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ two_dir, "prefs", "source_7.json" }), a, .limited(4096));
     try std.testing.expect(std.mem.indexOf(u8, prefs, "\"mirror\"") != null);
+    const restored_stores = try two.extensionStores(a);
+    try std.testing.expectEqual(1, restored_stores.len);
+    try std.testing.expectEqualStrings("abcd", restored_stores[0].signing_key);
 }
 
 test "engine records nothing for sources of extensions read in incognito" {
@@ -2782,4 +2798,98 @@ test "engine records nothing for sources of extensions read in incognito" {
     try engine.saveSettings(s);
     try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2 });
     try std.testing.expect((try engine.loadLibrary(a)).manga[0].chapters[0].read);
+}
+
+test "engine merges store listings and keeps only trusted extension files" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const key = "9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2";
+    const archive = @import("archive.zig");
+    try tmp.dir.writeFile(io, .{ .sub_path = "signed.jar", .data = try archive.zip(a, &.{.{ .name = "META-INF/CERT.RSA", .data = @embedFile("testdata/keiyoushi-cert.rsa") }}) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "unsigned.jar", .data = try archive.zip(a, &.{.{ .name = "a.txt", .data = "x" }}) });
+    const signed = try std.fs.path.join(a, &.{ dir, "signed.jar" });
+    const unsigned = try std.fs.path.join(a, &.{ dir, "unsigned.jar" });
+    try tmp.dir.createDirPath(io, "extensions");
+    try library.writeJsonAtomic(a, io, try std.fs.path.join(a, &.{ dir, "extensions", "installed.json" }), manage.Registry{ .extensions = @constCast(&[_]manage.InstalledEntry{
+        .{ .pkg = "eu.signed", .path = signed, .versionCode = 3, .versionName = "1.4.3" },
+        .{ .pkg = "eu.unsigned", .path = unsigned, .versionCode = 1, .versionName = "1.4.1" },
+        .{ .pkg = "eu.gone", .path = "/nowhere", .versionCode = 1, .versionName = "1.4.1" },
+    }) });
+
+    const Fake = struct {
+        uninstalled: usize = 0,
+        fn entry(pkg: []const u8, code: i64, signing_key: []const u8, lang: []const u8) manage.RepoEntry {
+            return .{ .pkg = pkg, .name = pkg, .versionName = "", .versionCode = code, .libVersion = "1.4", .nsfw = false, .lang = lang, .jarUrl = null, .apkUrl = "", .iconUrl = "", .supported = true, .installed = false, .installedVersionCode = null, .hasUpdate = false, .sources = &.{}, .signingKey = signing_key };
+        }
+        fn run(ptr: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (status) |s| s.ready(s.context);
+            return switch (c) {
+                .extensions => |r| if (std.mem.indexOf(u8, r.url.?, "one") != null)
+                    .{ .extensions = try arena.dupe(manage.RepoEntry, &.{ entry("eu.signed", 3, "k1", "en"), entry("eu.french", 1, "k1", "fr") }) }
+                else if (std.mem.indexOf(u8, r.url.?, "two") != null)
+                    .{ .extensions = try arena.dupe(manage.RepoEntry, &.{entry("eu.signed", 4, "k1", "en")}) }
+                else
+                    error.NetworkError,
+                .install_file => .{},
+                .uninstall => blk: {
+                    self.uninstalled += 1;
+                    break :blk .{};
+                },
+                else => error.Unexpected,
+            };
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+    };
+    var fake: Fake = .{};
+    const backend: be.Backend = .{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .warm = Fake.yes, .cancel = Fake.none, .release = Fake.none, .idle = Fake.none } };
+    var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try (stores.File{ .stores = &.{
+        .{ .index_url = "https://one/index.min.json", .signing_key = key },
+        .{ .index_url = "https://two/index.min.json", .signing_key = "k2" },
+        .{ .index_url = "https://down/index.min.json", .signing_key = "k3" },
+    } }).save(a, io, dir);
+
+    // One entry per package and key, the newest; French hidden; a store
+    // that fails adds nothing; what no store lists is obsolete.
+    const list = try Job.start(&engine, .{ .extensions = .{} });
+    list.join();
+    try std.testing.expect(list.failure == null);
+    try std.testing.expectEqual(1, list.result.extensions.len);
+    try std.testing.expectEqual(4, list.result.extensions[0].versionCode);
+    try std.testing.expectEqual(2, list.result.obsolete.len);
+    list.deinit();
+
+    const ok = try Job.start(&engine, .{ .install_file = signed });
+    ok.join();
+    try std.testing.expect(ok.failure == null);
+    ok.deinit();
+    const refused = try Job.start(&engine, .{ .install_file = unsigned });
+    refused.join();
+    try std.testing.expect(refused.failure != null);
+    try std.testing.expectEqualStrings("eu.unsigned", refused.result.untrusted.?.pkg);
+    refused.deinit();
+    try std.testing.expectEqual(1, fake.uninstalled);
+
+    // Without the store, the signed file needs trusting by hand.
+    try engine.removeStore("https://one/index.min.json");
+    const untrusted = try Job.start(&engine, .{ .install_file = signed });
+    untrusted.join();
+    const found = untrusted.result.untrusted.?;
+    try std.testing.expectEqualStrings(key, found.fingerprint);
+    try engine.trustExtension(.{ .pkg = try a.dupe(u8, found.pkg), .version_code = found.version_code, .fingerprint = try a.dupe(u8, found.fingerprint) });
+    untrusted.deinit();
+    const trusted = try Job.start(&engine, .{ .install_file = signed });
+    trusted.join();
+    try std.testing.expect(trusted.failure == null);
+    trusted.deinit();
 }

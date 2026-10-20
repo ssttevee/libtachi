@@ -28,6 +28,19 @@ data class Backup(
     @ProtoNumber(101) var backupSources: List<BackupSource> = emptyList(),
     @ProtoNumber(104) var backupPreferences: List<BackupPreference> = emptyList(),
     @ProtoNumber(105) var backupSourcePreferences: List<BackupSourcePreferences> = emptyList(),
+    @ProtoNumber(106) var backupExtensionStores: List<BackupExtensionStore> = emptyList(),
+)
+
+@Serializable
+class BackupExtensionStore(
+    @ProtoNumber(1) var indexUrl: String,
+    @ProtoNumber(2) var name: String,
+    @ProtoNumber(3) var badgeLabel: String?,
+    @ProtoNumber(5) var signingKey: String,
+    @ProtoNumber(4) var contactWebsite: String,
+    @ProtoNumber(6) var contactDiscord: String?,
+    @ProtoNumber(7) var isLegacy: Boolean?,
+    @ProtoNumber(8) var extensionListUrl: String?,
 )
 
 // Mihon's classes carry no @SerialName, so kotlinx names them by their
@@ -205,6 +218,10 @@ fun sample() = Backup(
     ),
     backupSourcePreferences = listOf(
         BackupSourcePreferences("source_2499283573021220255", listOf(BackupPreference("dataSaver", BooleanPreferenceValue(true)))),
+    ),
+    backupExtensionStores = listOf(
+        BackupExtensionStore("https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json", "Keiyoushi", "KEI", "9add655a", "https://keiyoushi.github.io", "https://discord.gg/x", false, "https://k/list.pb"),
+        BackupExtensionStore("https://old/repo.json", "Old", null, "", "", null, null, null),
     ),
 )
 
