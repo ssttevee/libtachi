@@ -233,14 +233,7 @@ pub const Engine = struct {
     pub fn libraryView(self: *Engine, arena: std.mem.Allocator, search: []const u8) ![]views.Group {
         const s = try self.loadSettings(arena);
         const lib = try self.store.load(arena);
-        return views.libraryView(arena, lib, .{
-            .filters = s.library.filters,
-            .downloaded_only = s.library.downloaded_only,
-            .skip_outside_release_period = s.update.skip_outside_release_period,
-            .default_sort = .decode(s.library.sort),
-            .random_seed = s.library.random_seed,
-            .match = try views.search(arena, lib, search, self.options.utc_offset_s),
-        });
+        return views.libraryView(arena, lib, try views.libraryOptions(arena, lib, s, search, self.options.utc_offset_s));
     }
 
     // ---- covers ------------------------------------------------------------------

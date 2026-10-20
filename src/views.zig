@@ -320,6 +320,19 @@ pub const Matcher = struct {
     matches: *const fn (context: *const anyopaque, manga: *const Manga, counts: library.Counts) bool,
 };
 
+/// The library view the settings describe, searching for `search` in
+/// Mihon's syntax; what `Engine.libraryView` shows.
+pub fn libraryOptions(arena: std.mem.Allocator, lib: Library, s: settings.Settings, search_text: []const u8, utc_offset_s: i32) !LibraryOptions {
+    return .{
+        .filters = s.library.filters,
+        .downloaded_only = s.library.downloaded_only,
+        .skip_outside_release_period = s.update.skip_outside_release_period,
+        .default_sort = .decode(s.library.sort),
+        .random_seed = s.library.random_seed,
+        .match = try search(arena, lib, search_text, utc_offset_s),
+    };
+}
+
 /// A matcher for Mihon's library search syntax (see `query`); null for
 /// empty text, which matches everything.
 pub fn search(arena: std.mem.Allocator, lib: Library, text: []const u8, utc_offset_s: i32) !?Matcher {
