@@ -2,6 +2,11 @@
 package eu.kanade.tachiyomi.network
 
 import android.content.Context
+import dev.tachi.host.CallTimings
+import dev.tachi.host.NativeHostnameVerifier
+import dev.tachi.host.NativeSocketFactory
+import dev.tachi.host.NativeSslSocketFactory
+import dev.tachi.host.NativeTrustManager
 import dev.tachi.host.TachiRuntime
 import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
 import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
@@ -24,9 +29,19 @@ class NetworkHelper(context: Context) {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .callTimeout(2, TimeUnit.MINUTES)
-            .cache(Cache(cacheDir, cacheSize))
+            .eventListenerFactory(CallTimings)
             .addInterceptor(UncaughtExceptionInterceptor())
             .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+
+        if (TachiRuntime.config.nativeTransport) {
+            // No disk cache: a cached HTTPS entry records peer certificates,
+            // which stay on the native side.
+            builder.socketFactory(NativeSocketFactory)
+                .sslSocketFactory(NativeSslSocketFactory, NativeTrustManager)
+                .hostnameVerifier(NativeHostnameVerifier)
+        } else {
+            builder.cache(Cache(cacheDir, cacheSize))
+        }
 
         if (TachiRuntime.config.verbose) {
             val logging = HttpLoggingInterceptor { message -> android.util.Log.d("okhttp", message) }

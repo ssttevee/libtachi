@@ -10,6 +10,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 
 /**
@@ -46,6 +47,15 @@ object Bridge {
     @JvmStatic
     fun install(path: ByteArray): ByteArray = guard {
         json.encodeToJsonElement(ExtensionInfoDto.serializer(), ExtensionLoader.install(File(path.utf8())))
+    }
+
+    /** `{"path": ..., "info": ExtensionInfo}` from an earlier install; loads on first use. */
+    @JvmStatic
+    fun register(entry: ByteArray): ByteArray = guard {
+        val fields = json.parseToJsonElement(entry.utf8()).jsonObject
+        val info = json.decodeFromJsonElement(ExtensionInfoDto.serializer(), fields["info"]!!)
+        val path = fields["path"]!!.jsonPrimitive.content
+        json.encodeToJsonElement(ExtensionInfoDto.serializer(), ExtensionLoader.register(File(path), info))
     }
 
     @JvmStatic
@@ -103,6 +113,8 @@ object Bridge {
     @JvmStatic
     fun shutdown() {
         for (ext in ExtensionLoader.list()) ExtensionLoader.uninstall(ext.pkg)
+        // Idle pooled sockets may be native; close them while the natives still exist.
+        if (TachiRuntime.isInitialised) TachiRuntime.network.client.connectionPool.evictAll()
     }
 
     // ---- plumbing ----------------------------------------------------------------

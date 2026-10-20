@@ -82,6 +82,7 @@ const Flags = struct {
     /// Skip reloading the installed extensions at startup.
     no_restore: bool = false,
     no_cds: bool = false,
+    native_transport: bool = false,
     // `repo` options
     repo_url: ?[]const u8 = null,
     refresh: bool = false,
@@ -127,6 +128,7 @@ fn usage() noreturn {
         \\  --ext FILE       load an extension file for this run only
         \\  --no-restore     do not reload installed extensions
         \\  --no-cds         do not keep a JVM class-data-sharing archive in the cache dir
+        \\  --native-tls     send extension HTTP through Zig sockets and TLS
         \\  --repo URL       index URL (default keiyoushi)
         \\  --refresh        ignore the cached index
         \\  -v               verbose logging
@@ -168,6 +170,8 @@ pub fn main(init: std.process.Init) !void {
             flags.no_restore = true;
         } else if (std.mem.eql(u8, arg, "--no-cds")) {
             flags.no_cds = true;
+        } else if (std.mem.eql(u8, arg, "--native-tls")) {
+            flags.native_transport = true;
         } else if (std.mem.eql(u8, arg, "--repo")) {
             flags.repo_url = it.next() orelse usage();
         } else if (std.mem.eql(u8, arg, "--refresh")) {
@@ -196,6 +200,7 @@ pub fn main(init: std.process.Init) !void {
         .java_home = flags.java_home,
         .verbose = flags.verbose,
         .class_data_sharing = !flags.no_cds,
+        .native_transport = flags.native_transport,
         .log_fn = logFn,
         .environ = init.minimal.environ,
     }) catch |e| {

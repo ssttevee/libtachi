@@ -13,7 +13,9 @@ import org.w3c.dom.Element
 import java.io.File
 import java.net.URLClassLoader
 import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 import javax.xml.parsers.DocumentBuilderFactory
 
 class ExtensionLoadException(message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -55,14 +57,45 @@ object ExtensionLoader {
     )
 
     private val extensions = ConcurrentHashMap<String, LoadedExtension>()
+    /** Registered by a restore and loaded when one of their sources is first used. */
+    private val pending = ConcurrentHashMap<String, Pending>()
     private val sourcesById = ConcurrentHashMap<Long, Source>()
     private val sourceOwner = ConcurrentHashMap<Long, String>()
 
-    fun source(id: Long): Source = sourcesById[id] ?: throw NoSuchElementException("No loaded source with id $id")
+    private class Pending(val file: File, val info: ExtensionInfoDto)
+
+    fun source(id: Long): Source = sourcesById[id] ?: loadOwner(id) ?: throw NoSuchElementException("No loaded source with id $id")
 
     fun extension(pkg: String): LoadedExtension? = extensions[pkg]
 
-    fun list(): List<ExtensionInfoDto> = extensions.values.map { it.info }.sortedBy { it.pkg }
+    fun list(): List<ExtensionInfoDto> = (extensions.values.map { it.info } + pending.values.map { it.info }).sortedBy { it.pkg }
+
+    /**
+     * Remembers a previously installed package without loading it. Its classes
+     * load, and its sources are created, the first time one of them is used.
+     * Without recorded source classes this falls back to `install`.
+     */
+    @Synchronized
+    fun register(file: File, info: ExtensionInfoDto): ExtensionInfoDto {
+        if (info.sourceClasses.isEmpty() || info.sources.isEmpty()) return install(file)
+        if (!file.isFile) throw ExtensionLoadException("Extension file not found: $file")
+        extensions[info.pkg]?.let { unload(it) }
+        pending[info.pkg] = Pending(file, info)
+        for (s in info.sources) sourceOwner[s.id.toLong()] = info.pkg
+        return info
+    }
+
+    @Synchronized
+    private fun loadOwner(id: Long): Source? {
+        sourcesById[id]?.let { return it }
+        val pkg = sourceOwner[id] ?: return null
+        val waiting = pending[pkg] ?: return null
+        val started = System.nanoTime()
+        val loaded = load(waiting.file, waiting.info.copy(sources = emptyList()), waiting.info.sourceClasses)
+        pending.remove(pkg)
+        TachiLog.i("tachi", "loaded $pkg on first use in ${(System.nanoTime() - started) / 1_000_000} ms")
+        return loaded.sources.firstOrNull { it.id == id }
+    }
 
     @Synchronized
     fun install(file: File): ExtensionInfoDto {
@@ -70,14 +103,32 @@ object ExtensionLoader {
         val manifest = readManifest(file)
         validate(manifest)
 
-        val jar = if (containsDex(file)) convertApk(file, manifest) else file
-        val loader = URLClassLoader(arrayOf(jar.toURI().toURL()), ExtensionLoader::class.java.classLoader)
-
         val classNames = manifest.metaData[METADATA_SOURCE_CLASS]!!
             .split(";")
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .map { if (it.startsWith(".")) manifest.packageName + it else it }
+        val info = ExtensionInfoDto(
+            pkg = manifest.packageName,
+            name = manifest.metaData[METADATA_NAME] ?: manifest.packageName.substringAfterLast('.'),
+            versionName = manifest.versionName,
+            versionCode = manifest.versionCode,
+            libVersion = libVersion(manifest),
+            nsfw = isNsfw(manifest),
+            lang = "",
+            path = file.absolutePath,
+            sources = emptyList(),
+            sourceClasses = classNames,
+        )
+        val loaded = load(file, info, classNames)
+        TachiLog.i("tachi", "loaded ${info.pkg} v${info.versionName} (${loaded.sources.size} source(s))")
+        return loaded.info
+    }
+
+    /** Creates the package's sources and makes them callable. `info` supplies everything but sources and lang. */
+    private fun load(file: File, info: ExtensionInfoDto, classNames: List<String>): LoadedExtension {
+        val jar = classJar(if (containsDex(file)) convertApk(file, info.pkg, info.versionCode) else file, info.pkg, info.versionCode)
+        val loader = URLClassLoader(arrayOf(jar.toURI().toURL()), ExtensionLoader::class.java.classLoader)
 
         val sources = try {
             classNames.flatMap { className ->
@@ -92,41 +143,42 @@ object ExtensionLoader {
             throw e
         } catch (e: Throwable) {
             loader.close()
-            throw ExtensionLoadException("Failed to instantiate sources of ${manifest.packageName}: $e", e)
+            throw ExtensionLoadException("Failed to instantiate sources of ${info.pkg}: $e", e)
         }
 
-        // Replace a previously loaded version of the same package.
-        extensions[manifest.packageName]?.let { unload(it) }
+        // Replace a previously loaded or registered version of the same package.
+        extensions[info.pkg]?.let { unload(it) }
+        pending.remove(info.pkg)?.let { forget(it.info) }
 
-        val info = ExtensionInfoDto(
-            pkg = manifest.packageName,
-            name = manifest.metaData[METADATA_NAME] ?: manifest.packageName.substringAfterLast('.'),
-            versionName = manifest.versionName,
-            versionCode = manifest.versionCode,
-            libVersion = libVersion(manifest),
-            nsfw = isNsfw(manifest),
+        val complete = info.copy(
             lang = when (val langs = sources.map { it.lang }.distinct()) {
                 emptyList<String>() -> ""
                 else -> if (langs.size == 1) langs.first() else "all"
             },
-            path = file.absolutePath,
-            sources = sources.map { it.toInfo(manifest.packageName) },
+            sources = sources.map { it.toInfo(info.pkg) },
         )
-        val loaded = LoadedExtension(info, loader, sources)
-        extensions[manifest.packageName] = loaded
+        val loaded = LoadedExtension(complete, loader, sources)
+        extensions[info.pkg] = loaded
         for (s in sources) {
             sourcesById[s.id] = s
-            sourceOwner[s.id] = manifest.packageName
+            sourceOwner[s.id] = info.pkg
         }
-        TachiLog.i("tachi", "loaded ${info.pkg} v${info.versionName} (${sources.size} source(s))")
-        return info
+        return loaded
     }
 
     @Synchronized
     fun uninstall(pkg: String): Boolean {
+        pending.remove(pkg)?.let {
+            forget(it.info)
+            return true
+        }
         val ext = extensions.remove(pkg) ?: return false
         unload(ext)
         return true
+    }
+
+    private fun forget(info: ExtensionInfoDto) {
+        for (s in info.sources) sourceOwner.remove(s.id.toLong(), info.pkg)
     }
 
     private fun unload(ext: LoadedExtension) {
@@ -137,6 +189,33 @@ object ExtensionLoader {
             }
         }
         runCatching { ext.classLoader.close() }
+    }
+
+    /**
+     * Java checks a SHA-256 digest of every class it loads from a signed jar,
+     * which is slow without a JIT. Signatures only attach code signers here (no
+     * policy uses them), so classes load from a copy without them.
+     */
+    private fun classJar(jar: File, pkg: String, versionCode: Int): File {
+        val signature = Regex("""META-INF/[^/]+\.(SF|RSA|DSA|EC)""", RegexOption.IGNORE_CASE)
+        val signed = ZipFile(jar).use { zip -> zip.entries().asSequence().any { signature.matches(it.name) } }
+        if (!signed) return jar
+        val outDir = File(TachiRuntime.application.cacheDir, "extensions").also { it.mkdirs() }
+        val copy = File(outDir, "$pkg-$versionCode-unsigned.jar")
+        if (copy.isFile && copy.lastModified() >= jar.lastModified()) return copy
+        val part = File(outDir, copy.name + ".part")
+        ZipFile(jar).use { zip ->
+            ZipOutputStream(part.outputStream().buffered()).use { out ->
+                for (entry in zip.entries()) {
+                    if (signature.matches(entry.name)) continue
+                    out.putNextEntry(ZipEntry(entry.name))
+                    zip.getInputStream(entry).use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+            }
+        }
+        if (!part.renameTo(copy)) throw ExtensionLoadException("Cannot write $copy")
+        return copy
     }
 
     fun Source.toInfo(pkg: String) = SourceInfoDto(
@@ -238,9 +317,9 @@ object ExtensionLoader {
     }
 
     /** dex -> class conversion, as Suwayomi does it (PackageTools.dex2jar). */
-    private fun convertApk(apk: File, manifest: Manifest): File {
+    private fun convertApk(apk: File, pkg: String, versionCode: Int): File {
         val outDir = File(TachiRuntime.application.cacheDir, "extensions").also { it.mkdirs() }
-        val jar = File(outDir, "${manifest.packageName}-${manifest.versionCode}.jar")
+        val jar = File(outDir, "$pkg-$versionCode.jar")
         if (jar.isFile && jar.lastModified() >= apk.lastModified()) return jar
         TachiLog.i("tachi", "converting ${apk.name} with dex2jar")
         val handler = BaksmaliBaseDexExceptionHandler()

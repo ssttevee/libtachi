@@ -30,6 +30,8 @@ data class RuntimeConfig(
     val verbose: Boolean = false,
     /** True when the native side registered NativeHooks.log. */
     val nativeLog: Boolean = false,
+    /** True when the native side registered NativeTransport; OkHttp sockets and TLS then go through it. */
+    val nativeTransport: Boolean = false,
 )
 
 /** Process-wide state of the host: configuration, the fake Application, and DI wiring. */

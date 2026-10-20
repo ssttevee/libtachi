@@ -90,6 +90,8 @@ data class ExtensionInfoDto(
     val lang: String,
     val path: String,
     val sources: List<SourceInfoDto>,
+    /** `tachiyomi.extension.class` entries; lets a restore defer loading until a source is used. */
+    val sourceClasses: List<String> = emptyList(),
 )
 
 /**

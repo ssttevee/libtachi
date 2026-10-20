@@ -93,6 +93,7 @@ pub const tachi_config = extern struct {
     app_version_code: c_int = 0,
     verbose: c_int = 0,
     no_class_data_sharing: c_int = 0,
+    native_transport: c_int = 0,
 };
 
 fn optSlice(p: ?[*:0]const u8) ?[]const u8 {
@@ -126,6 +127,7 @@ pub export fn tachi_runtime_new(cfg: ?*const tachi_config, out: ?*?*tachi.Runtim
         .package_name = optSlice(c.package_name),
         .verbose = c.verbose != 0,
         .class_data_sharing = c.no_class_data_sharing == 0,
+        .native_transport = c.native_transport != 0,
         .log_fn = c.log_fn,
         .log_user_data = c.log_user_data,
         .java_home = optSlice(c.java_home),

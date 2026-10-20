@@ -74,6 +74,8 @@ typedef struct tachi_config {
     int verbose;                   /* enables debug logging and HTTP header logging */
     int no_class_data_sharing;     /* skip the JVM class-data-sharing archive kept in cache_dir (JDK 19+;
                                       written on first exit, roughly halves JVM start-up afterwards) */
+    int native_transport;          /* send extension HTTP through Zig sockets and TLS (for JVMs
+                                      without a JIT); see docs/API.md */
 } tachi_config;
 
 int tachi_runtime_new(const tachi_config *config, tachi_runtime **out);

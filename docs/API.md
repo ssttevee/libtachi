@@ -23,6 +23,7 @@ so JavaScript consumers do not lose precision, and `int64_t` in the C API.
 | Call | Args | Result |
 |---|---|---|
 | `install(path)` | path to `.jar` or `.apk` | `ExtensionInfo` |
+| `register(entry)` | `{"path", "info": ExtensionInfo}` from an earlier `install` | `ExtensionInfo`; loads on first use |
 | `uninstall(pkg)` | package name | `true`/`false` |
 | `listExtensions()` | | `ExtensionInfo[]` |
 
@@ -31,7 +32,8 @@ ExtensionInfo {
   "pkg": "eu.kanade.tachiyomi.extension.en.weebcentral",
   "name": "Weeb Central", "versionName": "1.6.25", "versionCode": 106025,
   "libVersion": "1.6", "nsfw": true, "lang": "en", "path": "/…/x.jar",
-  "sources": [ SourceInfo ]
+  "sources": [ SourceInfo ],
+  "sourceClasses": [ "keiyoushi.source.Generated" ]   // as the manifest declares them
 }
 SourceInfo {
   "id": "2131019126180322627", "name": "Weeb Central", "lang": "en",
@@ -41,8 +43,13 @@ SourceInfo {
 }
 ```
 
-`install` is the only way a package enters the JVM. The Zig/C layers wrap it
-with a registry so installs survive the process; see below.
+`install` and `register` are the only ways a package enters the JVM. The
+Zig/C layers wrap them with a registry so installs survive the process; see
+below. A registered package is listed with its recorded sources, but its
+classes load, and its sources are created, only when one of them is first
+called. Classes from a signed jar load from an unsigned copy in
+`<cacheDir>/extensions`: the signatures attach no permissions here, and
+checking a digest per class is slow on JVMs without a JIT.
 
 ## Management (native side)
 
@@ -55,7 +62,7 @@ Zig and as `tachi_install/tachi_uninstall/tachi_restore/tachi_repo_*` in C.
 |---|---|
 | `installExtension(path)` | `install` + records the package in `<data_dir>/extensions/installed.json` |
 | `uninstallExtension(pkg)` | `uninstall` + forgets it; deletes the file if it was downloaded from a repo |
-| `restore()` | reloads every recorded package; `{"loaded": n, "failed": [{"pkg", "error"}]}` |
+| `restore()` | `register`s every recorded package; `{"loaded": n, "failed": [{"pkg", "error"}]}`. Entries from before `info` was recorded load now, and their info is saved |
 | `repoList(url?)` | `RepoEntry[]`: the index joined with the registry |
 | `repoInstall(pkg, url?)` | download, verify signer, `install`, record |
 | `repoUpdate(url?)` | `{"updated": ExtensionInfo[], "failed": [{"pkg","error"}], "missing": [pkg]}` |
@@ -170,17 +177,38 @@ bytes plus the `Content-Type`.
 | field | default | notes |
 |---|---|---|
 | `dataDir` | required | prefs, cookies, converted APKs |
-| `cacheDir` | `<dataDir>/cache` | OkHttp cache, dex2jar output |
+| `cacheDir` | `<dataDir>/cache` | OkHttp cache, dex2jar output, unsigned class jars |
 | `userAgent` | Chrome on Android | `NetworkHelper.defaultUserAgentProvider()` |
 | `appVersionName` / `appVersionCode` | `0.20.1` / `137` | `eu.kanade.tachiyomi.AppInfo` |
 | `packageName` | `app.mihon` | `Context.getPackageName()` |
 | `verbose` | false | debug logs + HTTP header logging |
+| `nativeTransport` | false | set by the native side when `Options.native_transport` registered `NativeTransport` |
 
 ## Logging
 
 `android.util.Log` → `dev.tachi.host.TachiLog` → (if a `log_fn` was given)
 the native callback, called from whatever JVM thread logged. Levels follow
 Android: 2 verbose … 7 assert.
+
+Every OkHttp call made through the host's clients logs one info line, tag
+`http`: `GET host/path dns_ms= connect_ms= tls_ms= headers_ms= total_ms=`,
+with ` failed=Exception` when it fails.
+
+## Native transport
+
+`Options.native_transport` (`tachi_config.native_transport` in C) sends the
+host clients' sockets through Zig (`src/transport.zig`): OkHttp keeps DNS,
+routing, cookies, redirects, interceptors and HTTP/1.1, and only the bytes,
+and TLS, are native. `std.crypto.tls` verifies the peer and host name against
+`ca_file` (the system roots when null). On JVMs without a JIT, Java's TLS is
+interpreted: loading the trust store and one handshake take seconds each.
+
+Handshakes run on a Zig thread with a 1 MiB stack, since a JVM thread may
+have little left. Peer certificates stay native, so sessions report none:
+the OkHttp disk cache, which records them, is off in this mode, and pinned
+hosts (`CertificatePinner`) fail. A client that installs its own
+`SSLSocketFactory` still gets Java TLS over the native socket. The 1.3/1.2
+suite and protocol names reported to OkHttp are nominal; Zig negotiates.
 
 
 ### Native image planning (PocketManga host bridge)

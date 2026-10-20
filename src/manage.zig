@@ -35,6 +35,9 @@ pub const InstalledEntry = struct {
     versionName: []const u8,
     /// Index URL this was installed from; null for files the caller supplied.
     repo: ?[]const u8 = null,
+    /// The `ExtensionInfo` the host reported at install. With it, `restore`
+    /// registers the package and the host loads it when a source is first used.
+    info: ?std.json.Value = null,
 };
 
 pub const Registry = struct {
@@ -71,7 +74,7 @@ fn saveRegistry(rt: *Runtime, arena: Allocator, reg: Registry) Error!void {
 }
 
 /// Records (or replaces) the registry line for a freshly installed package.
-fn record(rt: *Runtime, arena: Allocator, info: models.ExtensionInfo, index_url: ?[]const u8) Error!void {
+fn record(rt: *Runtime, arena: Allocator, info: models.ExtensionInfo, raw: std.json.Value, index_url: ?[]const u8) Error!void {
     var reg = try loadRegistry(rt, arena);
     const entry: InstalledEntry = .{
         .pkg = info.pkg,
@@ -79,6 +82,7 @@ fn record(rt: *Runtime, arena: Allocator, info: models.ExtensionInfo, index_url:
         .versionCode = info.versionCode,
         .versionName = info.versionName,
         .repo = index_url,
+        .info = raw,
     };
     if (reg.find(info.pkg)) |e| {
         e.* = entry;
@@ -124,7 +128,8 @@ fn installAndRecord(rt: *Runtime, arena: Allocator, path: []const u8, index_url:
     const info = std.json.parseFromSliceLeaky(models.ExtensionInfo, arena, json, models.parse_options) catch {
         return error.InvalidResponse;
     };
-    try record(rt, arena, info, index_url);
+    const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch return error.InvalidResponse;
+    try record(rt, arena, info, raw, index_url);
     return json;
 }
 
@@ -157,8 +162,10 @@ pub const RestoreResult = struct {
     pub const Failure = struct { pkg: []const u8, @"error": []const u8 };
 };
 
-/// Reloads every package in the registry. Call once after `Runtime.init`.
-/// Returns the result as JSON (owned by caller).
+/// Makes every package in the registry available again. Call once after
+/// `Runtime.init`. Packages with recorded info load when a source is first
+/// used; older entries load now and gain that info. Returns the result as
+/// JSON (owned by caller).
 pub fn restore(rt: *Runtime) Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(rt.gpa);
     defer arena_state.deinit();
@@ -169,16 +176,29 @@ pub fn restore(rt: *Runtime) Error![]u8 {
     const reg = try loadRegistry(rt, arena);
     var failed: std.ArrayList(RestoreResult.Failure) = .empty;
     var loaded: usize = 0;
-    for (reg.extensions) |e| {
-        if (rt.loadPackage(e.path)) |json| {
-            rt.gpa.free(json);
+    var changed = false;
+    for (reg.extensions) |*e| {
+        const result = if (e.info) |info|
+            rt.registerPackage(arena, e.path, info)
+        else
+            rt.loadPackage(e.path);
+        if (result) |json| {
+            defer rt.gpa.free(json);
             loaded += 1;
+            // Entries recorded before `info` existed, or without source
+            // classes, were loaded eagerly; remember what that reported.
+            const known = if (e.info) |info| info == .object and info.object.contains("sourceClasses") else false;
+            if (!known) {
+                e.info = std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{}) catch null;
+                changed = changed or e.info != null;
+            }
         } else |err| {
             const msg = try std.fmt.allocPrint(arena, "{s}: {s}", .{ @errorName(err), tachi.lastError() });
             tachi.log(.warn, "restore: {s} failed: {s}", .{ e.pkg, msg });
             try failed.append(arena, .{ .pkg = e.pkg, .@"error" = msg });
         }
     }
+    if (changed) saveRegistry(rt, arena, reg) catch |err| tachi.log(.warn, "restore: registry not updated: {s}", .{@errorName(err)});
     return std.json.Stringify.valueAlloc(rt.gpa, RestoreResult{ .loaded = loaded, .failed = failed.items }, .{}) catch
         return error.OutOfMemory;
 }
