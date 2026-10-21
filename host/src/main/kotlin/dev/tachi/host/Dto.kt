@@ -127,7 +127,7 @@ data class PreferenceDto(
 )
 
 @Serializable
-data class ErrorDto(val type: String, val message: String?, val stack: String? = null)
+data class ErrorDto(val type: String, val message: String?, val stack: String? = null, val code: String? = null)
 
 // ---------------------------------------------------------------------------
 // Conversions

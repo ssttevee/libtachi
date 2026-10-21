@@ -50,6 +50,8 @@ pub const Error = jvm.Error || repo.Error || error{
     JavaException,
     /// The bridge returned `{"error": ...}`; see `lastError()`.
     ExtensionError,
+    /// The source requires browser verification that this host cannot perform.
+    BrowserVerificationRequired,
     InvalidResponse,
     /// The package is not listed in the repository index.
     ExtensionNotInRepo,
@@ -573,9 +575,10 @@ pub const Runtime = struct {
             if (try self.callStatic(env, .lastError, .{})) |e| {
                 const msg = try bytesFromArray(self.gpa, env, e);
                 defer self.gpa.free(msg);
-                if (!setErrorFromJson(self.gpa, msg)) setLastError(msg);
+                if (setErrorFromJson(self.gpa, msg)) |err| return err;
+                setLastError(msg);
             } else setLastError("fetchImage failed");
-            return error.ExtensionError;
+            return extensionFailure();
         };
         const bytes = try bytesFromArray(self.gpa, env, arr);
         errdefer self.gpa.free(bytes);
@@ -821,23 +824,35 @@ fn parseEnvelope(comptime T: type, gpa: std.mem.Allocator, reply: []const u8) Er
     };
     errdefer parsed.deinit();
     if (parsed.value.@"error") |e| {
-        setErrorInfo(e);
-        return error.ExtensionError;
+        return setErrorInfo(e);
     }
     if (parsed.value.ok == null) return error.InvalidResponse;
     return .{ .parsed = parsed };
 }
 
-fn setErrorInfo(e: models.ErrorInfo) void {
-    setLastErrorFmt("{s}: {s}", .{ e.type, e.message orelse "" });
+/// Classifies only the host's explicit unsupported Cloudflare solver failure.
+/// HTTP 403, source exceptions and unsuccessful registered solvers stay retryable.
+fn extensionFailure() Error {
+    const detail = lastError();
+    const exception = "eu.kanade.tachiyomi.network.interceptor.CloudflareBypassException: ";
+    if (std.mem.startsWith(u8, detail, exception) and
+        std.mem.startsWith(u8, detail[exception.len..], "Cloudflare challenge on ") and
+        std.mem.endsWith(u8, detail, "; no CloudflareSolver is registered with the tachi host."))
+        return error.BrowserVerificationRequired;
+    return error.ExtensionError;
 }
 
-/// Decodes an ErrorDto JSON blob into lastError. Returns false if it was not one.
-fn setErrorFromJson(gpa: std.mem.Allocator, json: []const u8) bool {
-    const parsed = std.json.parseFromSlice(models.ErrorInfo, gpa, json, models.parse_options) catch return false;
+fn setErrorInfo(e: models.ErrorInfo) Error {
+    setLastErrorFmt("{s}: {s}", .{ e.type, e.message orelse "" });
+    if (e.code) |code| if (std.mem.eql(u8, code, "browser_verification_required")) return error.BrowserVerificationRequired;
+    return extensionFailure();
+}
+
+/// Decodes an ErrorDto JSON blob into lastError and preserves its typed failure.
+fn setErrorFromJson(gpa: std.mem.Allocator, json: []const u8) ?Error {
+    const parsed = std.json.parseFromSlice(models.ErrorInfo, gpa, json, models.parse_options) catch return null;
     defer parsed.deinit();
-    setErrorInfo(parsed.value);
-    return true;
+    return setErrorInfo(parsed.value);
 }
 
 // ---- host jar discovery --------------------------------------------------------
@@ -1046,4 +1061,35 @@ test "operation cancellation requires the complete optional bridge lifecycle" {
         try std.testing.expect(!rt.supportsCancellation());
         rt.methods.set(method, @ptrFromInt(1));
     }
+}
+
+test "only an unsupported Cloudflare solver is browser verification required" {
+    const exception = "eu.kanade.tachiyomi.network.interceptor.CloudflareBypassException";
+    const message = "Cloudflare challenge on images.example; no CloudflareSolver is registered with the tachi host.";
+    const cases = .{
+        .{ exception, message, error.BrowserVerificationRequired },
+        .{ exception, "Cloudflare challenge on images.example could not be solved.", error.ExtensionError },
+        .{ "java.io.IOException", "HTTP error 403", error.ExtensionError },
+        .{ "java.io.IOException", message, error.ExtensionError },
+        .{ "other.CloudflareBypassException", message, error.ExtensionError },
+    };
+    inline for (cases) |case| {
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .@"error" = .{ .type = case[0], .message = case[1] } }, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(case[2], parseEnvelope(models.MangasPage, std.testing.allocator, json));
+        // fetchImage uses the same classifier after its out-of-band error DTO.
+        try std.testing.expectEqual(case[2], extensionFailure());
+        try std.testing.expect(std.mem.endsWith(u8, lastError(), case[1]));
+    }
+}
+
+test "wrapped host browser error code survives envelopes and image error DTOs" {
+    const dto = .{ .type = "java.io.IOException", .message = "Cloudflare challenge on images.example; no CloudflareSolver is registered with the tachi host.", .code = "browser_verification_required" };
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .@"error" = dto }, .{});
+    defer std.testing.allocator.free(envelope);
+    try std.testing.expectError(error.BrowserVerificationRequired, parseEnvelope(models.MangasPage, std.testing.allocator, envelope));
+    const image_error = try std.json.Stringify.valueAlloc(std.testing.allocator, dto, .{});
+    defer std.testing.allocator.free(image_error);
+    try std.testing.expectEqual(error.BrowserVerificationRequired, setErrorFromJson(std.testing.allocator, image_error).?);
+    try std.testing.expect(std.mem.startsWith(u8, lastError(), "java.io.IOException: Cloudflare challenge"));
 }

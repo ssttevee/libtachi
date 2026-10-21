@@ -1,6 +1,7 @@
 package dev.tachi.host
 
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.network.interceptor.CloudflareBypassException
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -156,15 +157,18 @@ object Bridge {
         return json.encodeToString(JsonObject.serializer(), result).toByteArray(Charsets.UTF_8)
     }
 
-    private fun Throwable.toErrorDto(): ErrorDto {
-        val root = generateSequence(this) { it.cause?.takeIf { c -> c !== it } }.last()
+    internal fun Throwable.toErrorDto(): ErrorDto {
+        val causes = generateSequence(this) { it.cause?.takeIf { c -> c !== it } }.toList()
+        val root = causes.last()
         val message = buildString {
             append(this@toErrorDto.message ?: this@toErrorDto.javaClass.simpleName)
             if (root !== this@toErrorDto && root.message != null && root.message != this@toErrorDto.message) {
                 append(" (caused by ").append(root.javaClass.simpleName).append(": ").append(root.message).append(')')
             }
         }
-        return ErrorDto(type = javaClass.name, message = message, stack = stackTraceToString())
+        val browserRequired = causes.any { it is CloudflareBypassException && it.browserVerificationRequired }
+        return ErrorDto(type = javaClass.name, message = message, stack = stackTraceToString(),
+            code = if (browserRequired) "browser_verification_required" else null)
     }
 
     private fun ByteArray.utf8() = String(this, Charsets.UTF_8)

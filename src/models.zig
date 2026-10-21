@@ -147,6 +147,7 @@ pub const ErrorInfo = struct {
     type: []const u8,
     message: ?[]const u8 = null,
     stack: ?[]const u8 = null,
+    code: ?[]const u8 = null,
 };
 
 /// Envelope every bridge call returns: exactly one of `ok` / `error` is set.

@@ -11,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-class CloudflareBypassException(message: String) : IOException(message)
+class CloudflareBypassException @JvmOverloads constructor(message: String, val browserVerificationRequired: Boolean = false) : IOException(message)
 
 /**
  * Something that can obtain a `cf_clearance` cookie for a URL, e.g. the host
@@ -44,6 +44,7 @@ class CloudflareInterceptor(
                 response.close()
                 throw CloudflareBypassException(
                     "Cloudflare challenge on ${request.url.host}; no CloudflareSolver is registered with the tachi host.",
+                    browserVerificationRequired = true,
                 )
             }
 

@@ -41,6 +41,7 @@ typedef enum tachi_error {
     TACHI_E_UNSUPPORTED_EXTENSION = 15,  /* extensions-lib version the host does not implement */
     TACHI_E_CANCELED = 16,
     TACHI_E_CONCURRENCY_UNAVAILABLE = 17,
+    TACHI_E_BROWSER_VERIFICATION_REQUIRED = 18, /* source needs an unsupported browser check */
 } tachi_error;
 
 /* Levels follow android.util.Log. */

@@ -8,6 +8,7 @@ const library = @import("library.zig");
 const models = @import("models.zig");
 const engine_mod = @import("engine.zig");
 const parallel = @import("parallel.zig");
+const tachi = @import("tachi.zig");
 const Engine = engine_mod.Engine;
 const Job = engine_mod.Job;
 
@@ -31,11 +32,17 @@ const Item = struct {
     source: i64 = 0,
     status: Status = .queued,
     failure: ?[]u8 = null,
+    browser_verification_required: bool = false,
     /// The download running now, for its page progress.
     job: ?*Job = null,
 };
 
-const Saved = struct { chapters: []const []const u8 = &.{} };
+const Blocked = struct { chapter_id: []const u8, failure: []const u8 };
+const Saved = struct {
+    chapters: []const []const u8 = &.{},
+    /// Only non-retryable failures survive restart; old queue files remain valid.
+    browser_verification_required: []const Blocked = &.{},
+};
 
 pub const Queue = struct {
     lock: std.atomic.Mutex = .unlocked,
@@ -102,6 +109,13 @@ pub const Queue = struct {
                 break :find;
             };
             try self.append(engine.gpa, id, source);
+            for (saved.browser_verification_required) |blocked| if (std.mem.eql(u8, id, blocked.chapter_id)) {
+                const item = &self.items.items[self.items.items.len - 1];
+                item.failure = try engine.gpa.dupe(u8, blocked.failure);
+                item.browser_verification_required = true;
+                item.status = .failed;
+                break;
+            };
         }
         self.loaded = true;
     }
@@ -115,7 +129,11 @@ pub const Queue = struct {
         for (self.items.items, ids) |item, *id| id.* = item.chapter_id;
         const file = try path(engine, a);
         try Io.Dir.cwd().createDirPath(engine.io, std.fs.path.dirname(file).?);
-        try library.writeJsonAtomic(a, engine.io, file, Saved{ .chapters = ids });
+        var blocked: std.ArrayList(Blocked) = .empty;
+        for (self.items.items) |item| if (item.browser_verification_required) {
+            try blocked.append(a, .{ .chapter_id = item.chapter_id, .failure = item.failure orelse "BrowserVerificationRequired" });
+        };
+        try library.writeJsonAtomic(a, engine.io, file, Saved{ .chapters = ids, .browser_verification_required = blocked.items });
     }
 
     /// Adds chapters, skipping those already downloaded, local or queued,
@@ -154,7 +172,7 @@ pub const Queue = struct {
         return added;
     }
 
-    /// Works through the queue in the background, retrying failed entries.
+    /// Works through the queue, retrying failures except unsupported browser verification.
     pub fn start(self: *Queue, engine: *Engine) !void {
         self.acquire();
         defer self.lock.unlock();
@@ -163,7 +181,7 @@ pub const Queue = struct {
     }
 
     fn startLocked(self: *Queue, engine: *Engine) !void {
-        for (self.items.items) |*item| if (item.status == .failed) {
+        for (self.items.items) |*item| if (item.status == .failed and !item.browser_verification_required) {
             item.status = .queued;
         };
         self.paused = false;
@@ -331,6 +349,7 @@ pub const Queue = struct {
             next.?.status = .downloading;
             next.?.job = &job;
             self.lock.unlock();
+            tachi.setLastError("");
             const outcome = if (enoughSpace(engine)) engine.downloadChapter(&job, id) else error.NotEnoughSpace;
             self.acquire();
             const index = for (self.items.items, 0..) |item, i| {
@@ -347,7 +366,15 @@ pub const Queue = struct {
                     else => {
                         item.status = .failed;
                         if (item.failure) |f| engine.gpa.free(f);
-                        item.failure = std.fmt.allocPrint(engine.gpa, "{s}", .{job.failure orelse @errorName(err)}) catch null;
+                        const detail = tachi.lastError();
+                        item.failure = (if (job.failure) |failure|
+                            engine.gpa.dupe(u8, failure)
+                        else if (detail.len > 0)
+                            std.fmt.allocPrint(engine.gpa, "{s}: {s}", .{ @errorName(err), detail })
+                        else
+                            engine.gpa.dupe(u8, @errorName(err))) catch null;
+                        item.browser_verification_required = err == error.BrowserVerificationRequired;
+                        self.persist(engine) catch |save_err| log.warn("download queue not saved: {s}", .{@errorName(save_err)});
                         log.warn("download {s}: {s}", .{ id, item.failure orelse @errorName(err) });
                     },
                 }
@@ -464,4 +491,71 @@ test "queue restoration retries a corrected file after a parse failure" {
     try t.expect(engine.queue.loaded);
     try t.expectEqual(1, engine.queue.items.items.len);
     try t.expectEqualStrings("recovered", engine.queue.items.items[0].chapter_id);
+}
+
+test "queue keeps browser-blocked failures actionable across starts and restoration" {
+    const t = std.testing;
+    const be = @import("backend.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const Fixture = struct {
+        attempts: std.atomic.Value(usize) = .init(0),
+        fn run(ptr: *anyopaque, _: std.mem.Allocator, _: be.Call, _: ?be.Status) !be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.attempts.fetchAdd(1, .acq_rel);
+            tachi.setLastError("Cloudflare challenge on images.example; no CloudflareSolver is registered with the tachi host.");
+            return error.BrowserVerificationRequired;
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+        fn wait(queue: *Queue) !void {
+            for (0..5000) |_| {
+                if (!queue.running()) return;
+                try t.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.QueueStuck;
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend: be.Backend = .{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .warm = Fixture.yes, .cancel = Fixture.none, .release = Fixture.none, .idle = Fixture.none } };
+    {
+        var engine: Engine = .init(t.allocator, t.io, backend, .{ .dir = root });
+        defer engine.deinit();
+        defer engine.queue.deinit(&engine);
+        try engine.store.save(a, .{ .manga = &.{.{ .id = "1:/m", .title = "M", .source_id = 1, .chapters = &.{ .{ .id = "1:/c", .title = "C", .remote = .{ .url = "/c", .name = "C" } }, .{ .id = "1:/c2", .title = "C2", .remote = .{ .url = "/c2", .name = "C2" } } } }} });
+        engine.setNetwork(.wifi);
+        _ = try engine.queue.enqueue(&engine, &.{"1:/c"}, true);
+        try Fixture.wait(&engine.queue);
+        var entries = try engine.queue.snapshot(&engine, a);
+        try t.expectEqual(Status.failed, entries[0].status);
+        try t.expect(std.mem.startsWith(u8, entries[0].failure.?, "BrowserVerificationRequired: Cloudflare challenge on images.example"));
+        try engine.queue.start(&engine);
+        try Fixture.wait(&engine.queue);
+        _ = try engine.queue.enqueue(&engine, &.{"1:/c"}, true);
+        try Fixture.wait(&engine.queue);
+        entries = try engine.queue.snapshot(&engine, a);
+        try t.expectEqual(Status.failed, entries[0].status);
+        try t.expectEqual(1, fixture.attempts.load(.acquire));
+        // New chapters still run, including ones from the blocked chapter's source.
+        _ = try engine.queue.enqueue(&engine, &.{"1:/c2"}, true);
+        try Fixture.wait(&engine.queue);
+        try t.expectEqual(2, fixture.attempts.load(.acquire));
+        try t.expectEqual(2, (try engine.queue.snapshot(&engine, a)).len);
+    }
+    var restored: Engine = .init(t.allocator, t.io, backend, .{ .dir = root });
+    defer restored.deinit();
+    defer restored.queue.deinit(&restored);
+    restored.setNetwork(.wifi);
+    try restored.queue.start(&restored);
+    try Fixture.wait(&restored.queue);
+    const entries = try restored.queue.snapshot(&restored, a);
+    try t.expectEqual(Status.failed, entries[0].status);
+    try t.expect(std.mem.indexOf(u8, entries[0].failure.?, "images.example") != null);
+    try t.expectEqual(2, fixture.attempts.load(.acquire));
 }

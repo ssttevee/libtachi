@@ -43,9 +43,16 @@ pub const Response = struct {
     extension: ?[]const u8 = null,
     reply: ?WireReply = null,
     failure: ?[]const u8 = null,
+    failure_code: ?enum { browser_verification_required } = null,
     /// The worker's resident memory when it sent this.
     rss_kib: usize = 0,
 };
+
+fn responseError(response: Response) tachi.Error {
+    tachi.setLastError(response.failure orelse "worker call failed");
+    if (response.failure_code == .browser_verification_required) return error.BrowserVerificationRequired;
+    return error.ExtensionError;
+}
 
 /// `be.Reply` with the image as base64, so frames stay valid JSON.
 pub const WireReply = struct {
@@ -459,8 +466,7 @@ pub const Client = struct {
                 },
                 .loading => if (status) |s| s.loading(s.context, response.extension),
                 .failure => {
-                    tachi.setLastError(response.failure orelse "worker call failed");
-                    return error.ExtensionError;
+                    return responseError(response);
                 },
                 .result => return (response.reply orelse return error.InvalidWorkerReply).reply(arena),
             }
@@ -594,6 +600,7 @@ const Job = struct {
     call: be.Call,
     reply: ?be.Reply = null,
     failure: ?[]const u8 = null,
+    failure_code: @FieldType(Response, "failure_code") = null,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     is_ready: std.atomic.Value(bool) = .init(false),
@@ -607,6 +614,7 @@ const Job = struct {
         defer self.done.store(true, .release);
         const status: be.Status = .{ .context = self, .starting = starting, .ready = isReady, .loading = loading };
         self.reply = self.runtime.run(self.arena.allocator(), self.call, status) catch |err| blk: {
+            self.failure_code = if (err == error.BrowserVerificationRequired) .browser_verification_required else null;
             self.failure = std.fmt.allocPrint(self.arena.allocator(), "{s}: {s}", .{ @errorName(err), tachi.lastError() }) catch "Operation failed (out of memory)";
             log.warn("{s}", .{self.failure.?});
             break :blk null;
@@ -656,7 +664,7 @@ fn serveLoop(gpa: std.mem.Allocator, runtime: *be.InProcess, options: ServeOptio
                 job.thread.?.join();
                 if (options.after_call) |after| after();
                 const reply: ?WireReply = if (job.reply) |r| try WireReply.from(job.arena.allocator(), r) else null;
-                try send(fd, gpa, Response{ .id = id, .kind = if (job.failure != null) .failure else .result, .failure = job.failure, .reply = reply, .rss_kib = tachi_rss_kib() });
+                try send(fd, gpa, Response{ .id = id, .kind = if (job.failure != null) .failure else .result, .failure = job.failure, .failure_code = job.failure_code, .reply = reply, .rss_kib = tachi_rss_kib() });
                 job.arena.deinit();
                 gpa.destroy(job);
                 active = null;
@@ -727,4 +735,16 @@ test "calls round-trip as JSON" {
     const parsed = try std.json.parseFromSliceLeaky(Command, a, json, parse_options);
     try std.testing.expectEqual(42, parsed.call.?.browse.source);
     try std.testing.expectEqualStrings("one piece", parsed.call.?.browse.kind.search.query);
+}
+
+test "worker failures preserve typed browser verification without guessing from diagnostics" {
+    const t = std.testing;
+    const diagnostic = "BrowserVerificationRequired: Cloudflare challenge on images.example";
+    const json = try std.json.Stringify.valueAlloc(t.allocator, Response{ .id = 1, .kind = .failure, .failure = diagnostic, .failure_code = .browser_verification_required }, .{});
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(Response, t.allocator, json, models.parse_options);
+    defer parsed.deinit();
+    try t.expectEqual(error.BrowserVerificationRequired, responseError(parsed.value));
+    try t.expectEqualStrings(diagnostic, tachi.lastError());
+    try t.expectEqual(error.ExtensionError, responseError(.{ .id = 1, .kind = .failure, .failure = diagnostic }));
 }

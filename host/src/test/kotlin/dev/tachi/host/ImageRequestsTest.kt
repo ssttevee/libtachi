@@ -4,6 +4,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
+import eu.kanade.tachiyomi.network.awaitSuccess
 import kotlinx.coroutines.runBlocking
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -59,8 +60,33 @@ object ImageRequestsTest {
         )
         override fun intercept(chain: Interceptor.Chain): Response = error("recognized limiter must not execute")
     }
+    private fun verifyBrowserChallengeErrors() {
+        // Exercise the actual interceptor and DTO conversion, including OkHttp/source wrappers.
+        val client = OkHttpClient.Builder()
+            .addInterceptor(eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor(
+                eu.kanade.tachiyomi.network.PersistentCookieJar(null), { "test" }))
+            .addInterceptor { chain -> Response.Builder().request(chain.request())
+                .protocol(Protocol.HTTP_1_1).code(403).message("Forbidden")
+                .header("Server", "cloudflare").body("challenge".toResponseBody()).build() }
+            .build()
+        val failure = runCatching { runBlocking { client.newCall(Request.Builder().url("https://images.example/page").build()).awaitSuccess() } }
+            .exceptionOrNull() ?: error("challenge should fail")
+        check(failure is java.io.IOException && failure.cause is eu.kanade.tachiyomi.network.interceptor.CloudflareBypassException)
+        val dto = Bridge.run { failure.toErrorDto() }
+        val wire = TachiRuntime.json.encodeToString(ErrorDto.serializer(), dto)
+        val decoded = TachiRuntime.json.decodeFromString(ErrorDto.serializer(), wire)
+        check(decoded.type == "java.io.IOException" && decoded.code == "browser_verification_required")
+        check(decoded.message!!.contains("images.example"))
+        // Neither generic HTTP rejection nor a solver that failed is unsupported verification.
+        check(Bridge.run { java.io.IOException("HTTP error 403").toErrorDto() }.code == null)
+        val solverFailed = eu.kanade.tachiyomi.network.interceptor.CloudflareBypassException("could not be solved")
+        check(Bridge.run { solverFailed.toErrorDto() }.code == null)
+        println("PASS: browser challenge errors retain typed code through wrappers and JSON")
+    }
+
     @JvmStatic fun main(args: Array<String>) {
         TachiRuntime.init(RuntimeConfig(dataDir = Files.createTempDirectory("tachi-plan-").toString()))
+        verifyBrowserChallengeErrors()
         val base = TachiRuntime.network.client
         native(plan(base))
         val jar = object : CookieJar {

@@ -417,7 +417,7 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
             var attempt: usize = 0;
             const transfer = while (true) : (attempt += 1) {
                 break fetcher.page(ctx.plan, i, &stats) catch |err| switch (err) {
-                    error.Canceled, error.OutOfMemory => return err,
+                    error.Canceled, error.OutOfMemory, error.BrowserVerificationRequired => return err,
                     else => {
                         if (attempt >= ctx.options.retry_ms.len or err == error.NeedsJvm) return err;
                         log.info("page {d}/{d} failed ({s}); retrying in {d} ms", .{ i + 1, ctx.plan.len, @errorName(err), ctx.options.retry_ms[attempt] });
@@ -967,4 +967,92 @@ test "JPEG 2000 downloads publish and resume with the canonical suffix" {
     const retry = try PageStore.init(a, io, root, "chapter", &.{});
     try std.testing.expectEqualStrings(relative, (try retry.complete(0)).?);
     try std.testing.expectEqualStrings(bytes, try Io.Dir.cwd().readFileAlloc(io, try store.absolute(relative), a, .limited(1024)));
+}
+
+test "unsupported browser verification skips page retries and keeps task diagnostics" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const Fixture = struct {
+        attempts: std.atomic.Value(usize) = .init(0),
+        failure: anyerror,
+        fn fetch(ptr: *anyopaque, _: std.mem.Allocator, _: ImageRequest, _: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.attempts.fetchAdd(1, .acq_rel);
+            tachi.setLastError("Cloudflare challenge on images.example");
+            return self.failure;
+        }
+    };
+    const plan: []const ImageRequest = &.{.{ .page = .{ .index = 0, .url = "/page" }, .url = "jvm://page", .method = "GET", .headers = &.{} }};
+    for ([_]anyerror{ error.BrowserVerificationRequired, error.ExtensionError }) |failure| {
+        var fixture: Fixture = .{ .failure = failure };
+        try t.expectError(failure, downloadChapter(t.allocator, a, t.io, plan, .{
+            .dir = root,
+            .chapter_id = @errorName(failure),
+            .retry_ms = &.{ 0, 0, 0 },
+            .fallback = .{ .context = &fixture, .fetch = Fixture.fetch },
+        }));
+        try t.expectEqual(@as(usize, if (failure == error.BrowserVerificationRequired) 1 else 4), fixture.attempts.load(.acquire));
+        try t.expectEqualStrings("Cloudflare challenge on images.example", tachi.lastError());
+    }
+}
+
+test "browser-blocked chapters cancel pending pages without losing completed pages or diagnostics" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const Fixture = struct {
+        saved: Io.Event = .unset,
+        pending: Io.Event = .unset,
+        canceled: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        fn fetch(ptr: *anyopaque, gpa: std.mem.Allocator, request: ImageRequest, _: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (request.page.index) {
+                0 => return gpa.dupe(u8, "\x89PNG\r\n\x1a\nsaved"),
+                1 => {
+                    try self.saved.wait(t.io);
+                    try self.pending.wait(t.io);
+                    tachi.setLastError("unsupported browser verification on images.example");
+                    return error.BrowserVerificationRequired;
+                },
+                else => {
+                    defer self.canceled.set(t.io);
+                    self.pending.set(t.io);
+                    try self.parked.wait(t.io);
+                    return error.Unexpected;
+                },
+            }
+        }
+        fn progress(_: *anyopaque, _: usize, _: usize) void {}
+        fn page(ptr: *anyopaque, _: usize, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.saved.set(t.io);
+        }
+    };
+    var fixture: Fixture = .{};
+    var plan: [3]ImageRequest = undefined;
+    for (&plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(a, "/{d}", .{i}) }, .url = "jvm://page", .method = "GET", .headers = &.{} };
+    try t.expectError(error.BrowserVerificationRequired, downloadChapter(t.allocator, a, t.io, &plan, .{
+        .dir = root,
+        .chapter_id = "blocked",
+        .parallelism = 2,
+        .retry_ms = &.{ 0, 0 },
+        .fallback = .{ .context = &fixture, .fetch = Fixture.fetch },
+        .progress = .{ .context = &fixture, .report = Fixture.progress, .page = Fixture.page },
+    }));
+    try t.expect(fixture.canceled.isSet());
+    try t.expectEqualStrings("unsupported browser verification on images.example", tachi.lastError());
+    const store = try PageStore.init(a, t.io, root, "blocked", &plan);
+    try t.expect(try store.complete(0) != null);
+    try t.expect(try store.complete(1) == null);
+    try t.expect(try store.complete(2) == null);
 }

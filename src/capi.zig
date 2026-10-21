@@ -58,6 +58,7 @@ pub const ErrorCode = enum(c_int) {
     unsupported_extension = 15,
     canceled = 16,
     concurrency_unavailable = 17,
+    browser_verification_required = 18,
 
     fn int(c: ErrorCode) c_int {
         return @backingInt(c);
@@ -77,6 +78,7 @@ fn mapError(err: tachi.Error) c_int {
         error.BridgeClassNotFound, error.BridgeMethodNotFound => .bridge_missing,
         error.JavaException => .java_exception,
         error.ExtensionError => .extension_error,
+        error.BrowserVerificationRequired => .browser_verification_required,
         error.InvalidResponse => .invalid_response,
         error.FileSystemError => .file_system_error,
         error.ExtensionNotInRepo => .extension_not_in_repo,
@@ -92,6 +94,7 @@ fn mapError(err: tachi.Error) c_int {
         // These errors already have a detailed runtime diagnostic.
         .java_exception,
         .extension_error,
+        .browser_verification_required,
         .invalid_response,
         .file_system_error,
         .extension_not_in_repo,
@@ -308,6 +311,7 @@ test "error mapping preserves runtime diagnostics only for detailed errors" {
         .{ error.BridgeMethodNotFound, ErrorCode.bridge_missing, false },
         .{ error.JavaException, ErrorCode.java_exception, true },
         .{ error.ExtensionError, ErrorCode.extension_error, true },
+        .{ error.BrowserVerificationRequired, ErrorCode.browser_verification_required, true },
         .{ error.InvalidResponse, ErrorCode.invalid_response, true },
         .{ error.FileSystemError, ErrorCode.file_system_error, true },
         .{ error.ExtensionNotInRepo, ErrorCode.extension_not_in_repo, true },
