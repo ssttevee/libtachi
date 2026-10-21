@@ -12,6 +12,8 @@ pub const Chapter = struct {
     title: []const u8,
     /// Downloaded or local page files, relative to the library directory.
     pages: []const []const u8 = &.{},
+    /// Last known page-list size, retained after downloaded files are deleted.
+    page_count: u32 = 0,
     /// The source's chapter, passed back to its extension unchanged.
     remote: ?models.Chapter = null,
     read: bool = false,
@@ -720,6 +722,7 @@ fn apply(arena: std.mem.Allocator, library: Library, manga: Manga, now: i64, pru
 fn updated(old: Chapter, new: Chapter) Chapter {
     var ch = new;
     if (ch.pages.len == 0) ch.pages = old.pages;
+    if (ch.page_count == 0) ch.page_count = if (ch.pages.len > 0) @intCast(ch.pages.len) else old.page_count;
     ch.read = old.read or new.read;
     ch.bookmark = old.bookmark or new.bookmark;
     if (new.last_page_read == 0) ch.last_page_read = old.last_page_read;
@@ -800,6 +803,24 @@ pub fn setPages(arena: std.mem.Allocator, library: Library, chapter_id: []const 
         if (!std.mem.eql(u8, ch.id, chapter_id)) continue;
         const chapters = try arena.dupe(Chapter, m.chapters);
         chapters[ci].pages = pages;
+        if (pages.len > 0) chapters[ci].page_count = @intCast(pages.len) else if (ch.pages.len > 0) chapters[ci].page_count = @intCast(ch.pages.len);
+        const titles = try arena.dupe(Manga, library.manga);
+        titles[mi].chapters = chapters;
+        var result = library;
+        result.manga = titles;
+        return result;
+    };
+    return null;
+}
+
+/// Remembers a source's page-list size without marking its cache as a download.
+pub fn setPageCount(arena: std.mem.Allocator, library: Library, chapter_id: []const u8, count: u32) !?Library {
+    if (count == 0) return null;
+    for (library.manga, 0..) |m, mi| for (m.chapters, 0..) |ch, ci| {
+        if (!std.mem.eql(u8, ch.id, chapter_id)) continue;
+        if (ch.page_count == count) return null;
+        const chapters = try arena.dupe(Chapter, m.chapters);
+        chapters[ci].page_count = count;
         const titles = try arena.dupe(Manga, library.manga);
         titles[mi].chapters = chapters;
         var result = library;
@@ -963,4 +984,30 @@ test "reading state lives in its own file and overlays the library" {
     // A full save keeps the reading state.
     try store.save(std.testing.allocator, loaded);
     try std.testing.expectEqual(9, (try store.load(a)).manga[0].chapters[1].last_page_read);
+}
+
+test "known chapter page totals survive deletion, metadata refresh and reload" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var store: Store = .{ .io = std.testing.io, .dir = dir };
+    var lib: Library = .{ .manga = &.{.{ .id = "m", .title = "M", .chapters = &.{.{ .id = "c", .title = "C", .pages = &.{ "downloads/1.png", "downloads/2.png", "downloads/3.png" } }} }} };
+    // Existing library files have pages but no explicit count yet.
+    lib = (try setPages(a, lib, "c", &.{})).?;
+    try std.testing.expectEqual(3, lib.manga[0].chapters[0].page_count);
+    const refreshed = updated(lib.manga[0].chapters[0], .{ .id = "c", .title = "Renamed" });
+    try std.testing.expectEqual(3, refreshed.page_count);
+    try store.save(a, lib);
+    const reopened = try store.load(a);
+    try std.testing.expectEqual(0, reopened.manga[0].chapters[0].pages.len);
+    try std.testing.expectEqual(3, reopened.manga[0].chapters[0].page_count);
+    lib = (try setPageCount(a, reopened, "c", 4)).?;
+    try std.testing.expectEqual(4, lib.manga[0].chapters[0].page_count);
+    try std.testing.expect((try setPageCount(a, lib, "c", 0)) == null);
+    try std.testing.expect((try setPageCount(a, lib, "c", 4)) == null);
+    lib = (try setPages(a, lib, "c", &.{ "downloads/new1.png", "downloads/new2.png" })).?;
+    try std.testing.expectEqual(2, lib.manga[0].chapters[0].page_count);
 }

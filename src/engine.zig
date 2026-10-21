@@ -723,6 +723,19 @@ pub const Engine = struct {
             break :blk fetched;
         };
         if (plan.len == 0) return error.EmptyChapter;
+        const Count = struct {
+            chapter_id: []const u8,
+            count: u32,
+            changed: *bool,
+            fn apply(value: @This(), arena: std.mem.Allocator, lib: library.Library) !?library.Library {
+                const next = try library.setPageCount(arena, lib, value.chapter_id, value.count);
+                value.changed.* = next != null;
+                return next;
+            }
+        };
+        var count_changed = false;
+        _ = try self.store.update(a, Count{ .chapter_id = chapter_id, .count = @intCast(plan.len), .changed = &count_changed }, Count.apply);
+        job.result.library_changed = count_changed;
         job.setPages(plan.len);
         const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
             .dir = self.options.dir,
@@ -738,7 +751,7 @@ pub const Engine = struct {
             .keep_going = true,
         });
         self.trimChapterCache(a, chapter_id) catch |err| log.warn("chapter cache not trimmed: {s}", .{@errorName(err)});
-        job.result = .{ .manga_id = found.manga.id, .pages = chapter.pages, .message = "Chapter ready" };
+        job.result = .{ .library_changed = count_changed, .manga_id = found.manga.id, .pages = chapter.pages, .message = "Chapter ready" };
     }
 
     /// A title's chapters as its chapter list flags show them.
@@ -3270,6 +3283,10 @@ test "engine reads a chapter online through the chapter cache" {
     const states = try read.pageStates(a);
     try std.testing.expect(states[0] == .ready and states[1] == .failed and states[2] == .ready);
     try std.testing.expectEqual(0, read.result.pages[1].len);
+    try std.testing.expect(read.result.library_changed);
+    const online_saved = (try engine.store.load(a)).manga[0].chapters[0];
+    try std.testing.expectEqual(3, online_saved.page_count);
+    try std.testing.expectEqual(0, online_saved.pages.len);
     read.deinit();
     try std.testing.expect(try engine.chapterCacheBytes() > 0);
 
@@ -3288,6 +3305,12 @@ test "engine reads a chapter online through the chapter cache" {
     try std.testing.expectEqual(3, fake.images.load(.acquire));
     try engine.clearChapterCache();
     try std.testing.expectEqual(0, try engine.chapterCacheBytes());
+    try engine.setProgress("7:/c", 1, false, 0);
+    try std.testing.expectEqual(1, try engine.deleteDownloads(&.{"7:/c"}));
+    const deleted = (try engine.store.load(a)).manga[0].chapters[0];
+    try std.testing.expectEqual(3, deleted.page_count);
+    try std.testing.expectEqual(0, deleted.pages.len);
+    try std.testing.expectEqual(1, deleted.last_page_read);
 }
 
 test "engine caches thumbnails and prefers a custom cover" {
