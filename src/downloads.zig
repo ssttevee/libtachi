@@ -333,6 +333,9 @@ pub const Progress = struct {
     report: *const fn (context: *anyopaque, done: usize, total: usize) void,
     /// Each page as it is saved: its index and path relative to the library directory.
     page: ?*const fn (context: *anyopaque, index: usize, path: []const u8) void = null,
+    /// A page is cached or has acquired a transfer slot. This may run on
+    /// concurrent page tasks; the callback must synchronize shared state.
+    dispatched: ?*const fn (context: *anyopaque) void = null,
     /// Each page that failed for good, with `keep_going`.
     failed: ?*const fn (context: *anyopaque, index: usize, err: anyerror) void = null,
 };
@@ -463,18 +466,24 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
         fn fetch(ctx: *@This(), scratch: std.mem.Allocator, i: usize) !Result {
             var page_store = ctx.store;
             page_store.arena = scratch;
-            if (try page_store.complete(i)) |path| return .{ .path = path, .stats = .{ .resumed = 1 } };
+            if (try page_store.complete(i)) |path| {
+                ctx.dispatched();
+                return .{ .path = path, .stats = .{ .resumed = 1 } };
+            }
             if (ctx.reuse) |original| {
                 var cached_store = original;
                 cached_store.arena = scratch;
                 if (try cached_store.complete(i)) |cached| {
                     const bytes = try Io.Dir.cwd().readFileAlloc(ctx.io, try std.fs.path.join(scratch, &.{ ctx.options.dir, cached }), ctx.gpa, .limited(max_image));
                     defer ctx.gpa.free(bytes);
-                    return .{ .path = try page_store.put(i, bytes), .stats = .{ .resumed = 1 } };
+                    const path = try page_store.put(i, bytes);
+                    ctx.dispatched();
+                    return .{ .path = path, .stats = .{ .resumed = 1 } };
                 }
             }
             if (ctx.options.scheduler) |scheduler| try scheduler.permits.wait(ctx.io);
             defer if (ctx.options.scheduler) |scheduler| scheduler.permits.post(ctx.io);
+            ctx.dispatched();
             var fetcher: Fetcher = .{ .gpa = ctx.gpa, .io = ctx.io, .store = page_store, .options = ctx.options, .client = ctx.client, .limiter = if (ctx.options.scheduler) |scheduler| &scheduler.limiter else ctx.limiter, .https = ctx.https };
             var stats: Stats = .{};
             var attempt: usize = 0;
@@ -494,6 +503,9 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
             stats.disk_ms = transfer.disk_ms;
             log.info("page {d}/{d} bytes={d} network_ms={d} head_ms={d} body_ms={d} disk_ms={d}", .{ i + 1, ctx.plan.len, transfer.bytes, transfer.network_ms, transfer.head_ms, transfer.network_ms - transfer.head_ms, transfer.disk_ms });
             return .{ .path = transfer.path, .stats = stats };
+        }
+        fn dispatched(ctx: *@This()) void {
+            if (ctx.options.progress) |progress| if (progress.dispatched) |report| report(progress.context);
         }
         fn publish(ctx: *@This(), index: usize, result: Result, _: *std.heap.ArenaAllocator) !void {
             const i = ctx.order[index];

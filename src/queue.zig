@@ -223,6 +223,7 @@ pub const Queue = struct {
     pub fn pause(self: *Queue, engine: *Engine) void {
         self.acquire();
         self.paused = true;
+        self.notify(engine.io);
         var runner = self.runner;
         self.runner = null;
         self.lock.unlock();
@@ -437,7 +438,18 @@ pub const Queue = struct {
                 if (!seen) distinct += 1;
             };
             const next = for (self.items.items) |*item| {
-                if (item.status != .queued or !item.prepared) continue;
+                if (item.status == .failed) continue;
+                // Later chapters may overlap a predecessor's tail only once
+                // every preceding page has a slot (or is already cached).
+                // Rebuild this admission order on every restart as well.
+                if (item.status == .downloading) {
+                    if (item.planning) break null;
+                    const job = item.job orelse break null;
+                    const total = job.pages_total.load(.acquire);
+                    if (total == 0 or job.pages_dispatched.load(.acquire) < total) break null;
+                    continue;
+                }
+                if (!item.prepared) break null;
                 var same: usize = 0;
                 for (self.items.items) |other| {
                     if (other.status == .downloading and !other.planning and other.source == item.source) same += 1;
@@ -460,6 +472,18 @@ pub const Queue = struct {
             defer engine.gpa.free(id);
             var job: Job = .{ .arena = .init(engine.gpa), .engine = engine, .request = .{ .download = id } };
             defer job.arena.deinit();
+            const Dispatch = struct {
+                queue: *Queue,
+                io: Io,
+                fn notify(ptr: *anyopaque) void {
+                    const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                    ctx.queue.acquire();
+                    defer ctx.queue.lock.unlock();
+                    ctx.queue.notify(ctx.io);
+                }
+            };
+            var dispatch: Dispatch = .{ .queue = self, .io = engine.io };
+            job.dispatch_notify = .{ .context = &dispatch, .notify = Dispatch.notify };
             next.?.status = .downloading;
             next.?.job = &job;
             self.lock.unlock();
@@ -1034,4 +1058,35 @@ test "clearing an unloaded queue discards persisted and orphan page plans" {
     try engine.queue.clear(&engine);
     try t.expectEqual(0, (try engine.queue.snapshot(&engine, a)).len);
     try t.expectError(error.FileNotFound, tmp.dir.openDir(t.io, "downloads/queued-plans", .{}));
+}
+
+test "restarted queue admits all earlier chapter pages before its successor" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var fixture: PipelineFixture = .{ .park_images = true };
+    var engine: Engine = .init(t.allocator, t.io, fixture.backend(), .{ .dir = dir, .parallelism = 2 });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    try PipelineFixture.setup(&engine, a);
+    _ = try engine.queue.enqueue(&engine, &.{ "1:/c1", "1:/c2" }, true);
+    try fixture.second_planned.wait(t.io);
+    engine.queue.pause(&engine);
+    try t.expectEqual(0, fixture.active.load(.acquire));
+    try engine.queue.start(&engine);
+    for (0..5000) |_| {
+        if (fixture.active.load(.acquire) == 2) break;
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // With both slots held by chapter one, chapter two must stay ready,
+    // rather than competing with its predecessor's final pending page.
+    const entries = try engine.queue.snapshot(&engine, a);
+    try t.expectEqual(Stage.downloading, entries[0].stage);
+    try t.expectEqual(Stage.pages_ready, entries[1].stage);
+    try t.expectEqual(0, entries[1].pages_done);
+    engine.queue.pause(&engine);
 }

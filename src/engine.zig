@@ -2693,7 +2693,7 @@ pub const Engine = struct {
             .parallelism = try self.pageParallelism(a),
             .scheduler = scheduler,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
-            .progress = .{ .context = job, .report = Job.reportPages },
+            .progress = .{ .context = job, .report = Job.reportPages, .dispatched = Job.reportDispatched },
             .reuse = if (use_sd) null else cache_pages,
         });
         const stored_pages = if (use_sd) blk: {
@@ -2817,6 +2817,9 @@ pub const Job = struct {
     /// A `read` job's pages so far; read them with `pageStates`.
     page_lock: std.atomic.Mutex = .unlocked,
     page_states: []PageState = &.{},
+    /// Queue admission progress counts cached pages and transfers with a slot.
+    pages_dispatched: std.atomic.Value(usize) = .init(0),
+    dispatch_notify: ?struct { context: *anyopaque, notify: *const fn (*anyopaque) void } = null,
     /// The source pages that need the JVM are fetched through.
     fallback_source: i64 = 0,
     /// A global search's results so far; read them with `searchResults`.
@@ -2940,6 +2943,12 @@ pub const Job = struct {
         while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.page_lock.unlock();
         if (index < self.page_states.len) self.page_states[index] = .{ .ready = path };
+    }
+
+    fn reportDispatched(context: *anyopaque) void {
+        const self: *Job = @ptrCast(@alignCast(context));
+        _ = self.pages_dispatched.fetchAdd(1, .acq_rel);
+        if (self.dispatch_notify) |callback| callback.notify(callback.context);
     }
 
     fn reportReady(context: *anyopaque, index: usize, path: []const u8) void {
