@@ -2675,8 +2675,6 @@ pub const Job = struct {
         return buf[0..n];
     }
 
-    /// Stops the job as soon as possible; it fails with `Canceled`. Pages a
-    /// download saved stay for a retry.
     /// A global search's results so far, in the order sources answered;
     /// valid until `deinit`.
     pub fn searchResults(self: *Job, arena: std.mem.Allocator) ![]SearchResult {
@@ -2685,6 +2683,9 @@ pub const Job = struct {
         return arena.dupe(SearchResult, self.search_partial.items);
     }
 
+    /// Cancels this job's Io task and waits for unwind. Foreign code must
+    /// cooperate, or use a worker backend for process termination. A completed
+    /// job can still succeed; downloaded pages remain available for a retry.
     pub fn cancel(self: *Job) void {
         // Backend waits translate this task's cancellation to its own JVM
         // operation (or worker). A backend-wide cancel could stop another job.

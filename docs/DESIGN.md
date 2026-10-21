@@ -118,20 +118,44 @@ host implements exactly the 1.6 surface (plus Mihon's harmless extras such as
 
 ### Threading
 
-HotSpot is thread-safe through JNI; each native thread that calls in is
-attached (as a daemon) on first use. Extension `suspend` functions run under
-`runBlocking` on the calling thread with `Dispatchers.IO` for network work,
-so a call blocks its caller and the host app provides its own concurrency
-(thread pool, one call per thread). PatchBukkit instead funnels everything
-through one JVM worker thread; that is unnecessary here because the host
-exposes no mutable game state, only request/response calls.
+HotSpot is thread-safe through JNI. `Runtime` accepts the embedder's `std.Io`
+and uses `Io.concurrent` to execute JNI bodies, with an `Io.Event` as the
+caller's cancellation point. Native execution threads attach as daemons and
+detach after each operation. Extension `suspend` functions use `runBlocking`
+with `Dispatchers.IO` and a parent coroutine job registered under a unique
+operation ID before execution starts.
+
+Canceling the caller's I/O task cancels that operation's coroutine job and
+its tracked HTTP calls, including calls whose response headers have already
+arrived. The native caller joins execution before returning `error.Canceled`;
+borrowed arguments and the runtime remain alive until Java has unwound. A
+successful result racing cancellation is released instead of returned.
+Image bytes, MIME metadata and diagnostics are collected on their execution
+thread and transferred back to the caller together.
+
+This is cooperative in-process cancellation. Java code that does not suspend,
+check its coroutine job or unblock when its HTTP call is canceled can delay
+completion indefinitely. JVM creation and arbitrary class loading cannot be
+forcibly interrupted through `std.Io`. The worker backend provides the stronger
+boundary: cancellation of its socket wait terminates the active worker, and
+its next call starts another. Canceling a call waiting for the worker lock
+leaves the active call alone.
+
+`Runtime.supportsCancellation()` reports whether the host implements the full
+operation lifecycle. Older host jars remain usable with synchronous JNI
+execution and a warning through the configured log callback. The supplied
+I/O implementation must support concurrency for the new bridge;
+`error.ConcurrencyUnavailable` reports when it cannot. Runtime destruction
+requires all calls to have finished.
 
 ### Error model
 
-The bridge never throws across JNI. Every reply is `{"ok":…}` or
+Normal bridge replies are `{"ok":…}` or
 `{"error":{type,message,stack}}`; the Zig layer converts that to
 `error.ExtensionError` + `tachi.lastError()`, and the C API to
-`TACHI_E_EXTENSION_ERROR` + `tachi_last_error()`. An exception that does
+`TACHI_E_EXTENSION_ERROR` + `tachi_last_error()`. Operation registration returns
+a primitive ID so native allocation failure cannot lose an already registered
+operation. An exception that does
 escape (bridge bug) is caught by `ExceptionCheck`, described via
 `Throwable.toString()`, and surfaced as `error.JavaException`.
 

@@ -11,9 +11,12 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 
 /**
- * The JNI surface. Every method is static, takes/returns UTF-8 byte arrays of
- * JSON, and never throws: results are wrapped as `{"ok": ...}` or
+ * The JNI surface. Methods are static and normally return UTF-8 JSON bytes:
+ * results are wrapped as `{"ok": ...}` or
  * `{"error": {"type", "message", "stack"}}`.
+ *
+ * beginOperation returns a primitive Long so registration cannot lose its ID
+ * to a native allocation failure. The native side checks JNI exceptions.
  *
  * Signatures (for RegisterNatives / GetStaticMethodID):
  *   init([B)[B   install([B)[B   uninstall([B)[B   listExtensions()[B

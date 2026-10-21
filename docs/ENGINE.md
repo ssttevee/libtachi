@@ -52,6 +52,35 @@ before the operation itself; `pages_done` / `pages_total` give progress.
 `Engine.pause` cancels extension work and refuses new jobs, for an app going
 to the background; `resume` undoes it.
 
+## Cancellation
+
+`job.cancel()` cancels that job's `std.Io` task and waits for it to finish.
+For in-process JVM calls, the runtime translates cancellation to the matching
+Kotlin coroutine job and HTTP calls. Other engine jobs keep running. A job
+that finishes before cancellation is observed can still succeed; inspect
+`job.failure` after cancellation or joining. The operation need not be on the
+network to observe cancellation: suspending source procedures inherit the
+same coroutine job.
+
+The runtime retains arguments, JNI references and result buffers until foreign
+execution has unwound. In-process extension code that ignores coroutine
+cancellation and does not unblock on HTTP cancellation can therefore delay
+`cancel()` indefinitely. Use `worker.Client` when uncooperative extension
+code must be stopped: it terminates the active worker on cancellation, and
+starts another for the next call. Canceling a queued worker request does not
+terminate a different request already running.
+
+`Engine.pause()` and `Backend.cancel()` remain broad administrative controls.
+`Runtime.cancelRequests(source_id)` explicitly cancels a source client's HTTP
+requests; it is not the per-operation cancellation API. Custom backends should
+observe their caller's `std.Io` cancellation and propagate `error.Canceled`.
+
+The same cancellation contract is available without the engine. Run a runtime
+call in an `Io.concurrent` task using the `Io` supplied to `Runtime.init`, then
+cancel that future. `Runtime.supportsCancellation()` is false for older host
+jars; these retain synchronous JNI behavior. All outstanding calls must be
+joined before destroying a runtime.
+
 ## Views
 
 Pure functions over the stored library (`views.zig`), wrapped by the engine

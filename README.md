@@ -65,6 +65,7 @@ zig build             # zig-out/lib/libtachi.{a,dylib|so}, zig-out/lib/tachi-hos
                       # zig-out/include/tachi.h, zig-out/bin/tachi-cli
 zig build host        # only the jar (Gradle, ~1 min the first time)
 zig build test        # no Gradle unless -Dembed-host-jar
+zig build test-jvm    # opt-in real-JVM cancellation, isolation and worker recovery tests
 
 # For distribution: bake the jar into the library and CLI so they are the only
 # files to ship (plus a JDK). It is written to the cache dir on first run.
@@ -137,6 +138,25 @@ for (popular.value().mangas) |m| std.debug.print("{s}\n", .{m.title});
 const img = try rt.fetchImage(id, "{\"index\":0,\"imageUrl\":\"https://...\"}");
 defer img.deinit(gpa);
 ```
+
+`std.Io` is also the cancellation interface for JVM calls. Using the same
+`io` passed to `Runtime.init`:
+
+```zig
+var operation = try io.concurrent(tachi.Runtime.call, .{ rt, id, "popular", "{\"page\":1}" });
+const outcome = operation.cancel(io); // requests cancellation and waits for unwind
+if (outcome) |bytes| {
+    gpa.free(bytes); // completion can race cancellation
+} else |err| {
+    if (err != error.Canceled) return err;
+}
+```
+
+With the current host jar, each call has its own coroutine job and HTTP
+cancellation scope. `rt.supportsCancellation()` detects support; older jars
+retain synchronous behavior. In-process cancellation is cooperative and waits
+for Java to unwind. Use `worker.Client` to stop uncooperative extensions;
+see [engine cancellation](docs/ENGINE.md#cancellation).
 
 Add it as a dependency with `zig fetch --save <url>` and
 `exe.root_module.addImport("tachi", dep.module("tachi"))`.

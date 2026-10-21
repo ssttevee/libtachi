@@ -90,12 +90,14 @@ pub const Backend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Runs `call` and returns its reply, allocated in `arena`.
+        /// Runs in the caller's Io task; propagate error.Canceled when that task
+        /// is canceled. Foreign work must unwind before releasing its borrowed inputs.
+        /// Returns a reply allocated in `arena`.
         run: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, call: Call, status: ?Status) anyerror!Reply,
         /// Whether a call would run without starting the JVM first.
         warm: *const fn (ptr: *anyopaque) bool,
-        /// Interrupts calls running on other threads, as promptly as the
-        /// backend can. They then fail.
+        /// Backend-wide administrative cancellation, for pause/shutdown.
+        /// Cancel an individual job through its Io task instead.
         cancel: *const fn (ptr: *anyopaque) void,
         /// The caller has no extension work for now: a helper process may exit
         /// to give its memory back. The next call starts it again.
