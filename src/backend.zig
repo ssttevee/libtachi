@@ -313,7 +313,7 @@ const ActiveSources = struct {
         defer self.lock.unlock(io);
         var link = self.list.first;
         while (link) |node| : (link = node.next) {
-            const entry: *Entry = @fieldParentPtr("link", node);
+            const entry: *Entry = @alignCast(@fieldParentPtr("link", node));
             callback(context, entry.source);
         }
     }
