@@ -188,6 +188,10 @@ pub const Options = struct {
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
     release_jvm: bool = true,
+    /// Removable storage root; pages use the persistent `sdcard/` namespace.
+    sd_dir: ?[]const u8 = null,
+    /// Require this mount point to be mounted before accessing removable storage.
+    sd_mount: ?[]const u8 = null,
     /// Native tracking adapter; no extension runtime is started by tracking.
     tracker_driver: ?tracking.Driver = null,
     /// The user's offset from UTC in seconds, for "today" in update
@@ -222,7 +226,7 @@ pub const Engine = struct {
     drivers: track_drivers.Drivers,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, backend: be.Backend, options: Options) Engine {
-        return .{ .gpa = gpa, .io = io, .backend = backend, .store = .{ .io = io, .dir = options.dir }, .options = options, .drivers = .init(gpa, io, options.ca_file, options.host_dir orelse options.dir) };
+        return .{ .gpa = gpa, .io = io, .backend = backend, .store = .{ .io = io, .dir = options.dir, .sd_dir = options.sd_dir }, .options = options, .drivers = .init(gpa, io, options.ca_file, options.host_dir orelse options.dir) };
     }
 
     /// Frees what the tracking services hold. Stop the queue first
@@ -238,7 +242,34 @@ pub const Engine = struct {
 
     /// Absolute path of a page file the library refers to.
     pub fn pagePath(self: *Engine, gpa: std.mem.Allocator, relative: []const u8) ![:0]u8 {
+        if (std.mem.startsWith(u8, relative, "sdcard/") and !self.sdAvailable()) return error.StorageUnavailable;
         return self.store.pagePath(gpa, relative);
+    }
+
+    /// Whether the configured SD volume is present; never create a missing mount.
+    pub fn sdAvailable(self: *Engine) bool {
+        const dir = self.options.sd_dir orelse return false;
+        if (self.options.sd_mount) |mount| {
+            const bytes = Io.Dir.cwd().readFileAlloc(self.io, "/proc/mounts", self.gpa, .limited(1 << 20)) catch return false;
+            defer self.gpa.free(bytes);
+            var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+            while (lines.next()) |line| {
+                var fields = std.mem.tokenizeScalar(u8, line, ' ');
+                _ = fields.next() orelse continue;
+                if (std.mem.eql(u8, fields.next() orelse continue, mount)) return true;
+            }
+            return false;
+        }
+        var parent = Io.Dir.cwd().openDir(self.io, std.fs.path.dirname(dir) orelse return false, .{}) catch return false;
+        parent.close(self.io);
+        return true;
+    }
+
+    /// Saved pages from the current resumable plan, including another destination.
+    pub fn downloadProgress(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !?downloads.ResumeProgress {
+        if (try downloads.resumeProgress(a, self.io, self.options.dir, "downloads", chapter_id)) |p| return p;
+        if (self.sdAvailable()) if (try downloads.resumeProgress(a, self.io, self.options.sd_dir.?, "downloads", chapter_id)) |p| return p;
+        return null;
     }
 
     /// Records the page shown in a chapter, marks it read once requested,
@@ -1068,6 +1099,23 @@ pub const Engine = struct {
 
     /// Takes chapters out of the download queue and deletes their files.
     fn removeDownloads(self: *Engine, a: std.mem.Allocator, chapter_ids: []const []const u8) !usize {
+        const initial = try self.store.load(a);
+        var partial: usize = 0;
+        for (chapter_ids) |id| {
+            const found = findChapter(initial, id) orelse continue;
+            if (found.manga.local()) continue;
+            if (try self.savedDownloadDestination(a, id)) |destination| {
+                if (destination.sd_card and !self.sdAvailable()) return error.StorageUnavailable;
+            }
+            if (!found.chapter.downloaded() and try self.downloadProgress(a, id) != null) partial += 1;
+        }
+        if (!self.sdAvailable()) {
+            const lib = initial;
+            for (lib.manga) |m| for (m.chapters) |ch| {
+                if (!contains(chapter_ids, ch.id)) continue;
+                for (ch.pages) |page| if (std.mem.startsWith(u8, page, "sdcard/")) return error.StorageUnavailable;
+            };
+        }
         for (chapter_ids) |id| try self.queue.remove(self, id);
         const Edit = struct {
             ids: []const []const u8,
@@ -1093,7 +1141,8 @@ pub const Engine = struct {
             // A page inside an archive goes with the archive.
             const file = page[0 .. std.mem.indexOfScalar(u8, page, '#') orelse page.len];
             if (!library.safePath(file)) continue;
-            const path = try std.fs.path.join(a, &.{ self.options.dir, file });
+            if (std.mem.startsWith(u8, file, "sdcard/") and !self.sdAvailable()) return error.StorageUnavailable;
+            const path = try self.store.pagePath(a, file);
             Io.Dir.cwd().deleteFile(self.io, path) catch {};
             const dir = std.fs.path.dirname(path) orelse continue;
             if (last_dir == null or !std.mem.eql(u8, last_dir.?, dir)) {
@@ -1102,7 +1151,15 @@ pub const Engine = struct {
             }
         }
         if (last_dir) |d| self.removeEmptyDirs(d);
-        return deleted;
+        for (chapter_ids) |id| {
+            const found = findChapter(initial, id) orelse continue;
+            if (found.manga.local()) continue;
+            const folder = try std.fmt.allocPrint(a, "downloads/{x}", .{std.hash.Wyhash.hash(0, id)});
+            // Partial pages have not reached the library yet; delete their plans too.
+            try Io.Dir.cwd().deleteTree(self.io, try std.fs.path.join(a, &.{ self.options.dir, folder }));
+            if (self.sdAvailable()) try Io.Dir.cwd().deleteTree(self.io, try std.fs.path.join(a, &.{ self.options.sd_dir.?, folder }));
+        }
+        return deleted + partial;
     }
 
     /// Removes `dir` and its parent if they are empty, stopping at `downloads`.
@@ -2502,15 +2559,49 @@ pub const Engine = struct {
         };
     }
 
+    const DownloadDestination = struct { sd_card: bool };
+
+    fn downloadDestinationPath(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}/downloads/{x}/destination.json", .{ self.options.dir, std.hash.Wyhash.hash(0, chapter_id) });
+    }
+
+    fn savedDownloadDestination(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !?DownloadDestination {
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, try self.downloadDestinationPath(a, chapter_id), a, .limited(4096)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try std.json.parseFromSliceLeaky(DownloadDestination, a, bytes, models.parse_options);
+    }
+
+    pub const DownloadTarget = struct { dir: []const u8, sd_card: bool };
+
+    /// The destination of a queued or foreground download, including its original volume.
+    pub fn downloadTarget(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !DownloadTarget {
+        const settings_value = try self.loadSettings(a);
+        // Resume an existing partial download on its original volume.
+        const internal_partial = try downloads.resumeProgress(a, self.io, self.options.dir, "downloads", chapter_id);
+        const sd_partial = if (self.sdAvailable()) try downloads.resumeProgress(a, self.io, self.options.sd_dir.?, "downloads", chapter_id) else null;
+        const saved_destination = try self.savedDownloadDestination(a, chapter_id);
+        const use_sd = if (saved_destination) |saved| saved.sd_card else if (internal_partial != null) false else if (sd_partial != null) true else settings_value.downloads.storage == .sd_card;
+        if (use_sd and !self.sdAvailable()) return error.StorageUnavailable;
+        return .{ .dir = if (use_sd) self.options.sd_dir.? else self.options.dir, .sd_card = use_sd };
+    }
+
     /// Downloads a library chapter for `job`, resuming saved pages, and
     /// records its pages in the library.
     pub fn downloadChapter(self: *Engine, job: *Job, chapter_id: []const u8) !void {
         const a = job.arena.allocator();
         const chapter_started = millis(self.io);
+        const target = try self.downloadTarget(a, chapter_id);
+        const use_sd = target.sd_card;
+        const destination_file = try self.downloadDestinationPath(a, chapter_id);
         const current = try self.store.load(a);
         const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
         const source = found.manga.source_id orelse return error.LocalChapter;
         const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
+        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(destination_file).?);
+        // Keep the original target even when a removable card disappears before retry.
+        try library.writeJsonAtomic(a, self.io, destination_file, DownloadDestination{ .sd_card = use_sd });
         job.fallback_source = source;
         const plan = (job.call(.{ .image_requests = .{ .source = source, .chapter = remote } }) catch |err| {
             if (err == error.ExtensionError and std.mem.endsWith(u8, tachi.lastError(), "HTTP error 404")) {
@@ -2526,14 +2617,19 @@ pub const Engine = struct {
         defer if (self.options.release_jvm) self.backend.release();
         job.pages_total.store(plan.len, .release);
         const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
-            .dir = self.options.dir,
+            .dir = target.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
             .parallelism = try self.pageParallelism(a),
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages },
-            .reuse = cache_pages,
+            .reuse = if (use_sd) null else cache_pages,
         });
+        const stored_pages = if (use_sd) blk: {
+            const pages = try a.alloc([]const u8, chapter.pages.len);
+            for (chapter.pages, pages) |page, *stored| stored.* = try std.fmt.allocPrint(a, "sdcard/{s}", .{page});
+            break :blk pages;
+        } else chapter.pages;
         const s = chapter.stats;
         log.info("chapter pages={d}/{d} resumed={d} native={d} bytes={d} network_ms={d} disk_ms={d} elapsed_ms={d} planning_ms={d} worker_start_ms={d} total_elapsed_ms={d}", .{ job.pages_done.load(.acquire), plan.len, s.resumed, s.native, s.bytes, s.network_ms, s.disk_ms, s.elapsed_ms, planning_ms, job.start_ms, millis(self.io) - chapter_started });
         const Edit = struct {
@@ -2543,7 +2639,7 @@ pub const Engine = struct {
                 return library.setPages(arena, lib, edit.id, edit.pages);
             }
         };
-        _ = try self.store.update(a, Edit{ .id = chapter_id, .pages = chapter.pages }, Edit.apply);
+        _ = try self.store.update(a, Edit{ .id = chapter_id, .pages = stored_pages }, Edit.apply);
         job.result = .{ .library_changed = true, .manga_id = found.manga.id, .message = "Chapter downloaded" };
     }
 };
@@ -3922,4 +4018,100 @@ test "reader and downloader honor page preferences within the engine concurrency
         try std.testing.expectEqual(case.expected, fixture.peak.load(.acquire));
         try std.testing.expectEqual(2, job.pages_done.load(.acquire));
     }
+}
+
+test "SD downloads retain their volume when resuming and delete through the SD resolver" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const sd = try std.fs.path.join(a, &.{ dir, "sd", "pocketmanga" });
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(sd).?);
+    const Fixture = struct {
+        const plan: []const models.ImageRequest = &.{
+            .{ .page = .{ .index = 0, .url = "/page" }, .url = "http://unused/page", .method = "GET", .headers = &.{}, .fallback = "fixture" },
+        };
+        images: usize = 0,
+        fn run(ptr: *anyopaque, scratch: std.mem.Allocator, call: be.Call, _: ?be.Status) !be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return switch (call) {
+                .image_requests => .{ .image_requests = plan },
+                .image => blk: {
+                    self.images += 1;
+                    break :blk .{ .image = try scratch.dupe(u8, "\x89PNG\r\n\x1a\nfixture-page") };
+                },
+                else => error.Unexpected,
+            };
+        }
+        fn warm(_: *anyopaque) bool {
+            return true;
+        }
+        fn quiet(_: *anyopaque) void {}
+    };
+    var fixture: Fixture = .{};
+    var engine: Engine = .init(a, io, .{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .warm = Fixture.warm, .cancel = Fixture.quiet, .release = Fixture.quiet, .idle = Fixture.quiet } }, .{ .dir = dir, .sd_dir = sd, .release_jvm = false });
+    const initial: library.Library = .{ .manga = &.{.{ .id = "m", .title = "M", .source_id = 1, .chapters = &.{.{ .id = "c", .title = "C", .remote = .{ .url = "/c", .name = "C" } }} }} };
+    try engine.store.save(a, initial);
+    var prefs: settings.Settings = .{};
+    prefs.downloads.storage = .sd_card;
+    try prefs.save(a, io, dir);
+    try std.testing.expectEqualStrings(sd, (try engine.downloadTarget(a, "c")).dir);
+    var job: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "c" } };
+    try engine.downloadChapter(&job, "c");
+    const downloaded = try engine.store.load(a);
+    const relative = downloaded.manga[0].chapters[0].pages[0];
+    try std.testing.expect(std.mem.startsWith(u8, relative, "sdcard/downloads/"));
+    const absolute = try engine.pagePath(a, relative);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, absolute, a, .limited(1024));
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "\x89PNG"));
+    try std.testing.expectEqual(1, fixture.images);
+    // Recreate an interrupted chapter while keeping the saved page and manifest.
+    try engine.store.save(a, initial);
+    prefs.downloads.storage = .internal;
+    try prefs.save(a, io, dir);
+    engine.options.sd_dir = null;
+    var unplugged: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "c" } };
+    try std.testing.expectError(error.StorageUnavailable, engine.downloadTarget(a, "c"));
+    try std.testing.expectError(error.StorageUnavailable, engine.downloadChapter(&unplugged, "c"));
+    try std.testing.expectEqual(1, fixture.images);
+    try std.testing.expectError(error.StorageUnavailable, engine.removeDownloads(a, &.{"c"}));
+    try std.testing.expect((try engine.savedDownloadDestination(a, "c")).?.sd_card);
+    engine.options.sd_dir = sd;
+    var retry: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "c" } };
+    try engine.downloadChapter(&retry, "c");
+    try std.testing.expectEqual(1, fixture.images);
+    try std.testing.expect(std.mem.startsWith(u8, (try engine.store.load(a)).manga[0].chapters[0].pages[0], "sdcard/"));
+    // A removed card must preserve the library record when deletion is requested.
+    engine.options.sd_dir = null;
+    try std.testing.expectError(error.StorageUnavailable, engine.removeDownloads(a, &.{"c"}));
+    try std.testing.expectEqual(1, (try engine.store.load(a)).manga[0].chapters[0].pages.len);
+    engine.options.sd_dir = sd;
+    try std.testing.expectEqual(1, try engine.removeDownloads(a, &.{"c"}));
+    try std.testing.expectEqual(0, (try engine.store.load(a)).manga[0].chapters[0].pages.len);
+    try std.testing.expect(try downloads.resumeProgress(a, io, sd, "downloads", "c") == null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(io, absolute, .{}));
+    // The newly selected destination applies after explicit deletion.
+    var fresh: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "c" } };
+    try engine.downloadChapter(&fresh, "c");
+    try std.testing.expect(!std.mem.startsWith(u8, (try engine.store.load(a)).manga[0].chapters[0].pages[0], "sdcard/"));
+    prefs.downloads.storage = .sd_card;
+    try prefs.save(a, io, dir);
+    try engine.store.save(a, initial);
+    try downloads.clearResumeProgress(a, io, dir, "downloads", "c");
+    try Io.Dir.cwd().deleteFile(io, try engine.downloadDestinationPath(a, "c"));
+    engine.options.sd_dir = null;
+    var missing: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "c" } };
+    try std.testing.expectError(error.StorageUnavailable, engine.downloadChapter(&missing, "c"));
+    try std.testing.expectEqualStrings("C", (try engine.store.load(a)).manga[0].chapters[0].title);
+    // The old internal page is now a partial download: delete files and its manifest.
+    const partial_store = try downloads.PageStore.init(a, io, dir, "c", Fixture.plan);
+    _ = try partial_store.put(0, "\x89PNG\r\n\x1a\npartial-page");
+    const manifest = try std.fmt.allocPrint(a, "{s}/downloads/{x}/current-plan.json", .{ dir, std.hash.Wyhash.hash(0, "c") });
+    try library.writeJsonAtomic(a, io, manifest, .{ .plan = std.fs.path.basename(partial_store.folder), .total = 1 });
+    try std.testing.expectEqual(1, try engine.removeDownloads(a, &.{"c"}));
+    try std.testing.expect(try engine.downloadProgress(a, "c") == null);
+    try std.testing.expect(try partial_store.complete(0) == null);
 }

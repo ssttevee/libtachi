@@ -246,6 +246,8 @@ pub const Store = struct {
     io: Io,
     /// The library directory; page paths are relative to it.
     dir: []const u8,
+    /// Optional removable storage root. `sdcard/` page paths resolve here.
+    sd_dir: ?[]const u8 = null,
     mutex: Io.Mutex = .init,
 
     pub const file_name = "library.json";
@@ -380,6 +382,10 @@ pub const Store = struct {
     /// Absolute path of a page file the library refers to.
     pub fn pagePath(self: *const Store, gpa: std.mem.Allocator, relative: []const u8) ![:0]u8 {
         if (!safePath(relative)) return error.UnsafePagePath;
+        if (std.mem.startsWith(u8, relative, "sdcard/")) {
+            const dir = self.sd_dir orelse return error.StorageUnavailable;
+            return @import("archive.zig").pagePath(gpa, self.io, dir, relative["sdcard/".len..]);
+        }
         return @import("archive.zig").pagePath(gpa, self.io, self.dir, relative);
     }
 };

@@ -352,7 +352,10 @@ pub const Queue = struct {
             next.?.job = &job;
             self.lock.unlock();
             tachi.setLastError("");
-            const outcome = if (enoughSpace(engine)) engine.downloadChapter(&job, id) else error.NotEnoughSpace;
+            const outcome: anyerror!void = blk: {
+                const enough = enoughSpace(engine, id) catch |err| break :blk err;
+                break :blk if (enough) engine.downloadChapter(&job, id) else error.NotEnoughSpace;
+            };
             self.acquire();
             const index = for (self.items.items, 0..) |item, i| {
                 if (std.mem.eql(u8, item.chapter_id, id)) break i;
@@ -395,10 +398,18 @@ pub const Queue = struct {
 
     /// Mihon refuses to start a chapter with less than 200 MiB free; an
     /// unknown amount doesn't stop it.
-    fn enoughSpace(engine: *Engine) bool {
+    fn enoughSpace(engine: *Engine, chapter_id: []const u8) !bool {
+        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+        defer arena.deinit();
+        const target = try engine.downloadTarget(arena.allocator(), chapter_id);
         var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-        const dir = std.fmt.bufPrintSentinel(&buf, "{s}", .{engine.options.dir}, 0) catch return true;
-        const free = @import("worker.zig").tachi_free_bytes(dir.ptr);
+        const dir = std.fmt.bufPrintSentinel(&buf, "{s}", .{target.dir}, 0) catch return true;
+        var free = @import("worker.zig").tachi_free_bytes(dir.ptr);
+        // The app directory may not exist on a newly inserted card yet.
+        if (free < 0) if (std.fs.path.dirname(target.dir)) |parent| {
+            const mounted = std.fmt.bufPrintSentinel(&buf, "{s}", .{parent}, 0) catch return true;
+            free = @import("worker.zig").tachi_free_bytes(mounted.ptr);
+        };
         return free < 0 or free >= min_free_bytes;
     }
 
@@ -578,4 +589,18 @@ test "queue snapshots report worker phases before the page list is known" {
         try std.testing.expectEqual(phase, snapshot[0].phase);
         try std.testing.expectEqual(0, snapshot[0].pages_total);
     }
+}
+
+test "queue capacity checks preserve an unavailable SD target error" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var engine: Engine = .init(a, std.testing.io, @import("backend.zig").none, .{ .dir = dir });
+    var prefs: @import("settings.zig").Settings = .{};
+    prefs.downloads.storage = .sd_card;
+    try prefs.save(a, std.testing.io, dir);
+    try std.testing.expectError(error.StorageUnavailable, Queue.enoughSpace(&engine, "chapter"));
 }

@@ -63,6 +63,8 @@ pub const Settings = struct {
     };
 
     pub const Downloads = struct {
+        /// Destination for new chapter downloads; existing pages retain their location.
+        storage: enum { internal, sd_card } = .internal,
         /// Download new chapters a library update finds (`download_new`).
         new_chapters: bool = false,
         /// ...unless a chapter with the same number was read (`download_new_unread_chapters_only`).
