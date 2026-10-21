@@ -100,7 +100,11 @@ pub fn pagePath(gpa: std.mem.Allocator, io: Io, dir: []const u8, relative: []con
     const stat = try Io.Dir.cwd().statFile(io, path, .{});
     var hash = std.hash.Wyhash.init(0);
     hash.update(relative[0..separator]);
-    hash.update(std.mem.asBytes(&stat.mtime.nanoseconds));
+    // i96 has native padding. A canonical representation keeps an unchanged
+    // archive's extraction path stable across calls and process restarts.
+    var timestamp: [12]u8 = undefined;
+    std.mem.writeInt(i96, &timestamp, stat.mtime.nanoseconds, .little);
+    hash.update(&timestamp);
     const entries = try readSelected(a, io, path, "", false);
     for (entries, 0..) |e, i| {
         if (!std.mem.eql(u8, e.name, relative[separator + 1 ..])) continue;
@@ -189,12 +193,18 @@ test "deflated ZIP pages and cache invalidation" {
     const bytes = "\x50\x4b\x03\x04\x14\x00\x00\x00\x08\x00\x72\x1e\x54\x5d\x92\xb8\xc4\x2c\x12\x00\x00\x00\x82\x00\x00\x00\x07\x00\x00\x00\x30\x30\x31\x2e\x70\x6e\x67\x4b\x49\x4d\xcb\x49\x2c\x49\x4d\x51\x28\x48\x4c\x4f\x4d\x19\x08\x0e\x00\x50\x4b\x01\x02\x14\x03\x14\x00\x00\x00\x08\x00\x72\x1e\x54\x5d\x92\xb8\xc4\x2c\x12\x00\x00\x00\x82\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x30\x30\x31\x2e\x70\x6e\x67\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x35\x00\x00\x00\x37\x00\x00\x00\x00\x00";
     try tmp.dir.writeFile(io, .{ .sub_path = "chapter.cbz", .data = bytes });
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const file = try tmp.dir.openFile(io, "chapter.cbz", .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 0 } } });
     const first = try pagePath(a, io, dir, "chapter.cbz#001.png");
+    // The persistent key uses exactly twelve timestamp bytes, independent of
+    // the padding or byte order of this process's native i96 representation.
+    const expected_hash = std.hash.Wyhash.hash(0, "chapter.cbz\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    const expected = try std.fmt.allocPrint(a, "{s}/cache/pages/{x}/0.png", .{ dir, expected_hash });
+    try std.testing.expectEqualStrings(expected, first);
     try std.testing.expectEqualStrings("deflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated pagedeflated page", try Io.Dir.cwd().readFileAlloc(io, first, a, .limited(1024)));
     const again = try pagePath(a, io, dir, "chapter.cbz#001.png");
     try std.testing.expectEqualStrings(first, again);
-    const file = try tmp.dir.openFile(io, "chapter.cbz", .{ .mode = .read_write });
-    defer file.close(io);
     const stat = try file.stat(io);
     try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = stat.mtime.nanoseconds + std.time.ns_per_s } } });
     const second = try pagePath(a, io, dir, "chapter.cbz#001.png");
