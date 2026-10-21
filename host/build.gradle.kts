@@ -174,3 +174,7 @@ val cancellationFixtureJar = tasks.register<Jar>("cancellationFixtureJar") {
     archiveFileName.set("cancellation-fixture.jar")
     (findProperty("tachi.outputDir") as String?)?.let { destinationDirectory.set(file(it)) }
 }
+
+
+// Compatibility suites are executable mains wired into check, rather than JUnit classes.
+tasks.test { failOnNoDiscoveredTests.set(false) }
