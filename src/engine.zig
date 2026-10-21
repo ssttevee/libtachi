@@ -250,15 +250,13 @@ pub const Engine = struct {
     pub fn sdAvailable(self: *Engine) bool {
         const dir = self.options.sd_dir orelse return false;
         if (self.options.sd_mount) |mount| {
-            const bytes = Io.Dir.cwd().readFileAlloc(self.io, "/proc/mounts", self.gpa, .limited(1 << 20)) catch return false;
-            defer self.gpa.free(bytes);
-            var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
-            while (lines.next()) |line| {
-                var fields = std.mem.tokenizeScalar(u8, line, ' ');
-                _ = fields.next() orelse continue;
-                if (std.mem.eql(u8, fields.next() orelse continue, mount)) return true;
-            }
-            return false;
+            var file = Io.Dir.cwd().openFile(self.io, "/proc/mounts", .{}) catch return false;
+            defer file.close(self.io);
+            // procfs reports size zero even when the mount table has contents.
+            // Read the stream directly instead of a size-based allocation helper.
+            var buffer: [16 * 1024]u8 = undefined;
+            var reader = file.readerStreaming(self.io, &buffer);
+            return mountTableContains(&reader.interface, mount) catch false;
         }
         var parent = Io.Dir.cwd().openDir(self.io, std.fs.path.dirname(dir) orelse return false, .{}) catch return false;
         parent.close(self.io);
@@ -4041,6 +4039,45 @@ test "reader and downloader honor page preferences within the engine concurrency
         try std.testing.expectEqual(case.expected, fixture.peak.load(.acquire));
         try std.testing.expectEqual(2, job.pages_done.load(.acquire));
     }
+}
+
+fn mountTableContains(reader: *Io.Reader, mount: []const u8) !bool {
+    while (try reader.takeDelimiter('\n')) |line| {
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = fields.next() orelse continue;
+        if (std.mem.eql(u8, fields.next() orelse continue, mount)) return true;
+    }
+    return false;
+}
+
+test "SD mount detection reads contents even when the file reports size zero" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "mounts", .data = "rootfs / rootfs rw 0 0\n" ++
+        "/dev/mmcblk1p1 /mnt/ext2 exfat rw 0 0\n" });
+    var file = try tmp.dir.openFile(io, "mounts", .{});
+    defer file.close(io);
+    var buffer: [256]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    // Emulate procfs stat data on every host. A size-based read would return
+    // an empty mount table, silently treating the inserted SD card as absent.
+    reader.size = 0;
+    try std.testing.expect(try mountTableContains(&reader.interface, "/mnt/ext2"));
+}
+
+test "SD mount detection requires the exact mounted volume" {
+    for ([_][]const u8{
+        "",
+        "rootfs / rootfs rw 0 0\n",
+        "/dev/mmcblk1p1 /mnt/ext20 exfat rw 0 0\n",
+        "/mnt/ext2 /elsewhere none rw,bind 0 0\n",
+    }) |contents| {
+        var reader = Io.Reader.fixed(contents);
+        try std.testing.expect(!try mountTableContains(&reader, "/mnt/ext2"));
+    }
+    var reader = Io.Reader.fixed("/dev/mmcblk1p1 /mnt/ext2 exfat rw 0 0");
+    try std.testing.expect(try mountTableContains(&reader, "/mnt/ext2"));
 }
 
 test "SD downloads retain their volume when resuming and delete through the SD resolver" {
