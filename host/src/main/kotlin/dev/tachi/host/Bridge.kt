@@ -1,9 +1,6 @@
 package dev.tachi.host
 
 import eu.kanade.tachiyomi.source.online.HttpSource
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -27,6 +24,18 @@ object Bridge {
 
     private val json get() = TachiRuntime.json
     private val lastMime = ThreadLocal<String?>()
+
+    @JvmStatic
+    fun beginOperation(): ByteArray = guard { JsonPrimitive(Operations.begin()) }
+
+    @JvmStatic
+    fun enterOperation(id: Long): ByteArray = guard { Operations.enter(id); JsonPrimitive(true) }
+
+    @JvmStatic
+    fun cancelOperation(id: Long): ByteArray = guard { Operations.cancel(id); JsonPrimitive(true) }
+
+    @JvmStatic
+    fun endOperation(id: Long): ByteArray = guard { Operations.end(id); JsonPrimitive(true) }
 
     @JvmStatic
     fun apiVersion(): Int = API_VERSION
@@ -96,15 +105,13 @@ object Bridge {
             val source = ExtensionLoader.source(sourceId) as? HttpSource
                 ?: throw IllegalArgumentException("Source $sourceId is not an HttpSource")
             val page = json.decodeFromString(PageDto.serializer(), pageJson.utf8()).toPage()
-            runBlocking {
-                withContext(Dispatchers.IO) {
-                    if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
-                    source.getImage(page).use { response ->
-                        lastMime.set(response.body.contentType()?.toString() ?: response.header("Content-Type"))
-                        response.body.bytes()
-                    }
+            Operations.blocking {
+                if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
+                source.getImage(page).use { response ->
+                    // Thread-local JNI metadata belongs to the calling thread, not Dispatchers.IO.
+                    Pair(response.body.bytes(), response.body.contentType()?.toString() ?: response.header("Content-Type"))
                 }
-            }
+            }.let { (bytes, mime) -> lastMime.set(mime); bytes }
         } catch (t: Throwable) {
             lastError.set(json.encodeToString(ErrorDto.serializer(), t.toErrorDto()).toByteArray())
             null

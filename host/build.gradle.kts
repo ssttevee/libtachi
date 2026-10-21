@@ -157,3 +157,12 @@ val testMihonBackup = tasks.register<JavaExec>("testMihonBackup") {
     systemProperty("tachi.writeGolden", findProperty("writeGolden") ?: "false")
 }
 tasks.check { dependsOn(testMihonBackup) }
+
+
+val testOperations = tasks.register<JavaExec>("testOperations") {
+    description = "Check operation-scoped cancellation, pre-start cancellation and HTTP cancellation."
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("dev.tachi.host.OperationsTest")
+}
+tasks.check { dependsOn(testOperations) }

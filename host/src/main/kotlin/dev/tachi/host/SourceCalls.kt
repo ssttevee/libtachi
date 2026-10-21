@@ -20,9 +20,6 @@ import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.source.sourcePreferences
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -43,8 +40,8 @@ import kotlinx.serialization.json.jsonPrimitive
 object SourceCalls {
     private val json get() = TachiRuntime.json
 
-    fun call(source: Source, method: String, args: JsonObject): JsonElement = runBlocking {
-        withContext(Dispatchers.IO) { dispatch(source, method, args) }
+    fun call(source: Source, method: String, args: JsonObject): JsonElement = Operations.blocking {
+        dispatch(source, method, args)
     }
 
     private suspend fun dispatch(source: Source, method: String, args: JsonObject): JsonElement = with(ExtensionLoader) {
