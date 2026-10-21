@@ -53,7 +53,7 @@ differs on purpose.
 | Mihon | libtachi |
 |---|---|
 | Source list: languages, hidden, pinned, last used, local source | Same (`views.sourceList`) |
-| Global search: pinned or all, one page per source, Mihon's result order | Same; sources are searched one at a time because extension calls are serialized |
+| Global search: pinned or all, one page per source, Mihon's result order | Same; bounded concurrent searches with an in-process backend; one worker connection serializes JVM calls |
 | Extension stores: multiple stores, every index format, refresh rules | Same (`stores.zig`, `repo.zig`) |
 | Listings merged by package and key, language and content-warning filters, obsolete installs | Same |
 | Trust: store keys, version-scoped manual trust, untrusted listing | Same; checked when a file is installed and listed by `untrustedExtensions` |
@@ -84,7 +84,9 @@ differs on purpose.
 - **Cloudflare challenges and WebView sources** need a browser; Mihon solves
   them in a WebView. An app that has one can plug a solver into the host.
 - **DNS over HTTPS** isn't implemented; the system resolver is used.
-- **Extension calls are serialized** in one runtime, where Mihon runs
-  several sources at once. Native page downloads still run in parallel.
+- **One worker connection serializes JVM calls.** An in-process runtime can
+  run independent sources concurrently. Global searches, chapter pages, library
+  refreshes and store reads use the same bounded task runner; native page
+  transfers overlap even with a worker backend.
 - **Scheduling** (periodic updates, notifications) is the app's:
   `libraryUpdateDue` says when Mihon would update.

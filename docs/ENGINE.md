@@ -52,6 +52,45 @@ before the operation itself; `pages_done` / `pages_total` give progress.
 `Engine.pause` cancels extension work and refuses new jobs, for an app going
 to the background; `resume` undoes it.
 
+## Concurrency
+
+`Engine.Options.parallelism` bounds each independent I/O loop (default 4):
+global source search, chapter pages, library title fetches, store refreshes and
+store listings. Zero is treated as one. Chapter pages also honor the saved
+`Settings.downloads.parallel_pages` limit (default 5), taking the lower of the
+two limits. Direct users of `downloads.downloadChapter` set
+`downloads.Options.parallelism` (default 4).
+
+The download queue uses the same runner with its existing
+`Settings.downloads.parallel_sources` limit (default 5), keeping one chapter
+per source active. Each chapter has its own page limit. These are per-loop
+limits, so several jobs or queued sources can collectively exceed one loop's
+limit.
+
+All these loops use `src/parallel.zig`: bounded `Io.concurrent` futures,
+completion notifications through `Io.Queue`, private scratch arenas, and
+result publication on the parent task. Fatal errors and cancellation join
+outstanding tasks before releasing their memory. Global-search partial
+results and page callbacks arrive in completion order; progress counts are
+monotonic. Final search ranking, chapter reading order, store precedence,
+and library update report/automatic-download order remain stable.
+`downloads.Options.order` is a permutation defining dispatch priority;
+completion order can differ. Completed page files survive a canceled or
+failed chapter for reuse on retry. Source rate reservations and TLS setup
+are synchronized across native page transfers.
+
+An in-process backend can execute JVM operations concurrently. A single
+`worker.Client` still serializes JVM calls over its connection; native page
+transfers overlap independently. Backends and download fallbacks must make
+mutable state safe for overlapping calls. The general allocator must support
+concurrent allocations, and the supplied `Io` must support concurrency.
+Set `parallelism = 1` when serial dispatch is required.
+
+Tracker transactions, extension installation/registry changes and ordered
+backup/download import/export retain their sequential execution. Their
+iterations share mutable state, collision precedence or an ordered output.
+Retry loops and deadline races retain their own control flow.
+
 ## Cancellation
 
 `job.cancel()` cancels that job's `std.Io` task and waits for it to finish.
