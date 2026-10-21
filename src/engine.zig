@@ -2686,6 +2686,8 @@ pub const Engine = struct {
         if (scheduler == null and self.options.release_jvm and downloads.allNative(plan)) self.backend.release();
         defer if (scheduler == null and self.options.release_jvm) self.backend.release();
         job.pages_total.store(plan.len, .release);
+        job.download_sd = use_sd;
+        job.setPages(plan.len);
         const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
             .dir = target.dir,
             .chapter_id = chapter_id,
@@ -2693,7 +2695,7 @@ pub const Engine = struct {
             .parallelism = try self.pageParallelism(a),
             .scheduler = scheduler,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
-            .progress = .{ .context = job, .report = Job.reportPages, .dispatched = Job.reportDispatched },
+            .progress = .{ .context = job, .report = Job.reportPages, .page = Job.reportDownloadReady, .failed = Job.reportFailed, .dispatched = Job.reportDispatched },
             .reuse = if (use_sd) null else cache_pages,
         });
         const stored_pages = if (use_sd) blk: {
@@ -2814,9 +2816,10 @@ pub const Job = struct {
     extension_len: usize = 0,
     pages_done: std.atomic.Value(usize) = .init(0),
     pages_total: std.atomic.Value(usize) = .init(0),
-    /// A `read` job's pages so far; read them with `pageStates`.
+    /// Reader and persistent download pages so far; read them with `pageStates`.
     page_lock: std.atomic.Mutex = .unlocked,
     page_states: []PageState = &.{},
+    download_sd: bool = false,
     /// Queue admission progress counts cached pages and transfers with a slot.
     pages_dispatched: std.atomic.Value(usize) = .init(0),
     dispatch_notify: ?struct { context: *anyopaque, notify: *const fn (*anyopaque) void } = null,
@@ -2924,7 +2927,7 @@ pub const Job = struct {
         failed: []const u8,
     };
 
-    /// A `read` job's pages so far; valid until `deinit`.
+    /// Reader or download pages so far; strings remain valid until `deinit`.
     pub fn pageStates(self: *Job, arena: std.mem.Allocator) ![]PageState {
         while (!self.page_lock.tryLock()) std.atomic.spinLoopHint();
         defer self.page_lock.unlock();
@@ -2949,6 +2952,15 @@ pub const Job = struct {
         const self: *Job = @ptrCast(@alignCast(context));
         _ = self.pages_dispatched.fetchAdd(1, .acq_rel);
         if (self.dispatch_notify) |callback| callback.notify(callback.context);
+    }
+
+    fn reportDownloadReady(context: *anyopaque, index: usize, path: []const u8) void {
+        const self: *Job = @ptrCast(@alignCast(context));
+        const stored = if (self.download_sd)
+            std.fmt.allocPrint(self.arena.allocator(), "sdcard/{s}", .{path}) catch return
+        else
+            path;
+        self.pageReady(index, stored);
     }
 
     fn reportReady(context: *anyopaque, index: usize, path: []const u8) void {
@@ -4197,6 +4209,9 @@ test "SD downloads retain their volume when resuming and delete through the SD r
     const bytes = try Io.Dir.cwd().readFileAlloc(io, absolute, a, .limited(1024));
     try std.testing.expect(std.mem.startsWith(u8, bytes, "\x89PNG"));
     try std.testing.expectEqual(1, fixture.images);
+    const ready_states = try job.pageStates(a);
+    try std.testing.expectEqual(1, ready_states.len);
+    try std.testing.expectEqualStrings(relative, ready_states[0].ready);
     // Recreate an interrupted chapter while keeping the saved page and manifest.
     try engine.store.save(a, initial);
     prefs.downloads.storage = .internal;

@@ -91,9 +91,7 @@ pub fn clearResumeProgress(a: std.mem.Allocator, io: Io, dir: []const u8, root: 
     };
 }
 
-/// Counts valid, atomically published pages from the last download attempt.
-/// Temporary files and stale plans are deliberately excluded.
-pub fn resumeProgress(a: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8) !?ResumeProgress {
+fn resumeManifest(a: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8) !?ResumeManifest {
     const bytes = Io.Dir.cwd().readFileAlloc(io, try manifestPath(a, dir, root, chapter_id), a, .limited(4096)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -103,12 +101,35 @@ pub fn resumeProgress(a: std.mem.Allocator, io: Io, dir: []const u8, root: []con
     if (manifest.plan.len == 0 or manifest.total == 0 or manifest.total > 100_000) return error.InvalidResumeManifest;
     _ = std.fmt.parseInt(u64, manifest.plan, 16) catch return error.InvalidResumeManifest;
     for (manifest.plan) |c| if (!std.ascii.isHex(c)) return error.InvalidResumeManifest;
-    const store: PageStore = .{ .arena = a, .io = io, .dir = dir, .folder = try std.fmt.allocPrint(a, "{s}/{x}/{s}", .{ root, std.hash.Wyhash.hash(0, chapter_id), manifest.plan }) };
+    return manifest;
+}
+
+fn resumeStore(a: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8, manifest: ResumeManifest) !PageStore {
+    return .{ .arena = a, .io = io, .dir = dir, .folder = try std.fmt.allocPrint(a, "{s}/{x}/{s}", .{ root, std.hash.Wyhash.hash(0, chapter_id), manifest.plan }) };
+}
+
+/// Counts valid, atomically published pages from the last download attempt.
+/// Temporary files and stale plans are deliberately excluded.
+pub fn resumeProgress(a: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8) !?ResumeProgress {
+    const manifest = try resumeManifest(a, io, dir, root, chapter_id) orelse return null;
+    const store = try resumeStore(a, io, dir, root, chapter_id, manifest);
     var done: usize = 0;
     for (0..manifest.total) |index| if (try store.complete(index) != null) {
         done += 1;
     };
     return .{ .done = done, .total = manifest.total };
+}
+
+/// Saved pages from the active resumable plan, indexed by reading order.
+/// An empty string represents a page not yet atomically published. Paths are
+/// relative to `dir`; callers add any persistent volume namespace themselves.
+/// A missing manifest returns null, rather than an empty chapter.
+pub fn resumePages(a: std.mem.Allocator, io: Io, dir: []const u8, root: []const u8, chapter_id: []const u8) !?[]const []const u8 {
+    const manifest = try resumeManifest(a, io, dir, root, chapter_id) orelse return null;
+    const store = try resumeStore(a, io, dir, root, chapter_id, manifest);
+    const pages = try a.alloc([]const u8, manifest.total);
+    for (pages, 0..) |*page, index| page.* = try store.complete(index) orelse "";
+    return pages;
 }
 
 /// Where one chapter's pages are saved: `downloads/<chapter>/<plan>/0001.png`
@@ -1155,4 +1176,40 @@ test "interrupted download progress counts complete pages and excludes stale and
     try std.testing.expectEqual(2, progress.total);
     try library.writeJsonAtomic(a, io, try manifestPath(a, dir, "downloads", "chapter"), ResumeManifest{ .plan = "../escape", .total = 2 });
     try std.testing.expectError(error.InvalidResumeManifest, resumeProgress(a, io, dir, "downloads", "chapter"));
+}
+
+test "resumable reader pages preserve positions and exclude temporary stale and invalid files" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try t.expect(try resumePages(a, t.io, root, "downloads", "chapter") == null);
+    const plan: [4]ImageRequest = .{
+        .{ .page = .{ .index = 0, .url = "/1" }, .url = "https://example.com/1.png", .method = "GET", .headers = &.{} },
+        .{ .page = .{ .index = 1, .url = "/2" }, .url = "https://example.com/2.png", .method = "GET", .headers = &.{} },
+        .{ .page = .{ .index = 2, .url = "/3" }, .url = "https://example.com/3.png", .method = "GET", .headers = &.{} },
+        .{ .page = .{ .index = 3, .url = "/4" }, .url = "https://example.com/4.png", .method = "GET", .headers = &.{} },
+    };
+    const store = try PageStore.init(a, t.io, root, "chapter", &plan);
+    const first = try store.put(0, "\x89PNG\r\n\x1a\ncomplete page");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try store.temp(1), .data = "\x89PNG\r\n\x1a\nnot published" });
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try store.absolute(try store.relative(2, "png")), .data = "broken image" });
+    const last = try store.put(3, "\x89PNG\r\n\x1a\nlast page");
+    const stale = try PageStore.init(a, t.io, root, "chapter", &.{});
+    _ = try stale.put(1, "\x89PNG\r\n\x1a\nstale plan");
+    const path = try manifestPath(a, root, "downloads", "chapter");
+    try library.writeJsonAtomic(a, t.io, path, ResumeManifest{ .plan = std.fs.path.basename(store.folder), .total = plan.len });
+    const pages = (try resumePages(a, t.io, root, "downloads", "chapter")).?;
+    try t.expectEqual(4, pages.len);
+    try t.expectEqualStrings(first, pages[0]);
+    try t.expectEqualStrings("", pages[1]);
+    try t.expectEqualStrings("", pages[2]);
+    try t.expectEqualStrings(last, pages[3]);
+    try t.expectEqual(2, (try resumeProgress(a, t.io, root, "downloads", "chapter")).?.done);
+    try library.writeJsonAtomic(a, t.io, path, ResumeManifest{ .plan = "../outside", .total = 4 });
+    try t.expectError(error.InvalidResumeManifest, resumePages(a, t.io, root, "downloads", "chapter"));
+    try t.expectError(error.InvalidResumeManifest, resumeProgress(a, t.io, root, "downloads", "chapter"));
 }

@@ -308,6 +308,27 @@ pub const Queue = struct {
         return out;
     }
 
+    /// A queued transfer's page states. All strings belong to `arena`, so
+    /// completion or removal of the queue entry cannot invalidate the snapshot.
+    /// Null means the entry is not currently transferring (it may be planning).
+    pub fn chapterPages(self: *Queue, engine: *Engine, arena: std.mem.Allocator, chapter_id: []const u8) !?[]Job.PageState {
+        self.acquire();
+        defer self.lock.unlock();
+        try self.ensureLoaded(engine);
+        for (self.items.items) |item| {
+            if (!std.mem.eql(u8, item.chapter_id, chapter_id) or item.planning) continue;
+            const job = item.job orelse return null;
+            const states = try job.pageStates(arena);
+            for (states) |*state| state.* = switch (state.*) {
+                .ready => |saved_path| .{ .ready = try arena.dupe(u8, saved_path) },
+                .failed => |message| .{ .failed = try arena.dupe(u8, message) },
+                .loading => .loading,
+            };
+            return states;
+        }
+        return null;
+    }
+
     /// Whether the queue stopped to wait for Wi-Fi.
     pub fn waitingForWifi(self: *Queue) bool {
         self.acquire();
@@ -1089,4 +1110,32 @@ test "restarted queue admits all earlier chapter pages before its successor" {
     try t.expectEqual(Stage.pages_ready, entries[1].stage);
     try t.expectEqual(0, entries[1].pages_done);
     engine.queue.pause(&engine);
+}
+
+test "queued reader snapshots expose saved pages before the chapter completes" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: PipelineFixture = .{};
+    var engine: Engine = .init(t.allocator, t.io, fixture.backend(), .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a), .parallelism = 1 });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    try PipelineFixture.setup(&engine, a);
+    _ = try engine.queue.enqueue(&engine, &.{"1:/c1"}, true);
+    try fixture.tail_started.wait(t.io);
+    const states = (try engine.queue.chapterPages(&engine, a, "1:/c1")).?;
+    try t.expectEqual(3, states.len);
+    try t.expect(states[0] == .ready);
+    try t.expect(states[1] == .ready);
+    try t.expect(states[2] == .loading);
+    const saved_path = states[0].ready;
+    try t.expect(std.mem.startsWith(u8, saved_path, "downloads/"));
+    // Removing the entry joins and frees its job; snapshots own their strings.
+    try engine.queue.remove(&engine, "1:/c1");
+    const bytes = try Io.Dir.cwd().readFileAlloc(t.io, try engine.pagePath(a, saved_path), a, .limited(128));
+    try t.expect(std.mem.startsWith(u8, bytes, "\x89PNG"));
+    try t.expectEqual(2, (try engine.downloadProgress(a, "1:/c1")).?.done);
 }
