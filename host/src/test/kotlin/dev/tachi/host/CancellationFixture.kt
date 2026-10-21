@@ -37,6 +37,10 @@ object CancellationFixture {
                     101L -> awaitCancellation()
                     102L -> release.await()
                     103L -> throw IOException("fixture diagnostic")
+                    105L -> {
+                        java.io.File(TachiRuntime.config.dataDir, "uncooperative.started").writeText("ready")
+                        while (true) Thread.sleep(1000) // Deliberately ignores coroutine cancellation.
+                    }
                 }
                 return MangasPage(emptyList(), false)
             } finally { ended.add(id) }
@@ -63,7 +67,7 @@ object CancellationFixture {
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         val sources = field.get(ExtensionLoader) as ConcurrentHashMap<Long, Source>
-        for (id in 101L..103L) sources[id] = FixtureSource(id)
+        for (id in 101L..105L) sources[id] = FixtureSource(id)
         val fixture = FixtureSource(104)
         sources[104] = object : HttpSource(), Source by fixture {
             override val id = 104L

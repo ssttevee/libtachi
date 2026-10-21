@@ -15,6 +15,49 @@ import okhttp3.Request
 object OperationsTest {
     private fun CountDownLatch.waitBounded() = check(await(5, TimeUnit.SECONDS)) { "Operation test timed out" }
 
+    private fun deliveredResponseCancellation() {
+        val id = Operations.begin()
+        val delivered = CountDownLatch(1)
+        val bodyReleased = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>()
+        val delegate = OkHttpClient().newCall(Request.Builder().url("http://127.0.0.1/").build())
+        val call = object : Call by delegate {
+            override fun enqueue(responseCallback: Callback) {
+                val response = okhttp3.Response.Builder().request(request()).protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(200).message("OK").body(okhttp3.ResponseBody.EMPTY).build()
+                responseCallback.onResponse(this, response)
+            }
+            override fun cancel() { delegate.cancel(); bodyReleased.countDown() }
+        }
+        val thread = Thread {
+            try {
+                Operations.enter(id)
+                try {
+                    Operations.blocking {
+                        call.await().use {
+                            delivered.countDown()
+                            // Simulates a response-body read after the header continuation completed.
+                            bodyReleased.waitBounded()
+                        }
+                    }
+                    error("Delivered response operation ignored cancellation")
+                } catch (_: CancellationException) { }
+            } catch (t: Throwable) { failure.set(t) }
+            finally { Operations.end(id); done.countDown() }
+        }
+        thread.start()
+        try {
+            delivered.waitBounded()
+            Operations.cancel(id)
+            done.waitBounded()
+            check(delegate.isCanceled()) { "Delivered HTTP call was no longer tracked" }
+        } finally {
+            Operations.cancel(id); bodyReleased.countDown(); thread.join(5000)
+        }
+        failure.get()?.let { throw AssertionError("Response body cancellation failed", it) }
+    }
+
     @JvmStatic fun main(args: Array<String>) {
         val first = Operations.begin()
         val second = Operations.begin()
@@ -73,8 +116,9 @@ object OperationsTest {
             } catch (_: CancellationException) { }
         } finally { Operations.end(early) }
         check(!ran)
+        deliveredResponseCancellation()
         check(Operations.activeCount == 0) { "Operation registry leaked entries" }
         check(Operations.blocking { 42 } == 42) // end cleared the thread-local context.
-        println("PASS: targeted, pre-start and HTTP cancellation; registry and thread-local cleanup")
+        println("PASS: targeted, pre-start, HTTP and delivered-response cancellation; registry and thread-local cleanup")
     }
 }

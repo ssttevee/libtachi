@@ -2686,7 +2686,8 @@ pub const Job = struct {
     }
 
     pub fn cancel(self: *Job) void {
-        if (self.request.usesBackend() and self.engine.execute_fn == null) self.engine.backend.cancel();
+        // Backend waits translate this task's cancellation to its own JVM
+        // operation (or worker). A backend-wide cancel could stop another job.
         if (self.future) |*future| future.cancel(self.engine.io);
     }
 
@@ -3455,4 +3456,60 @@ test "enhanced matching binds accepted sources only and updates server before lo
         try t.expect(again.failure == null);
     }
     try fixture.finish();
+}
+
+test "canceling one engine job does not invoke backend-wide cancellation" {
+    const Fake = struct {
+        io: Io,
+        first_started: Io.Event = .unset,
+        second_started: Io.Event = .unset,
+        release: Io.Event = .unset,
+        global_cancels: std.atomic.Value(u32) = .init(0),
+
+        fn run(ptr: *anyopaque, _: std.mem.Allocator, call: be.Call, _: ?be.Status) !be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (call.filters == 1) self.first_started.set(self.io) else self.second_started.set(self.io);
+            try self.release.wait(self.io);
+            return .{};
+        }
+        fn warm(_: *anyopaque) bool {
+            return true;
+        }
+        fn cancel(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.global_cancels.fetchAdd(1, .monotonic);
+            self.release.set(self.io);
+        }
+        fn quiet(_: *anyopaque) void {}
+    };
+    const io = std.testing.io;
+    var fake: Fake = .{ .io = io };
+    var engine: Engine = .init(std.testing.allocator, io, .{ .ptr = &fake, .vtable = &.{
+        .run = Fake.run,
+        .warm = Fake.warm,
+        .cancel = Fake.cancel,
+        .release = Fake.quiet,
+        .idle = Fake.quiet,
+    } }, .{ .dir = "unused" });
+    defer engine.deinit();
+    const first = try Job.start(&engine, .{ .filters = 1 });
+    defer {
+        first.cancel();
+        first.deinit();
+    }
+    const second = try Job.start(&engine, .{ .filters = 2 });
+    defer {
+        fake.release.set(io);
+        second.cancel();
+        second.deinit();
+    }
+    try fake.first_started.wait(io);
+    try fake.second_started.wait(io);
+    first.cancel();
+    try std.testing.expectEqualStrings("Canceled", first.failure.?);
+    try std.testing.expectEqual(0, fake.global_cancels.load(.monotonic));
+    try std.testing.expect(!second.done.load(.acquire));
+    fake.release.set(io);
+    second.join();
+    try std.testing.expect(second.failure == null);
 }

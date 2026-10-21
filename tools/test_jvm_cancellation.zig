@@ -53,10 +53,88 @@ fn popular(rt: *tachi.Runtime, id: i64) ![]u8 {
     return rt.call(id, "popular", "{\"page\":1}");
 }
 
+const WorkerProbe = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    ready: std.Io.Event = .unset,
+    done: std.Io.Event = .unset,
+
+    fn run(client: *tachi.worker.Client, source: i64, probe: *@This()) !void {
+        probe.entered.set(probe.io);
+        defer probe.done.set(probe.io);
+        var arena: std.heap.ArenaAllocator = .init(client.gpa);
+        defer arena.deinit();
+        const call: tachi.backend.Call = if (source == 104) .{ .filters = source } else .{ .browse = .{ .source = source } };
+        _ = try client.run(arena.allocator(), call, .{
+            .context = probe,
+            .starting = starting,
+            .ready = isReady,
+            .loading = loading,
+        });
+    }
+    fn starting(_: *anyopaque) void {}
+    fn isReady(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.ready.set(self.io);
+    }
+    fn loading(_: *anyopaque, _: ?[]const u8) void {}
+};
+
+fn testWorker(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, dir: []const u8) !void {
+    const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, args[0], gpa);
+    defer gpa.free(exe);
+    const child_dir = try std.fs.path.join(gpa, &.{ dir, "worker" });
+    defer gpa.free(child_dir);
+    var client: tachi.worker.Client = undefined;
+    try client.init(gpa, io, .{ .exe = exe, .args = &.{ "--worker", args[1], args[2], child_dir } });
+    defer client.deinit();
+    var active_probe: WorkerProbe = .{ .io = io };
+    var queued_probe: WorkerProbe = .{ .io = io };
+    var active = try io.concurrent(WorkerProbe.run, .{ &client, @as(i64, 105), &active_probe });
+    defer active.cancel(io) catch {};
+    try active_probe.ready.wait(io);
+    const marker = try std.fs.path.join(gpa, &.{ child_dir, "uncooperative.started" });
+    defer gpa.free(marker);
+    const until = std.Io.Clock.awake.now(io).toMilliseconds() + 5000;
+    while (true) {
+        if (std.Io.Dir.cwd().access(io, marker, .{})) break else |err| {
+            if (err != error.FileNotFound) return err;
+        }
+        if (std.Io.Clock.awake.now(io).toMilliseconds() > until) return error.UncooperativeCallDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const pid = client.workerPid();
+    try std.testing.expect(pid > 0);
+    var queued = try io.concurrent(WorkerProbe.run, .{ &client, @as(i64, 102), &queued_probe });
+    defer queued.cancel(io) catch {};
+    try queued_probe.entered.wait(io);
+    try std.testing.expectError(error.Canceled, queued.cancel(io));
+    try std.testing.expectEqual(pid, client.workerPid());
+    try std.testing.expect(!active_probe.done.isSet());
+    try std.testing.expectError(error.Canceled, active.cancel(io));
+    try std.testing.expectEqual(-1, client.workerPid());
+    var restarted: WorkerProbe = .{ .io = io };
+    try WorkerProbe.run(&client, 104, &restarted);
+    std.debug.print("PASS: queued worker cancellation isolation, uncooperative worker termination and restart\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 5 and std.mem.eql(u8, args[1], "--worker")) {
+        var backend: tachi.backend.InProcess = .init(gpa, io, .{
+            .data_dir = args[4],
+            .host_jar = args[2],
+            .extra_classpath = &.{args[3]},
+            .environ = init.minimal.environ,
+            .class_data_sharing = false,
+        });
+        const rt = try backend.runtime();
+        const fixture = try Fixture.init(rt);
+        try fixture.command("install");
+        tachi.worker.serve(gpa, &backend, .{});
+    }
     if (args.len != 3) return error.ExpectedHostAndFixtureJars;
     var random: [8]u8 = undefined;
     io.random(&random);
@@ -109,4 +187,5 @@ pub fn main(init: std.process.Init) !void {
     try std.testing.expectEqualStrings("image/png", image.mime.?);
     try fixture.checkEmpty();
     std.debug.print("PASS: real JNI targeted cancellation, independent operation, diagnostics, image metadata and registry cleanup\n", .{});
+    try testWorker(gpa, io, args, dir);
 }

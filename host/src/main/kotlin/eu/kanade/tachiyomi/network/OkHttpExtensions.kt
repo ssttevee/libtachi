@@ -20,6 +20,7 @@ val jsonMime = "application/json; charset=utf-8".toMediaType()
 
 // Based on https://github.com/square/okhttp/blob/master/okhttp-coroutines/src/main/kotlin/okhttp3/coroutines/ExecuteAsync.kt
 private suspend fun Call.await(callStack: Array<StackTraceElement>): Response {
+    dev.tachi.host.Operations.track(this)
     return suspendCancellableCoroutine { continuation ->
         continuation.invokeOnCancellation {
             try {
