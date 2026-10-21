@@ -154,6 +154,9 @@ pub const PageStore = struct {
 pub fn imageExtension(bytes: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return "png";
     if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return "jpg";
+    // JP2 and JPX share the signature box. The raw JPEG 2000 codestream
+    // starts with SOC/SIZ markers; normalize both forms to one stored suffix.
+    if (std.mem.startsWith(u8, bytes, "\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0a") or std.mem.startsWith(u8, bytes, "\xff\x4f\xff\x51")) return "jp2";
     if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) return "gif";
     if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "webp";
     if (std.mem.startsWith(u8, bytes, "\xff\x0a") or std.mem.startsWith(u8, bytes, "\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")) return "jxl";
@@ -166,7 +169,7 @@ pub fn imageExtension(bytes: []const u8) ?[]const u8 {
 }
 
 /// Every extension `imageExtension` gives.
-pub const image_extensions = [_][]const u8{ "png", "jpg", "gif", "webp", "jxl", "avif", "heif" };
+pub const image_extensions = [_][]const u8{ "png", "jpg", "gif", "webp", "jxl", "avif", "heif", "jp2" };
 
 fn millis(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
@@ -938,4 +941,30 @@ test "native chapter pages establish overlapping HTTP transfers" {
     try serving.await(io);
     try std.testing.expectEqual(2, chapter.stats.native);
     try std.testing.expectEqual(24, chapter.stats.bytes);
+}
+
+test "JPEG 2000 signatures require complete boxed or codestream headers" {
+    for ([_][]const u8{ "\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0a", "\xff\x4f\xff\x51" }) |signature| {
+        try std.testing.expectEqualStrings("jp2", imageExtension(signature).?);
+        for (0..signature.len) |length| try std.testing.expect(imageExtension(signature[0..length]) == null);
+    }
+    try std.testing.expect(imageExtension("\x00\x00\x00\x0cjP  \x0d\x0a\x87\x00") == null);
+    try std.testing.expect(imageExtension("\xff\x4f\xff\x50") == null);
+}
+
+test "JPEG 2000 downloads publish and resume with the canonical suffix" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const store = try PageStore.init(a, io, root, "chapter", &.{});
+    const bytes = "\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0aJPEG-2000-page";
+    const relative = try store.put(0, bytes);
+    try std.testing.expect(std.mem.endsWith(u8, relative, ".jp2"));
+    const retry = try PageStore.init(a, io, root, "chapter", &.{});
+    try std.testing.expectEqualStrings(relative, (try retry.complete(0)).?);
+    try std.testing.expectEqualStrings(bytes, try Io.Dir.cwd().readFileAlloc(io, try store.absolute(relative), a, .limited(1024)));
 }

@@ -275,3 +275,40 @@ test "series ComicInfo overrides details and invalid dates preserve mtime" {
     const m = (try scan(a, std.testing.io, try tmp.dir.realPathFileAlloc(std.testing.io, ".", a)))[0];
     try std.testing.expectEqualStrings("XML", m.title);
 }
+
+test "JPEG 2000 local folders and CBZ pages are discovered and extracted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const boxed = "\x00\x00\x00\x0cjP  \x0d\x0a\x87\x0aJP2-page";
+    const raw = "\xff\x4f\xff\x51raw-codestream";
+    try tmp.dir.createDirPath(io, "local/Series/Chapter 1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "local/Series/cover.JP2", .data = boxed });
+    try tmp.dir.writeFile(io, .{ .sub_path = "local/Series/Chapter 1/1.JPX", .data = boxed });
+    try tmp.dir.writeFile(io, .{ .sub_path = "local/Series/Chapter 1/2.j2k", .data = raw });
+    try tmp.dir.writeFile(io, .{ .sub_path = "local/Series/Chapter 2.cbz", .data = try archive.zip(a, &.{
+        .{ .name = "1.jp2", .data = boxed },
+        .{ .name = "2.JPX", .data = boxed },
+        .{ .name = "3.J2C", .data = raw },
+    }) });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const titles = try scan(a, io, root);
+    try std.testing.expectEqual(@as(usize, 1), titles.len);
+    const manga = titles[0];
+    try std.testing.expectEqualStrings("local/Series/cover.JP2", manga.cover.?);
+    try std.testing.expectEqual(@as(usize, 2), manga.chapters.len);
+    const store: library.Store = .{ .dir = root, .io = io };
+    var folder_pages: usize = 0;
+    var archive_pages: usize = 0;
+    for (manga.chapters) |chapter| for (chapter.pages) |page| {
+        const path = try store.pagePath(a, page);
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+        try std.testing.expect(std.mem.eql(u8, bytes, boxed) or std.mem.eql(u8, bytes, raw));
+        if (std.mem.indexOfScalar(u8, page, '#') != null) archive_pages += 1 else folder_pages += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), folder_pages);
+    try std.testing.expectEqual(@as(usize, 3), archive_pages);
+}

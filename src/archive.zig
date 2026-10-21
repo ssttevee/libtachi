@@ -22,7 +22,7 @@ pub fn visible(name: []const u8) bool {
 
 pub fn isImage(name: []const u8) bool {
     const ext = std.fs.path.extension(name);
-    for ([_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic", ".heif", ".jxl" }) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    for ([_][]const u8{ ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".heic", ".heif", ".jxl", ".jp2", ".jpx", ".j2k", ".j2c" }) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return true;
     return false;
 }
 
