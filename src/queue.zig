@@ -7,6 +7,7 @@ const Io = std.Io;
 const library = @import("library.zig");
 const models = @import("models.zig");
 const engine_mod = @import("engine.zig");
+const parallel = @import("parallel.zig");
 const Engine = engine_mod.Engine;
 const Job = engine_mod.Job;
 
@@ -279,12 +280,19 @@ pub const Queue = struct {
             const s = engine.loadSettings(arena.allocator()) catch break :blk 1;
             break :blk @max(1, s.downloads.parallel_sources);
         };
-        var group: Io.Group = .init;
-        for (0..limit) |_| group.concurrent(engine.io, work, .{ self, engine }) catch {
-            // No more threads: the workers already started share the queue.
-            break;
+        const Workers = struct {
+            queue: *Queue,
+            engine: *Engine,
+            fn work(ctx: *@This(), _: std.mem.Allocator, _: usize) !void {
+                try ctx.queue.work(ctx.engine);
+            }
+            fn publish(_: *@This(), _: usize, _: void, _: *std.heap.ArenaAllocator) !void {}
         };
-        group.await(engine.io) catch {};
+        var workers: Workers = .{ .queue = self, .engine = engine };
+        parallel.run(engine.gpa, engine.io, limit, limit, &workers, Workers.work, Workers.publish) catch |err| switch (err) {
+            error.Canceled => {},
+            else => log.warn("download queue stopped: {s}", .{@errorName(err)}),
+        };
         self.acquire();
         self.runner_done = true;
         self.lock.unlock();
