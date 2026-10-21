@@ -692,7 +692,7 @@ pub const Engine = struct {
         }
     }
 
-    fn pageParallelism(self: *Engine, a: std.mem.Allocator) !usize {
+    pub fn pageParallelism(self: *Engine, a: std.mem.Allocator) !usize {
         const s = try self.loadSettings(a);
         return @min(@max(1, self.options.parallelism), @max(1, s.downloads.parallel_pages));
     }
@@ -2601,6 +2601,71 @@ pub const Engine = struct {
     /// Downloads a library chapter for `job`, resuming saved pages, and
     /// records its pages in the library.
     pub fn downloadChapter(self: *Engine, job: *Job, chapter_id: []const u8) !void {
+        return self.downloadPreparedChapter(job, chapter_id, null, null);
+    }
+
+    pub fn queuedPlanPath(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "{s}/downloads/queued-plans/{x}.json", .{ self.options.dir, std.hash.Wyhash.hash(0, chapter_id) });
+    }
+
+    pub fn discardQueuedPlan(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !void {
+        Io.Dir.cwd().deleteFile(self.io, try self.queuedPlanPath(a, chapter_id)) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    /// Queue plans include source headers/cookies and survive pause/restart.
+    /// They live on internal storage independently of the image destination.
+    pub fn prepareQueuedChapter(self: *Engine, job: *Job, chapter_id: []const u8) !void {
+        const a = job.arena.allocator();
+        _ = try self.downloadTarget(a, chapter_id);
+        if (try self.loadQueuedPlan(a, chapter_id)) |plan| {
+            job.pages_total.store(plan.len, .release);
+            return;
+        }
+        const current = try self.store.load(a);
+        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
+        const source = found.manga.source_id orelse return error.LocalChapter;
+        const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
+        const plan = try self.requestDownloadPlan(job, source, remote);
+        const path = try self.queuedPlanPath(a, chapter_id);
+        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
+        try library.writeJsonAtomic(a, self.io, path, plan);
+        job.pages_total.store(plan.len, .release);
+    }
+
+    pub fn loadQueuedPlan(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !?[]const models.ImageRequest {
+        const bytes = Io.Dir.cwd().readFileAlloc(self.io, try self.queuedPlanPath(a, chapter_id), a, .limited(16 << 20)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const plan = std.json.parseFromSliceLeaky([]const models.ImageRequest, a, bytes, models.parse_options) catch {
+            try self.discardQueuedPlan(a, chapter_id);
+            return null;
+        };
+        if (plan.len == 0) {
+            try self.discardQueuedPlan(a, chapter_id);
+            return null;
+        }
+        return plan;
+    }
+
+    fn requestDownloadPlan(self: *Engine, job: *Job, source: i64, remote: models.Chapter) ![]const models.ImageRequest {
+        _ = self;
+        job.fallback_source = source;
+        const plan = (job.call(.{ .image_requests = .{ .source = source, .chapter = remote } }) catch |err| {
+            if (err == error.ExtensionError and std.mem.endsWith(u8, tachi.lastError(), "HTTP error 404")) {
+                job.failure = "This chapter is no longer on the source. Refresh chapters to update the list.";
+                return error.ChapterRemoved;
+            }
+            return err;
+        }).image_requests;
+        if (plan.len == 0) return error.EmptyChapter;
+        return plan;
+    }
+
+    pub fn downloadPreparedChapter(self: *Engine, job: *Job, chapter_id: []const u8, prepared: ?[]const models.ImageRequest, scheduler: ?*downloads.Scheduler) !void {
         const a = job.arena.allocator();
         const chapter_started = millis(self.io);
         const target = try self.downloadTarget(a, chapter_id);
@@ -2614,24 +2679,19 @@ pub const Engine = struct {
         // Keep the original target even when a removable card disappears before retry.
         try library.writeJsonAtomic(a, self.io, destination_file, DownloadDestination{ .sd_card = use_sd });
         job.fallback_source = source;
-        const plan = (job.call(.{ .image_requests = .{ .source = source, .chapter = remote } }) catch |err| {
-            if (err == error.ExtensionError and std.mem.endsWith(u8, tachi.lastError(), "HTTP error 404")) {
-                job.failure = "This chapter is no longer on the source. Refresh chapters to update the list.";
-                return error.ChapterRemoved;
-            }
-            return err;
-        }).image_requests;
+        const plan = prepared orelse try self.requestDownloadPlan(job, source, remote);
         const planning_ms = millis(self.io) - chapter_started;
         if (plan.len == 0) return error.EmptyChapter;
         // Native pages need no JVM; a hand-back starts it again on demand.
-        if (self.options.release_jvm and downloads.allNative(plan)) self.backend.release();
-        defer if (self.options.release_jvm) self.backend.release();
+        if (scheduler == null and self.options.release_jvm and downloads.allNative(plan)) self.backend.release();
+        defer if (scheduler == null and self.options.release_jvm) self.backend.release();
         job.pages_total.store(plan.len, .release);
         const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
             .dir = target.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
             .parallelism = try self.pageParallelism(a),
+            .scheduler = scheduler,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages },
             .reuse = if (use_sd) null else cache_pages,

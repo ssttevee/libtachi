@@ -43,6 +43,8 @@ pub const Limiter = struct {
         return .{ .next = .init(gpa) };
     }
     pub fn deinit(self: *Limiter) void {
+        var keys = self.next.keyIterator();
+        while (keys.next()) |key| self.next.allocator.free(key.*);
         self.next.deinit();
     }
     /// Milliseconds to wait before sending a request with `rates` at `now`.
@@ -51,7 +53,13 @@ pub const Limiter = struct {
         for (rates) |rate| {
             if (rate.spacingMs == 0 or rate.initialWaitMs < rate.spacingMs or rate.initialWaitMs > std.math.maxInt(i32)) return error.InvalidRateLimit;
             const entry = try self.next.getOrPut(rate.key);
-            if (!entry.found_existing) entry.value_ptr.* = now + @as(i64, @intCast(rate.initialWaitMs));
+            if (!entry.found_existing) {
+                entry.key_ptr.* = self.next.allocator.dupe(u8, rate.key) catch |err| {
+                    _ = self.next.remove(rate.key);
+                    return err;
+                };
+                entry.value_ptr.* = now + @as(i64, @intCast(rate.initialWaitMs));
+            }
             until = @max(until, entry.value_ptr.*);
         }
         for (rates) |rate| self.next.getPtr(rate.key).?.* = until + @as(i64, @intCast(rate.spacingMs));
@@ -332,12 +340,27 @@ pub const Progress = struct {
 /// Mihon's waits before retrying a page: three retries, 2, 4 and 8 seconds.
 pub const mihon_retry_ms: []const u32 = &.{ 2000, 4000, 8000 };
 
+/// Shared by the queued chapters: one bound on all transfers and one rate
+/// history for requests from the same source, including chapter boundaries.
+pub const Scheduler = struct {
+    permits: Io.Semaphore,
+    limiter: Limiter,
+
+    pub fn init(gpa: std.mem.Allocator, limit: usize) Scheduler {
+        return .{ .permits = .{ .permits = @max(1, limit) }, .limiter = .init(gpa) };
+    }
+    pub fn deinit(self: *Scheduler) void {
+        self.limiter.deinit();
+    }
+};
+
 pub const Options = struct {
     /// The library directory; pages are saved under its `downloads/`.
     dir: []const u8,
     chapter_id: []const u8,
     /// Maximum pages in flight; callbacks are serialized in completion order.
     parallelism: usize = parallel.default_limit,
+    scheduler: ?*Scheduler = null,
     /// PEM roots for HTTPS. Null uses the system's.
     ca_file: ?[]const u8 = null,
     /// How pages that need the JVM are fetched; without one they fail with `error.NeedsJvm`.
@@ -450,7 +473,9 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
                     return .{ .path = try page_store.put(i, bytes), .stats = .{ .resumed = 1 } };
                 }
             }
-            var fetcher: Fetcher = .{ .gpa = ctx.gpa, .io = ctx.io, .store = page_store, .options = ctx.options, .client = ctx.client, .limiter = ctx.limiter, .https = ctx.https };
+            if (ctx.options.scheduler) |scheduler| try scheduler.permits.wait(ctx.io);
+            defer if (ctx.options.scheduler) |scheduler| scheduler.permits.post(ctx.io);
+            var fetcher: Fetcher = .{ .gpa = ctx.gpa, .io = ctx.io, .store = page_store, .options = ctx.options, .client = ctx.client, .limiter = if (ctx.options.scheduler) |scheduler| &scheduler.limiter else ctx.limiter, .https = ctx.https };
             var stats: Stats = .{};
             var attempt: usize = 0;
             const transfer = while (true) : (attempt += 1) {
