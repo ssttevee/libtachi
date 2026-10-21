@@ -663,6 +663,11 @@ pub const Engine = struct {
         }
     }
 
+    fn pageParallelism(self: *Engine, a: std.mem.Allocator) !usize {
+        const s = try self.loadSettings(a);
+        return @min(@max(1, self.options.parallelism), @max(1, s.downloads.parallel_pages));
+    }
+
     fn readChapter(self: *Engine, job: *Job, chapter_id: []const u8, start: u32) !void {
         const a = job.arena.allocator();
         const current = try self.store.load(a);
@@ -692,7 +697,7 @@ pub const Engine = struct {
             .dir = self.options.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
-            .parallelism = self.options.parallelism,
+            .parallelism = try self.pageParallelism(a),
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages, .page = Job.reportReady, .failed = Job.reportFailed },
             .root = cache_pages,
@@ -2514,7 +2519,7 @@ pub const Engine = struct {
             .dir = self.options.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
-            .parallelism = self.options.parallelism,
+            .parallelism = try self.pageParallelism(a),
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages },
             .reuse = cache_pages,
@@ -3792,4 +3797,71 @@ test "library refresh overlaps fetches and serially publishes updates, failures 
     try std.testing.expectEqual(0, updated.manga[updated.find("3:/m").?].chapters.len);
     try std.testing.expectEqual(0, updated.manga[updated.find("4:/m").?].chapters.len);
     try std.testing.expectEqual(2, (try engine.loadSettings(a)).updates.unseen);
+}
+
+test "reader and downloader honor page preferences within the engine concurrency cap" {
+    const io = std.testing.io;
+    const Case = struct { pages: u8, cap: usize, expected: usize, read: bool };
+    for ([_]Case{
+        .{ .pages = 0, .cap = 4, .expected = 1, .read = true },
+        .{ .pages = 1, .cap = 4, .expected = 1, .read = false },
+        .{ .pages = 5, .cap = 2, .expected = 2, .read = true },
+        .{ .pages = 2, .cap = 4, .expected = 2, .read = false },
+    }) |case| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+        const Fixture = struct {
+            expected: usize,
+            both: Io.Event = .unset,
+            entered: std.atomic.Value(usize) = .init(0),
+            active: std.atomic.Value(usize) = .init(0),
+            peak: std.atomic.Value(usize) = .init(0),
+            fn run(ptr: *anyopaque, scratch: std.mem.Allocator, call: be.Call, status: ?be.Status) !be.Reply {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (status) |s| s.ready(s.context);
+                return switch (call) {
+                    .image_requests => blk: {
+                        const plan = try scratch.alloc(models.ImageRequest, 2);
+                        for (plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(scratch, "/{d}", .{i}) }, .url = "jvm://page", .method = "GET", .headers = &.{} };
+                        break :blk .{ .image_requests = plan };
+                    },
+                    .image => blk: {
+                        const active = self.active.fetchAdd(1, .acq_rel) + 1;
+                        defer _ = self.active.fetchSub(1, .acq_rel);
+                        _ = self.peak.fetchMax(active, .acq_rel);
+                        const ticket = self.entered.fetchAdd(1, .acq_rel);
+                        if (self.expected == 2) {
+                            if (ticket == 0) try self.both.wait(std.testing.io) else self.both.set(std.testing.io);
+                        }
+                        break :blk .{ .image = try scratch.dupe(u8, "\x89PNG\r\n\x1a\nimage") };
+                    },
+                    else => error.Unexpected,
+                };
+            }
+            fn yes(_: *anyopaque) bool {
+                return true;
+            }
+            fn none(_: *anyopaque) void {}
+        };
+        var fixture: Fixture = .{ .expected = case.expected };
+        const backend: be.Backend = .{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .warm = Fixture.yes, .cancel = Fixture.none, .release = Fixture.none, .idle = Fixture.none } };
+        var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir, .parallelism = case.cap });
+        defer engine.deinit();
+        var s: settings.Settings = .{};
+        s.downloads.parallel_pages = case.pages;
+        try engine.saveSettings(s);
+        try engine.store.save(a, .{ .manga = &.{.{ .id = "1:/m", .title = "M", .source_id = 1, .remote = .{ .url = "/m", .title = "M" }, .chapters = &.{.{ .id = "1:/c", .title = "C", .remote = .{ .url = "/c", .name = "C" } }} }} });
+        const request: Request = if (case.read) .{ .read = .{ .chapter = "1:/c" } } else .{ .download = "1:/c" };
+        const job = try Job.start(&engine, request);
+        defer job.deinit();
+        job.join();
+        try std.testing.expect(job.failure == null);
+        try std.testing.expectEqual(2, fixture.entered.load(.acquire));
+        try std.testing.expectEqual(case.expected, fixture.peak.load(.acquire));
+        try std.testing.expectEqual(2, job.pages_done.load(.acquire));
+    }
 }
