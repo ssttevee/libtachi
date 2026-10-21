@@ -166,3 +166,11 @@ val testOperations = tasks.register<JavaExec>("testOperations") {
     mainClass.set("dev.tachi.host.OperationsTest")
 }
 tasks.check { dependsOn(testOperations) }
+
+val cancellationFixtureJar = tasks.register<Jar>("cancellationFixtureJar") {
+    description = "Packages fixtures for the opt-in native JNI cancellation test."
+    dependsOn(tasks.testClasses)
+    from(sourceSets["test"].output)
+    archiveFileName.set("cancellation-fixture.jar")
+    (findProperty("tachi.outputDir") as String?)?.let { destinationDirectory.set(file(it)) }
+}

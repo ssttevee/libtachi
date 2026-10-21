@@ -15,16 +15,14 @@ pub fn build(b: *std.Build) void {
     tachi_mod.addCSourceFile(.{ .file = b.path("src/worker_posix.c"), .flags = &.{} });
     tachi_mod.addCSourceFile(.{ .file = b.path("src/formats_time.c"), .flags = &.{} });
 
+    const android_jar = b.option([]const u8, "android-jar", "android.jar for Gradle (default: newest installed platform)");
+
     // Kotlin host jar: built by Gradle as a cached step unless -Dhost-jar names one.
     const host_jar = if (b.option(
         []const u8,
         "host-jar",
         "Use this tachi-host.jar instead of building it with Gradle",
-    )) |path| sourcePath(b, path) else gradleHostJar(b, b.option(
-        []const u8,
-        "android-jar",
-        "android.jar for the Gradle build (default: newest platform under $ANDROID_HOME)",
-    ));
+    )) |path| sourcePath(b, path) else gradleHostJar(b, android_jar);
     const embed_host_jar = b.option(
         bool,
         "embed-host-jar",
@@ -69,6 +67,20 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Module{ tachi_mod, capi_static }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
+
+    // Opt-in integration test: a real JVM and test-only synthetic sources.
+    const fixture_jar = b.addSystemCommand(&.{ "./gradlew", "cancellationFixtureJar", "-q" });
+    fixture_jar.setCwd(b.path("host"));
+    const fixture_dir = fixture_jar.addPrefixedOutputDirectoryArg("-Ptachi.outputDir=", "fixtures");
+    if (android_jar) |path|
+        fixture_jar.addPrefixedFileArg("-Ptachi.androidJar=", sourcePath(b, path));
+    for ([_][]const u8{ "host/src", "host/gradle" }) |dir| addFileInputsUnder(b, fixture_jar, dir);
+    fixture_jar.addFileInput(b.path("host/build.gradle.kts"));
+    const jvm_test = b.addExecutable(.{ .name = "test-jvm-cancellation", .root_module = dependent(b, "tools/test_jvm_cancellation.zig", tachi_mod) });
+    const run_jvm_test = b.addRunArtifact(jvm_test);
+    run_jvm_test.addFileArg(host_jar);
+    run_jvm_test.addFileArg(fixture_dir.path(b, "cancellation-fixture.jar"));
+    b.step("test-jvm", "Test operation cancellation through a real JVM").dependOn(&run_jvm_test.step);
 
     // Without embedding, the jar ships beside the library; the runtime looks in
     // <prefix>/lib relative to the executable. `zig build host` builds just that.

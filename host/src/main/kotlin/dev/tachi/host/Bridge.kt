@@ -26,7 +26,7 @@ object Bridge {
     private val lastMime = ThreadLocal<String?>()
 
     @JvmStatic
-    fun beginOperation(): ByteArray = guard { JsonPrimitive(Operations.begin()) }
+    fun beginOperation(): Long = Operations.begin()
 
     @JvmStatic
     fun enterOperation(id: Long): ByteArray = guard { Operations.enter(id); JsonPrimitive(true) }

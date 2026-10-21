@@ -56,6 +56,8 @@ pub const ErrorCode = enum(c_int) {
     extension_not_in_repo = 13,
     signature_mismatch = 14,
     unsupported_extension = 15,
+    canceled = 16,
+    concurrency_unavailable = 17,
 
     fn int(c: ErrorCode) c_int {
         return @backingInt(c);
@@ -80,6 +82,8 @@ fn mapError(err: tachi.Error) c_int {
         error.ExtensionNotInRepo => .extension_not_in_repo,
         error.SignatureMismatch => .signature_mismatch,
         error.UnsupportedExtension => .unsupported_extension,
+        error.Canceled => .canceled,
+        error.ConcurrencyUnavailable => .concurrency_unavailable,
         error.NetworkError => .network_error,
         error.InvalidIndex => .invalid_index,
         error.OutOfMemory => .out_of_memory,
@@ -312,6 +316,8 @@ test "error mapping preserves runtime diagnostics only for detailed errors" {
         .{ error.NetworkError, ErrorCode.network_error, false },
         .{ error.InvalidIndex, ErrorCode.invalid_index, false },
         .{ error.OutOfMemory, ErrorCode.out_of_memory, false },
+        .{ error.Canceled, ErrorCode.canceled, false },
+        .{ error.ConcurrencyUnavailable, ErrorCode.concurrency_unavailable, false },
     };
     inline for (cases) |case| {
         tachi.setLastError("runtime detail");

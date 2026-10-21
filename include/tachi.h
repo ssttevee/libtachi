@@ -39,6 +39,8 @@ typedef enum tachi_error {
     TACHI_E_EXTENSION_NOT_IN_REPO = 13,
     TACHI_E_SIGNATURE_MISMATCH = 14,     /* package not signed with the repository's key */
     TACHI_E_UNSUPPORTED_EXTENSION = 15,  /* extensions-lib version the host does not implement */
+    TACHI_E_CANCELED = 16,
+    TACHI_E_CONCURRENCY_UNAVAILABLE = 17,
 } tachi_error;
 
 /* Levels follow android.util.Log. */
