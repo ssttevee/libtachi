@@ -22,6 +22,7 @@ pub const Entry = struct {
     status: Status,
     pages_done: usize = 0,
     pages_total: usize = 0,
+    phase: engine_mod.Phase = .operation,
     /// Why the last attempt failed.
     failure: ?[]const u8 = null,
 };
@@ -268,6 +269,7 @@ pub const Queue = struct {
         for (self.items.items, out) |item, *e| {
             e.* = .{ .chapter_id = try arena.dupe(u8, item.chapter_id), .status = item.status, .failure = if (item.failure) |f| try arena.dupe(u8, f) else null };
             if (item.job) |job| {
+                e.phase = job.phase.load(.acquire);
                 e.pages_done = job.pages_done.load(.acquire);
                 e.pages_total = job.pages_total.load(.acquire);
             }
@@ -558,4 +560,22 @@ test "queue keeps browser-blocked failures actionable across starts and restorat
     try t.expectEqual(Status.failed, entries[0].status);
     try t.expect(std.mem.indexOf(u8, entries[0].failure.?, "images.example") != null);
     try t.expectEqual(2, fixture.attempts.load(.acquire));
+}
+
+test "queue snapshots report worker phases before the page list is known" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var engine: Engine = .init(a, std.testing.io, @import("backend.zig").none, .{ .dir = "." });
+    var job: Job = .{ .arena = .init(a), .engine = &engine, .request = .{ .download = "chapter" } };
+    engine.queue.loaded = true;
+    try engine.queue.append(a, "chapter", 1);
+    engine.queue.items.items[0].status = .downloading;
+    engine.queue.items.items[0].job = &job;
+    for ([_]engine_mod.Phase{ .starting, .extension_loading, .operation }) |phase| {
+        job.setPhase(phase);
+        const snapshot = try engine.queue.snapshot(&engine, a);
+        try std.testing.expectEqual(phase, snapshot[0].phase);
+        try std.testing.expectEqual(0, snapshot[0].pages_total);
+    }
 }

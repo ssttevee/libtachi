@@ -581,7 +581,7 @@ const Spawner = struct {
 pub const ServeOptions = struct {
     /// The channel to the client; `tachi_spawn` puts it on fd 3.
     fd: c_int = 3,
-    /// Exit after this long without a call.
+    /// Exit after this long without a call; zero keeps the worker alive.
     idle_exit_ms: u64 = 60_000,
     /// Save the runtime's startup cache once idle this long after a call.
     cache_idle_ms: u64 = 1_500,
@@ -669,7 +669,7 @@ const Job = struct {
 
 fn serveLoop(gpa: std.mem.Allocator, runtime: *be.InProcess, options: ServeOptions) !void {
     const fd = options.fd;
-    const cache_idle_ms = @min(options.cache_idle_ms, options.idle_exit_ms / 2);
+    const cache_idle_ms = if (options.idle_exit_ms == 0) options.cache_idle_ms else @min(options.cache_idle_ms, options.idle_exit_ms / 2);
     var active: ?*Job = null;
     var id: u64 = 0;
     var last_activity = tachi_now_ms();
@@ -703,7 +703,7 @@ fn serveLoop(gpa: std.mem.Allocator, runtime: *be.InProcess, options: ServeOptio
                 calls += 1;
                 last_activity = tachi_now_ms();
             }
-        } else if (tachi_now_ms() - last_activity >= options.idle_exit_ms) {
+        } else if (options.idle_exit_ms > 0 and tachi_now_ms() - last_activity >= options.idle_exit_ms) {
             return;
         } else if (calls > 0 and tachi_now_ms() - last_activity >= cache_idle_ms) {
             runtime.idle();
