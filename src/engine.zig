@@ -805,6 +805,10 @@ pub const Engine = struct {
         pages: u32,
         /// Reading time since the last call, in milliseconds, for history.
         read_ms: i64 = 0,
+        /// Whether the reader reached the chapter's final edge. Region-based
+        /// readers can show only part of the last image; null keeps the
+        /// page-based completion rule for existing callers.
+        completed: ?bool = null,
     };
 
     /// The reader's hook for each page shown, doing what Mihon's reader
@@ -821,7 +825,7 @@ pub const Engine = struct {
         const s = try self.loadSettings(a);
         if (s.reader.incognito) return;
         if (s.reader.incognito_extensions.len > 0 and try self.incognitoSource(a, s, shown.chapter_id)) return;
-        const last = shown.pages > 0 and shown.page + 1 >= shown.pages;
+        const last = shown.completed orelse (shown.pages > 0 and shown.page + 1 >= shown.pages);
         const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
         const hash: u32 = @truncate(std.hash.Wyhash.hash(0, shown.chapter_id));
         const ahead = s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash;
@@ -3321,6 +3325,54 @@ test "engine backups carry settings and extensions' settings both ways" {
     try std.testing.expectEqualStrings("abcd", restored_stores[0].signing_key);
 }
 
+test "region reading completes only at the final edge and retains history" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "m", .title = "M", .chapters = &.{.{ .id = "c", .title = "C" }} }} });
+    try engine.pageShown(.{ .chapter_id = "c", .page = 1, .pages = 2, .completed = false, .read_ms = 100 });
+    var chapter = (try engine.loadLibrary(a)).manga[0].chapters[0];
+    try std.testing.expectEqual(@as(u32, 1), chapter.last_page_read);
+    try std.testing.expect(!chapter.read);
+    try std.testing.expectEqual(@as(i64, 100), chapter.read_ms);
+    try std.testing.expect(chapter.last_read != 0);
+    try engine.pageShown(.{ .chapter_id = "c", .page = 1, .pages = 2, .completed = true, .read_ms = 50 });
+    chapter = (try engine.loadLibrary(a)).manga[0].chapters[0];
+    try std.testing.expect(chapter.read);
+    try std.testing.expectEqual(@as(i64, 150), chapter.read_ms);
+    // Revisiting an earlier region never clears a completed chapter.
+    try engine.pageShown(.{ .chapter_id = "c", .page = 0, .pages = 2, .completed = false });
+    try std.testing.expect((try engine.loadLibrary(a)).manga[0].chapters[0].read);
+}
+
+test "explicit region completion respects global incognito" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir });
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "m", .title = "M", .chapters = &.{.{ .id = "c", .title = "C" }} }} });
+    var prefs = try engine.loadSettings(a);
+    prefs.reader.incognito = true;
+    try engine.saveSettings(prefs);
+    try engine.pageShown(.{ .chapter_id = "c", .page = 1, .pages = 2, .completed = true, .read_ms = 100 });
+    const chapter = (try engine.loadLibrary(a)).manga[0].chapters[0];
+    try std.testing.expect(!chapter.read);
+    try std.testing.expectEqual(@as(u32, 0), chapter.last_page_read);
+    try std.testing.expectEqual(@as(i64, 0), chapter.last_read);
+    try std.testing.expectEqual(@as(i64, 0), chapter.read_ms);
+}
+
 test "engine records nothing for sources of extensions read in incognito" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3338,11 +3390,11 @@ test "engine records nothing for sources of extensions read in incognito" {
     var s = try engine.loadSettings(a);
     s.reader.incognito_extensions = &.{"eu.kanade.seven"};
     try engine.saveSettings(s);
-    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2 });
+    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2, .completed = true });
     try std.testing.expectEqual(0, (try engine.loadLibrary(a)).manga[0].chapters[0].last_page_read);
     s.reader.incognito_extensions = &.{};
     try engine.saveSettings(s);
-    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2 });
+    try engine.pageShown(.{ .chapter_id = "7:/c", .page = 1, .pages = 2, .completed = true });
     try std.testing.expect((try engine.loadLibrary(a)).manga[0].chapters[0].read);
 }
 
