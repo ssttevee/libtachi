@@ -92,7 +92,8 @@ pub const Backend = struct {
     pub const VTable = struct {
         /// Runs in the caller's Io task; propagate error.Canceled when that task
         /// is canceled. Foreign work must unwind before releasing its borrowed inputs.
-        /// Returns a reply allocated in `arena`.
+        /// Calls may overlap; serialize internally if the backend requires it.
+        /// Returns a reply allocated in the call's private `arena`.
         run: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, call: Call, status: ?Status) anyerror!Reply,
         /// Whether a call would run without starting the JVM first.
         warm: *const fn (ptr: *anyopaque) bool,
@@ -145,10 +146,7 @@ pub const InProcess = struct {
     /// HotSpot cannot be created twice in a process, so a failed start is final.
     attempted: bool = false,
     lock: Io.Mutex = .init,
-    /// Source of the call in progress, for `cancel`; 0 when none. Locked
-    /// rather than atomic: 32-bit ARM has no 64-bit atomics.
-    current: i64 = 0,
-    current_lock: std.atomic.Mutex = .unlocked,
+    active: ActiveSources = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: Io, options: tachi.Options) InProcess {
         return .{ .gpa = gpa, .io = io, .options = options };
@@ -201,15 +199,16 @@ pub const InProcess = struct {
         const rt = try self.runtime();
         defer rt.detachThread();
         if (status) |s| s.ready(s.context);
+        var active: ActiveSources.Entry = .{ .source = call.source() orelse 0 };
+        if (active.source != 0) self.active.enter(self.io, &active);
+        defer if (active.source != 0) self.active.leave(self.io, &active);
         if (call.source()) |id| {
             if (try rt.extensionToLoad(arena, id)) |name| {
                 if (status) |s| s.loading(s.context, name);
                 try rt.loadSource(id);
                 if (status) |s| s.loading(s.context, null);
             }
-            self.setCurrent(id);
         }
-        defer self.setCurrent(0);
         return switch (call) {
             .sources => .{ .sources = try sources(rt, arena) },
             .extensions => |repo| .{ .extensions = try rt.repoList(arena, repo.options()) },
@@ -256,24 +255,17 @@ pub const InProcess = struct {
         };
     }
 
-    /// Cancels the source client's in-flight requests; JNI calls cannot be
-    /// interrupted otherwise.
-    fn setCurrent(self: *InProcess, id: i64) void {
-        while (!self.current_lock.tryLock()) std.atomic.spinLoopHint();
-        defer self.current_lock.unlock();
-        self.current = id;
-    }
-
+    /// Administrative HTTP cancellation for every active source. Individual
+    /// operations are canceled through their own Io tasks instead.
     pub fn cancel(self: *InProcess) void {
-        const id = blk: {
-            while (!self.current_lock.tryLock()) std.atomic.spinLoopHint();
-            defer self.current_lock.unlock();
-            break :blk self.current;
+        const Cancel = struct {
+            fn source(instance: *InProcess, id: i64) void {
+                const rt = instance.rt orelse return;
+                rt.cancelRequests(id) catch {};
+                rt.detachThread();
+            }
         };
-        if (id == 0) return;
-        const rt = self.rt orelse return;
-        rt.cancelRequests(id) catch {};
-        rt.detachThread();
+        self.active.visit(self.io, self, Cancel.source);
     }
 
     fn runErased(ptr: *anyopaque, arena: std.mem.Allocator, call: Call, status: ?Status) anyerror!Reply {
@@ -294,6 +286,65 @@ pub const InProcess = struct {
         self.idle();
     }
 };
+
+// Stack entries live until run returns. Visiting holds an I/O mutex so entries
+// cannot leave while administrative cancellation traverses them; no allocation
+// is needed on the cancellation path, including on 32-bit targets.
+const ActiveSources = struct {
+    list: std.SinglyLinkedList = .{},
+    lock: Io.Mutex = .init,
+
+    const Entry = struct {
+        link: std.SinglyLinkedList.Node = .{},
+        source: i64,
+    };
+    fn enter(self: *ActiveSources, io: Io, entry: *Entry) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.list.prepend(&entry.link);
+    }
+    fn leave(self: *ActiveSources, io: Io, entry: *Entry) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.list.remove(&entry.link);
+    }
+    fn visit(self: *ActiveSources, io: Io, context: anytype, comptime callback: anytype) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var link = self.list.first;
+        while (link) |node| : (link = node.next) {
+            const entry: *Entry = @fieldParentPtr("link", node);
+            callback(context, entry.source);
+        }
+    }
+};
+
+test "administrative cancellation retains every active source when another call finishes" {
+    const io = std.testing.io;
+    var active: ActiveSources = .{};
+    var first: ActiveSources.Entry = .{ .source = 1 };
+    var second: ActiveSources.Entry = .{ .source = 2 };
+    var third: ActiveSources.Entry = .{ .source = 1 };
+    active.enter(io, &first);
+    active.enter(io, &second);
+    active.enter(io, &third);
+    active.leave(io, &first);
+    const Canceled = struct {
+        ids: [3]i64 = undefined,
+        count: usize = 0,
+        fn source(self: *@This(), id: i64) void {
+            self.ids[self.count] = id;
+            self.count += 1;
+        }
+    };
+    var canceled: Canceled = .{};
+    active.visit(io, &canceled, Canceled.source);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, canceled.ids[0..canceled.count]);
+    active.leave(io, &third);
+    active.leave(io, &second);
+    active.visit(io, &canceled, Canceled.source);
+    try std.testing.expectEqual(2, canceled.count);
+}
 
 fn sources(rt: *tachi.Runtime, arena: std.mem.Allocator) ![]const models.SourceInfo {
     const extensions = try into([]const models.ExtensionInfo, arena, try rt.listExtensions(), rt.gpa);
