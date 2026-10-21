@@ -17,6 +17,7 @@ const models = @import("models.zig");
 const manage = @import("manage.zig");
 const library = @import("library.zig");
 const downloads = @import("downloads.zig");
+const parallel = @import("parallel.zig");
 const local = @import("local.zig");
 const backup = @import("backup.zig");
 const settings = @import("settings.zig");
@@ -181,6 +182,8 @@ pub const Phase = enum(u8) {
 pub const Options = struct {
     /// The library directory: `library.json`, `downloads/` and `local/`.
     dir: []const u8,
+    /// Maximum independent operations per search, chapter or bulk I/O loop.
+    parallelism: usize = parallel.default_limit,
     /// PEM roots for native downloads; null uses the system's.
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
@@ -1461,28 +1464,46 @@ pub const Engine = struct {
             try targets.append(a, source);
         }
         job.pages_total.store(targets.items.len, .release);
-        // One source at a time: backends run one call at a time.
-        for (targets.items, 1..) |source, done| {
-            try self.io.checkCancel();
-            var result: SearchResult = .{ .source = source, .pinned = views.sourcePinned(source, s.browse) };
-            const id = source.idInt() catch unreachable;
-            if (job.call(.{ .browse = .{ .source = id, .kind = .{ .search = .{ .query = query } } } })) |reply| {
+        // Independent sources overlap; a worker backend still serializes its connection.
+        const Search = struct {
+            job: *Job,
+            targets: []const models.SourceInfo,
+            browse: @FieldType(settings.Settings, "browse"),
+            query: []const u8,
+
+            fn work(ctx: *@This(), scratch: std.mem.Allocator, index: usize) !SearchResult {
+                const source = ctx.targets[index];
+                var result: SearchResult = .{ .source = source, .pinned = views.sourcePinned(source, ctx.browse) };
+                tachi.setLastError("");
+                const reply = ctx.job.engine.backend.run(scratch, .{ .browse = .{
+                    .source = source.idInt() catch unreachable,
+                    .kind = .{ .search = .{ .query = ctx.query } },
+                } }, ctx.job.status()) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => {
+                        result.failure = try std.fmt.allocPrint(scratch, "{s}: {s}", .{ @errorName(err), tachi.lastError() });
+                        return result;
+                    },
+                };
                 var seen: std.StringHashMapUnmanaged(void) = .empty;
                 var mangas: std.ArrayList(models.Manga) = .empty;
                 if (reply.page) |page| for (page.mangas) |m| {
-                    if ((try seen.getOrPut(a, m.url)).found_existing) continue;
-                    try mangas.append(a, m);
+                    if ((try seen.getOrPut(scratch, m.url)).found_existing) continue;
+                    try mangas.append(scratch, m);
                 };
                 result.mangas = mangas.items;
-            } else |err| switch (err) {
-                error.Canceled => return err,
-                else => result.failure = try std.fmt.allocPrint(a, "{s}: {s}", .{ @errorName(err), tachi.lastError() }),
+                return result;
             }
-            while (!job.search_lock.tryLock()) std.atomic.spinLoopHint();
-            defer job.search_lock.unlock();
-            try job.search_partial.append(a, result);
-            job.pages_done.store(done, .release);
-        }
+            fn publish(ctx: *@This(), _: usize, result: SearchResult, scratch: *std.heap.ArenaAllocator) !void {
+                try ctx.job.keepArena(scratch);
+                while (!ctx.job.search_lock.tryLock()) std.atomic.spinLoopHint();
+                defer ctx.job.search_lock.unlock();
+                try ctx.job.search_partial.append(ctx.job.arena.allocator(), result);
+                ctx.job.pages_done.store(ctx.job.search_partial.items.len, .release);
+            }
+        };
+        var search: Search = .{ .job = job, .targets = targets.items, .browse = s.browse, .query = query };
+        try parallel.run(self.gpa, self.io, targets.items.len, self.options.parallelism, &search, Search.work, Search.publish);
         const results = try a.dupe(SearchResult, job.search_partial.items);
         sortSearch(results);
         job.result.search = results;
@@ -2509,6 +2530,7 @@ fn findChapter(lib: library.Library, chapter_id: []const u8) ?Found {
 /// `pages_total`, `join` it, then read `result` or `failure`.
 pub const Job = struct {
     arena: std.heap.ArenaAllocator,
+    retained_arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
     engine: *Engine,
     request: Request,
     result: Result = .{},
@@ -2533,6 +2555,7 @@ pub const Job = struct {
     /// Milliseconds the JVM took to start for this job, if it had to.
     start_ms: u64 = 0,
     starting_at: u64 = 0,
+    status_lock: std.atomic.Mutex = .unlocked,
 
     /// Copies `request`, so the caller's memory may go away.
     pub fn start(engine: *Engine, request: Request) !*Job {
@@ -2575,11 +2598,15 @@ pub const Job = struct {
     }
     fn starting(context: *anyopaque) void {
         const self: *Job = @ptrCast(@alignCast(context));
+        while (!self.status_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.status_lock.unlock();
         self.starting_at = tachi.worker.tachi_now_ms();
         self.phase.store(.starting, .release);
     }
     fn ready(context: *anyopaque) void {
         const self: *Job = @ptrCast(@alignCast(context));
+        while (!self.status_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.status_lock.unlock();
         if (self.starting_at != 0 and self.start_ms == 0) self.start_ms = tachi.worker.tachi_now_ms() - self.starting_at;
         self.phase.store(.operation, .release);
     }
@@ -2697,9 +2724,16 @@ pub const Job = struct {
         self.future = null;
     }
 
+    /// Keeps worker output alive for this job; called only during serial publication.
+    fn keepArena(self: *Job, scratch: *std.heap.ArenaAllocator) !void {
+        try self.retained_arenas.append(self.arena.allocator(), scratch.*);
+        scratch.* = .init(self.engine.gpa);
+    }
+
     pub fn deinit(self: *Job) void {
         self.join();
         const gpa = self.engine.gpa;
+        for (self.retained_arenas.items) |*arena| arena.deinit();
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -2892,7 +2926,9 @@ test "engine searches sources globally and migrates a title as Mihon does" {
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
 
     const Fake = struct {
-        fn run(_: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+        second: Io.Event = .unset,
+        fn run(ptr: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             if (status) |s| s.ready(s.context);
             const info: models.SourceInfo = .{ .id = "", .name = "", .lang = "en", .supportsLatest = true, .isConfigurable = false, .className = "", .extensionPkg = "" };
             return switch (c) {
@@ -2907,7 +2943,14 @@ test "engine searches sources globally and migrates a title as Mihon does" {
                 },
                 .browse => |b| switch (b.source) {
                     3 => error.ExtensionError,
-                    else => .{ .page = .{ .mangas = &.{ .{ .url = "/x", .title = "X" }, .{ .url = "/x", .title = "X again" } }, .hasNextPage = false } },
+                    else => blk: {
+                        // Source one cannot finish until source two starts.
+                        if (b.source == 1) try self.second.wait(std.testing.io);
+                        if (b.source == 2) self.second.set(std.testing.io);
+                        const mangas = try arena.dupe(models.Manga, &.{ .{ .url = "/x", .title = "X" }, .{ .url = "/x", .title = "X again" } });
+                        mangas[0].title = try arena.dupe(u8, "X");
+                        break :blk .{ .page = .{ .mangas = mangas, .hasNextPage = false } };
+                    },
                 },
                 .update => |u| .{ .update = .{ .manga = .{ .url = u.manga.url, .title = "Target" }, .chapters = &.{
                     .{ .url = "/t3", .name = "Chapter 3" },
@@ -2922,7 +2965,7 @@ test "engine searches sources globally and migrates a title as Mihon does" {
         }
         fn none(_: *anyopaque) void {}
     };
-    var state: u8 = 0;
+    var state: Fake = .{};
     const backend: be.Backend = .{ .ptr = &state, .vtable = &.{ .run = Fake.run, .warm = Fake.yes, .cancel = Fake.none, .release = Fake.none, .idle = Fake.none } };
     var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir });
     defer engine.queue.deinit(&engine);
@@ -2938,7 +2981,10 @@ test "engine searches sources globally and migrates a title as Mihon does" {
     defer search.deinit();
     try std.testing.expect(search.failure == null);
     const results = search.result.search;
+    try std.testing.expect(state.second.isSet());
     try std.testing.expectEqual(3, results.len);
+    try std.testing.expectEqual(3, search.pages_done.load(.acquire));
+    try std.testing.expectEqualStrings("X", results[0].mangas[0].title);
     try std.testing.expectEqualStrings("New", results[0].source.name);
     try std.testing.expectEqual(1, results[0].mangas.len);
     try std.testing.expectEqualStrings("Old", results[1].source.name);
