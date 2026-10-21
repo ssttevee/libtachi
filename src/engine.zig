@@ -354,35 +354,50 @@ pub const Engine = struct {
         return stores.Store.fromIndex(try repo.fetchIndex(&http, a, url), url);
     }
 
-    /// Mihon's refresh: each store fetched again in turn, failures logged;
+    /// Fetches stores concurrently, logging individual failures;
     /// a store whose URL moved is kept under its new URL.
     fn refreshStores(self: *Engine, job: *Job) !void {
         const a = job.arena.allocator();
         const before = try stores.File.load(a, self.io, self.options.dir);
-        const Refreshed = struct { old: []const u8, store: stores.Store };
-        var refreshed: std.ArrayList(Refreshed) = .empty;
-        var failed: usize = 0;
-        for (before.stores) |s| {
-            try self.io.checkCancel();
-            const store = self.fetchStore(a, s.index_url) catch |err| {
-                log.warn("store {s} not refreshed: {s}", .{ s.index_url, @errorName(err) });
-                failed += 1;
-                continue;
-            };
-            try refreshed.append(a, .{ .old = s.index_url, .store = store });
-        }
+        const refreshed = try a.alloc(?stores.Store, before.stores.len);
+        @memset(refreshed, null);
+        const Refresh = struct {
+            job: *Job,
+            stores_before: []const stores.Store,
+            refreshed: []?stores.Store,
+            failed: usize = 0,
+            fn work(ctx: *@This(), scratch: std.mem.Allocator, i: usize) !?stores.Store {
+                const url = ctx.stores_before[i].index_url;
+                return ctx.job.engine.fetchStore(scratch, url) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => {
+                        log.warn("store {s} not refreshed: {s}", .{ url, @errorName(err) });
+                        return null;
+                    },
+                };
+            }
+            fn publish(ctx: *@This(), i: usize, result: ?stores.Store, scratch: *std.heap.ArenaAllocator) !void {
+                if (result) |store| {
+                    try ctx.job.keepArena(scratch);
+                    ctx.refreshed[i] = store;
+                } else ctx.failed += 1;
+            }
+        };
+        var refresh: Refresh = .{ .job = job, .stores_before = before.stores, .refreshed = refreshed };
+        try parallel.run(self.gpa, self.io, before.stores.len, self.options.parallelism, &refresh, Refresh.work, Refresh.publish);
         // Stores removed meanwhile stay removed.
         var file = try stores.File.load(a, self.io, self.options.dir);
-        for (refreshed.items) |r| {
+        for (before.stores, refreshed) |previous, result| {
+            const store = result orelse continue;
             const present = for (file.stores) |s| {
-                if (std.mem.eql(u8, s.index_url, r.old)) break true;
+                if (std.mem.eql(u8, s.index_url, previous.index_url)) break true;
             } else false;
             if (!present) continue;
-            file = try file.upsert(a, r.store);
-            if (!std.mem.eql(u8, r.old, r.store.index_url)) file = try file.remove(a, r.old);
+            file = try file.upsert(a, store);
+            if (!std.mem.eql(u8, previous.index_url, store.index_url)) file = try file.remove(a, previous.index_url);
         }
         try file.save(a, self.io, self.options.dir);
-        job.result.message = if (failed == 0) "Stores refreshed" else try std.fmt.allocPrint(a, "Stores refreshed; {d} could not be reached", .{failed});
+        job.result.message = if (refresh.failed == 0) "Stores refreshed" else try std.fmt.allocPrint(a, "Stores refreshed; {d} could not be reached", .{refresh.failed});
     }
 
     /// One store's listing, or every configured store's merged as Mihon
@@ -394,20 +409,34 @@ pub const Engine = struct {
             job.result.extensions = (try job.call(.{ .extensions = r })).extensions;
             return;
         }
-        var listings: std.ArrayList([]const manage.RepoEntry) = .empty;
-        for (file.stores) |s| {
-            try self.io.checkCancel();
-            // A store that fails contributes nothing, as in Mihon.
-            const reply = job.call(.{ .extensions = .{ .url = s.index_url, .refresh = r.refresh } }) catch |err| switch (err) {
-                error.Canceled => return err,
-                else => {
-                    log.warn("store {s} not listed: {s}", .{ s.index_url, @errorName(err) });
-                    continue;
-                },
-            };
-            try listings.append(a, reply.extensions);
-        }
-        const merged = try stores.merge(a, listings.items);
+        const listings = try a.alloc([]const manage.RepoEntry, file.stores.len);
+        @memset(listings, &.{});
+        const Listing = struct {
+            job: *Job,
+            configured: []const stores.Store,
+            refresh: bool,
+            listings: [][]const manage.RepoEntry,
+            fn work(ctx: *@This(), scratch: std.mem.Allocator, i: usize) ![]const manage.RepoEntry {
+                const url = ctx.configured[i].index_url;
+                tachi.setLastError("");
+                const reply = ctx.job.engine.backend.run(scratch, .{ .extensions = .{ .url = url, .refresh = ctx.refresh } }, ctx.job.status()) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => {
+                        log.warn("store {s} not listed: {s}", .{ url, @errorName(err) });
+                        return &.{};
+                    },
+                };
+                return reply.extensions;
+            }
+            fn publish(ctx: *@This(), i: usize, entries: []const manage.RepoEntry, scratch: *std.heap.ArenaAllocator) !void {
+                try ctx.job.keepArena(scratch);
+                ctx.listings[i] = entries;
+            }
+        };
+        var listing: Listing = .{ .job = job, .configured = file.stores, .refresh = r.refresh, .listings = listings };
+        try parallel.run(self.gpa, self.io, file.stores.len, self.options.parallelism, &listing, Listing.work, Listing.publish);
+        // Completion order must not change store precedence for equal versions.
+        const merged = try stores.merge(a, listings);
         var installed: std.ArrayList([]const u8) = .empty;
         for (merged) |e| if (e.installed) try installed.append(a, e.pkg);
         for (try self.installedPackages(a)) |pkg| {
@@ -3278,6 +3307,7 @@ test "engine merges store listings and keeps only trusted extension files" {
 
     const Fake = struct {
         uninstalled: usize = 0,
+        second: Io.Event = .unset,
         fn entry(pkg: []const u8, code: i64, signing_key: []const u8, lang: []const u8) manage.RepoEntry {
             return .{ .pkg = pkg, .name = pkg, .versionName = "", .versionCode = code, .libVersion = "1.4", .nsfw = false, .lang = lang, .jarUrl = null, .apkUrl = "", .iconUrl = "", .supported = true, .installed = false, .installedVersionCode = null, .hasUpdate = false, .sources = &.{}, .signingKey = signing_key };
         }
@@ -3285,12 +3315,17 @@ test "engine merges store listings and keeps only trusted extension files" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (status) |s| s.ready(s.context);
             return switch (c) {
-                .extensions => |r| if (std.mem.indexOf(u8, r.url.?, "one") != null)
-                    .{ .extensions = try arena.dupe(manage.RepoEntry, &.{ entry("eu.signed", 3, "k1", "en"), entry("eu.french", 1, "k1", "fr") }) }
-                else if (std.mem.indexOf(u8, r.url.?, "two") != null)
-                    .{ .extensions = try arena.dupe(manage.RepoEntry, &.{entry("eu.signed", 4, "k1", "en")}) }
-                else
-                    error.NetworkError,
+                .extensions => |r| blk: {
+                    if (std.mem.indexOf(u8, r.url.?, "one") != null) {
+                        try self.second.wait(std.testing.io);
+                        break :blk .{ .extensions = try arena.dupe(manage.RepoEntry, &.{ entry("eu.signed", 3, "k1", "en"), entry("eu.french", 1, "k1", "fr") }) };
+                    }
+                    if (std.mem.indexOf(u8, r.url.?, "two") != null) {
+                        self.second.set(std.testing.io);
+                        break :blk .{ .extensions = try arena.dupe(manage.RepoEntry, &.{entry("eu.signed", 4, "k1", "en")}) };
+                    }
+                    return error.NetworkError;
+                },
                 .install_file => .{},
                 .uninstall => blk: {
                     self.uninstalled += 1;
@@ -3319,6 +3354,7 @@ test "engine merges store listings and keeps only trusted extension files" {
     const list = try Job.start(&engine, .{ .extensions = .{} });
     list.join();
     try std.testing.expect(list.failure == null);
+    try std.testing.expect(fake.second.isSet());
     try std.testing.expectEqual(1, list.result.extensions.len);
     try std.testing.expectEqual(4, list.result.extensions[0].versionCode);
     try std.testing.expectEqual(2, list.result.obsolete.len);
@@ -3563,4 +3599,64 @@ test "canceling one engine job does not invoke backend-wide cancellation" {
     fake.release.set(io);
     second.join();
     try std.testing.expect(second.failure == null);
+}
+
+test "store refresh overlaps requests and retains unreachable stores" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Fixture = struct {
+        server: *Io.net.Server,
+        fn accept(self: *@This()) !Io.net.Stream {
+            const stream = try self.server.accept(std.testing.io);
+            errdefer stream.close(std.testing.io);
+            var buffer: [4096]u8 = undefined;
+            var reader = stream.reader(std.testing.io, &buffer);
+            while ((try reader.interface.takeDelimiterInclusive('\n')).len > 2) {}
+            return stream;
+        }
+        fn serve(self: *@This()) !void {
+            const first = try self.accept();
+            defer first.close(std.testing.io);
+            const second = try self.accept();
+            defer second.close(std.testing.io);
+            const json = "{\"name\":\"Fresh\",\"badgeLabel\":\"F\",\"signingKey\":\"key\",\"contact\":{\"website\":\"\"}}";
+            for ([_]Io.net.Stream{ second, first }) |stream| {
+                var writer = stream.writer(std.testing.io, &.{});
+                try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ json.len, json });
+                try writer.interface.flush();
+            }
+            const failed = try self.accept();
+            defer failed.close(std.testing.io);
+            var writer = failed.writer(std.testing.io, &.{});
+            try writer.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            try writer.interface.flush();
+        }
+    };
+    var fixture: Fixture = .{ .server = &server };
+    var serving = try io.concurrent(Fixture.serve, .{&fixture});
+    defer _ = serving.cancel(io) catch {};
+    var configured: [3]stores.Store = undefined;
+    for (&configured, 0..) |*store, i| store.* = .{ .index_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/{d}.json", .{ server.socket.address.getPort(), i }), .name = "Old" };
+    try (stores.File{ .stores = &configured }).save(a, io, dir);
+    var engine: Engine = .init(std.testing.allocator, io, be.none, .{ .dir = dir, .parallelism = 2 });
+    defer engine.deinit();
+    const job = try Job.start(&engine, .refresh_stores);
+    defer job.deinit();
+    job.join();
+    try std.testing.expect(job.failure == null);
+    try serving.await(io);
+    const refreshed = try stores.File.load(a, io, dir);
+    try std.testing.expectEqual(3, refreshed.stores.len);
+    try std.testing.expectEqualStrings("Fresh", refreshed.stores[0].name);
+    try std.testing.expectEqualStrings("Fresh", refreshed.stores[1].name);
+    try std.testing.expectEqualStrings("Old", refreshed.stores[2].name);
+    try std.testing.expectEqualStrings("Stores refreshed; 1 could not be reached", job.result.message);
 }
