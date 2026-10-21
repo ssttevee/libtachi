@@ -1,12 +1,14 @@
 //! Chapter downloads without the JVM. `Runtime.imageRequests` plans each page
 //! as the request the source's client would send; this module sends the ones
 //! that are safe to send natively, honours the source's rate limits, and hands
-//! the rest back to the JVM through a `Fallback`. Pages are saved one at a time
+//! the rest back to the JVM through a `Fallback`. Pages are saved atomically
 //! and survive failure or cancellation, so a retry resumes the chapter.
 const std = @import("std");
 const Io = std.Io;
 const models = @import("models.zig");
 const library = @import("library.zig");
+const parallel = @import("parallel.zig");
+const tachi = @import("tachi.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -35,6 +37,7 @@ pub fn allNative(plan: []const ImageRequest) bool {
 /// by the source's interceptor, so one shared rule spaces requests across hosts.
 pub const Limiter = struct {
     next: std.StringHashMap(i64),
+    lock: Io.Mutex = .init,
 
     pub fn init(gpa: std.mem.Allocator) Limiter {
         return .{ .next = .init(gpa) };
@@ -55,7 +58,11 @@ pub const Limiter = struct {
         return until - now;
     }
     pub fn wait(self: *Limiter, io: Io, rates: []const Rate) !void {
-        const ms = try self.delay(rates, millis(io));
+        const ms = blk: {
+            try self.lock.lock(io);
+            defer self.lock.unlock(io);
+            break :blk try self.delay(rates, millis(io));
+        };
         if (ms > 0) try io.sleep(.fromMilliseconds(ms), .awake);
     }
 };
@@ -268,7 +275,8 @@ fn sleep(io: Io, duration: Io.Duration) Io.Cancelable!void {
 pub const Fallback = struct {
     context: *anyopaque,
     /// Returns the image bytes, allocated with `gpa`. `reason` says why the
-    /// page cannot be sent natively.
+    /// page cannot be sent natively. Calls may overlap and must honor Io cancellation.
+    /// The callback must keep its own mutable state and allocations thread-safe.
     fetch: *const fn (context: *anyopaque, gpa: std.mem.Allocator, request: ImageRequest, reason: []const u8) anyerror![]u8,
 };
 
@@ -289,6 +297,8 @@ pub const Options = struct {
     /// The library directory; pages are saved under its `downloads/`.
     dir: []const u8,
     chapter_id: []const u8,
+    /// Maximum pages in flight; callbacks are serialized in completion order.
+    parallelism: usize = parallel.default_limit,
     /// PEM roots for HTTPS. Null uses the system's.
     ca_file: ?[]const u8 = null,
     /// How pages that need the JVM are fetched; without one they fail with `error.NeedsJvm`.
@@ -298,7 +308,7 @@ pub const Options = struct {
     page_timeout: Io.Duration = .fromSeconds(120),
     /// Where pages go, relative to `dir`.
     root: []const u8 = "downloads",
-    /// The order to fetch pages in, as indexes; null is first to last.
+    /// Dispatch priority, as a permutation of page indexes; null is first to last.
     order: ?[]const usize = null,
     /// Waits before each retry of a failed page.
     retry_ms: []const u32 = mihon_retry_ms,
@@ -335,69 +345,143 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
     const store = try PageStore.initIn(arena, io, options.dir, options.root, options.chapter_id, plan);
     const reuse: ?PageStore = if (options.reuse) |root| try PageStore.initIn(arena, io, options.dir, root, options.chapter_id, plan) else null;
     const paths = try arena.alloc([]const u8, plan.len);
-    var fetcher: Fetcher = .{ .gpa = gpa, .io = io, .store = store, .options = options, .client = .{ .allocator = gpa, .io = io }, .limiter = .init(gpa) };
-    defer fetcher.client.deinit();
-    defer fetcher.limiter.deinit();
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var limiter: Limiter = .init(gpa);
+    defer limiter.deinit();
+    var https: Https = .{};
     const started = millis(io);
-    var stats: Stats = .{};
     const order = options.order orelse blk: {
         const all = try arena.alloc(usize, plan.len);
         for (all, 0..) |*i, n| i.* = n;
         break :blk all;
     };
-    for (order, 1..) |i, done| {
-        try io.checkCancel();
-        if (try store.complete(i)) |path| {
-            paths[i] = path;
-            stats.resumed += 1;
-        } else if (if (reuse) |r| try r.complete(i) else null) |cached| {
-            const bytes = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ options.dir, cached }), gpa, .limited(max_image));
-            defer gpa.free(bytes);
-            paths[i] = try store.put(i, bytes);
-            stats.resumed += 1;
-        } else {
+    // Duplicate indexes would race the same temporary file; missing ones would
+    // leave uninitialized paths in the returned chapter.
+    if (order.len != plan.len) return error.InvalidPageOrder;
+    const seen = try gpa.alloc(bool, plan.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    for (order) |i| {
+        if (i >= plan.len or seen[i]) return error.InvalidPageOrder;
+        seen[i] = true;
+    }
+    const Pages = struct {
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        io: Io,
+        plan: []const ImageRequest,
+        order: []const usize,
+        options: Options,
+        store: PageStore,
+        reuse: ?PageStore,
+        client: *std.http.Client,
+        limiter: *Limiter,
+        https: *Https,
+        paths: [][]const u8,
+        stats: Stats = .{},
+        done: usize = 0,
+
+        const Result = struct {
+            path: []const u8 = "",
+            stats: Stats = .{},
+            failure: ?anyerror = null,
+            diagnostic: []const u8 = "",
+        };
+
+        fn work(ctx: *@This(), scratch: std.mem.Allocator, index: usize) !Result {
+            tachi.setLastError("");
+            return ctx.fetch(scratch, ctx.order[index]) catch |err| .{
+                .failure = err,
+                .diagnostic = try scratch.dupe(u8, tachi.lastError()),
+            };
+        }
+        fn fetch(ctx: *@This(), scratch: std.mem.Allocator, i: usize) !Result {
+            var page_store = ctx.store;
+            page_store.arena = scratch;
+            if (try page_store.complete(i)) |path| return .{ .path = path, .stats = .{ .resumed = 1 } };
+            if (ctx.reuse) |original| {
+                var cached_store = original;
+                cached_store.arena = scratch;
+                if (try cached_store.complete(i)) |cached| {
+                    const bytes = try Io.Dir.cwd().readFileAlloc(ctx.io, try std.fs.path.join(scratch, &.{ ctx.options.dir, cached }), ctx.gpa, .limited(max_image));
+                    defer ctx.gpa.free(bytes);
+                    return .{ .path = try page_store.put(i, bytes), .stats = .{ .resumed = 1 } };
+                }
+            }
+            var fetcher: Fetcher = .{ .gpa = ctx.gpa, .io = ctx.io, .store = page_store, .options = ctx.options, .client = ctx.client, .limiter = ctx.limiter, .https = ctx.https };
+            var stats: Stats = .{};
             var attempt: usize = 0;
-            const t = while (true) : (attempt += 1) {
-                break fetcher.page(plan, i, &stats) catch |err| switch (err) {
+            const transfer = while (true) : (attempt += 1) {
+                break fetcher.page(ctx.plan, i, &stats) catch |err| switch (err) {
                     error.Canceled, error.OutOfMemory => return err,
                     else => {
-                        if (attempt >= options.retry_ms.len or err == error.NeedsJvm) {
-                            if (!options.keep_going) return err;
-                            paths[i] = "";
-                            if (options.progress) |progress| if (progress.failed) |report| report(progress.context, i, err);
-                            break null;
-                        }
-                        log.info("page {d}/{d} failed ({s}); retrying in {d} ms", .{ i + 1, plan.len, @errorName(err), options.retry_ms[attempt] });
-                        try io.sleep(.fromMilliseconds(options.retry_ms[attempt]), .awake);
+                        if (attempt >= ctx.options.retry_ms.len or err == error.NeedsJvm) return err;
+                        log.info("page {d}/{d} failed ({s}); retrying in {d} ms", .{ i + 1, ctx.plan.len, @errorName(err), ctx.options.retry_ms[attempt] });
+                        try ctx.io.sleep(.fromMilliseconds(ctx.options.retry_ms[attempt]), .awake);
                         continue;
                     },
                 };
             };
-            const transfer = t orelse continue;
-            paths[i] = transfer.path;
-            stats.bytes += transfer.bytes;
-            stats.network_ms += transfer.network_ms;
-            stats.disk_ms += transfer.disk_ms;
-            log.info("page {d}/{d} bytes={d} network_ms={d} head_ms={d} body_ms={d} disk_ms={d}", .{ i + 1, plan.len, transfer.bytes, transfer.network_ms, transfer.head_ms, transfer.network_ms - transfer.head_ms, transfer.disk_ms });
+            stats.bytes = transfer.bytes;
+            stats.network_ms = transfer.network_ms;
+            stats.disk_ms = transfer.disk_ms;
+            log.info("page {d}/{d} bytes={d} network_ms={d} head_ms={d} body_ms={d} disk_ms={d}", .{ i + 1, ctx.plan.len, transfer.bytes, transfer.network_ms, transfer.head_ms, transfer.network_ms - transfer.head_ms, transfer.disk_ms });
+            return .{ .path = transfer.path, .stats = stats };
         }
-        if (options.progress) |progress| {
-            if (progress.page) |report| report(progress.context, i, paths[i]);
-            progress.report(progress.context, done, plan.len);
+        fn publish(ctx: *@This(), index: usize, result: Result, _: *std.heap.ArenaAllocator) !void {
+            const i = ctx.order[index];
+            if (result.failure) |err| {
+                tachi.setLastError(result.diagnostic);
+                switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => if (!ctx.options.keep_going) return err,
+                }
+                ctx.paths[i] = "";
+                if (ctx.options.progress) |progress| if (progress.failed) |report| report(progress.context, i, err);
+            } else {
+                ctx.paths[i] = try ctx.arena.dupe(u8, result.path);
+                inline for (.{ "resumed", "native", "bytes", "network_ms", "disk_ms" }) |field| @field(ctx.stats, field) += @field(result.stats, field);
+                if (ctx.options.progress) |progress| if (progress.page) |report| report(progress.context, i, ctx.paths[i]);
+            }
+            ctx.done += 1;
+            if (ctx.options.progress) |progress| progress.report(progress.context, ctx.done, ctx.plan.len);
         }
-    }
-    try io.checkCancel();
-    stats.elapsed_ms = millis(io) - started;
-    return .{ .pages = paths, .stats = stats };
+    };
+    var pages: Pages = .{ .gpa = gpa, .arena = arena, .io = io, .plan = plan, .order = order, .options = options, .store = store, .reuse = reuse, .client = &client, .limiter = &limiter, .https = &https, .paths = paths };
+    try parallel.run(gpa, io, plan.len, options.parallelism, &pages, Pages.work, Pages.publish);
+    pages.stats.elapsed_ms = millis(io) - started;
+    return .{ .pages = paths, .stats = pages.stats };
 }
+
+// Configure the shared client's trust roots once, before any HTTPS request.
+const Https = struct {
+    lock: Io.Mutex = .init,
+    ready: bool = false,
+
+    fn prepare(self: *Https, client: *std.http.Client, gpa: std.mem.Allocator, io: Io, ca_file: ?[]const u8) !void {
+        try self.lock.lock(io);
+        defer self.lock.unlock(io);
+        if (self.ready) return;
+        const now = Io.Clock.real.now(io);
+        if (ca_file) |ca| {
+            try client.ca_bundle.addCertsFromFilePath(gpa, io, now, Io.Dir.cwd(), ca);
+        } else {
+            try client.ca_bundle.rescan(gpa, io, now);
+        }
+        client.now = now;
+        self.ready = true;
+    }
+};
 
 const Fetcher = struct {
     gpa: std.mem.Allocator,
     io: Io,
     store: PageStore,
     options: Options,
-    client: std.http.Client,
-    limiter: Limiter,
-    https_ready: bool = false,
+    client: *std.http.Client,
+    limiter: *Limiter,
+    https: *Https,
 
     /// One attempt at page `i`: natively if it can be, else through the JVM.
     fn page(self: *Fetcher, plan: []const ImageRequest, i: usize, stats: *Stats) !Transfer {
@@ -406,17 +490,8 @@ const Fetcher = struct {
         try self.limiter.wait(io, request.rates);
         var reason = request.fallback orelse "unsupported URI or method";
         if (nativeEligible(request)) {
-            if (!self.https_ready and std.mem.startsWith(u8, request.url, "https://")) {
-                // A given CA file is the only trust source: setting `now`
-                // stops the client rescanning the system's roots.
-                if (self.options.ca_file) |ca| {
-                    const now = Io.Clock.real.now(io);
-                    try self.client.ca_bundle.addCertsFromFilePath(self.gpa, io, now, Io.Dir.cwd(), ca);
-                    self.client.now = now;
-                }
-                self.https_ready = true;
-            }
-            if (fetchTimed(&self.client, self.store, i, request, self.options.page_timeout)) |transfer| {
+            if (std.mem.startsWith(u8, request.url, "https://")) try self.https.prepare(self.client, self.gpa, io, self.options.ca_file);
+            if (fetchTimed(self.client, self.store, i, request, self.options.page_timeout)) |transfer| {
                 stats.native += 1;
                 return transfer;
             } else |err| switch (err) {
@@ -665,7 +740,7 @@ test "downloadChapter sends pages natively, hands redirects to the JVM and resum
         }
     };
     var jvm: Jvm = .{ .arena = a };
-    const options: Options = .{ .dir = root, .chapter_id = "1:/c", .fallback = .{ .context = &jvm, .fetch = Jvm.fetchPage } };
+    const options: Options = .{ .dir = root, .chapter_id = "1:/c", .parallelism = 1, .fallback = .{ .context = &jvm, .fetch = Jvm.fetchPage } };
     const first = try downloadChapter(std.testing.allocator, a, io, plan, options);
     try std.testing.expectEqual(3, first.pages.len);
     try std.testing.expectEqual(1, first.stats.native);
@@ -685,4 +760,182 @@ test "reading order starts at the page, goes back one, forward, then back" {
     try std.testing.expectEqualSlices(usize, &.{ 3, 2, 4, 5, 1, 0 }, try readingOrder(a, 6, 3));
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, try readingOrder(a, 3, 0));
     try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, try readingOrder(a, 3, 9));
+}
+
+test "parallel pages retain reading order, retry independently and publish monotonic progress" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Fixture = struct {
+        io: Io,
+        first: Io.Event = .unset,
+        release: Io.Event = .unset,
+        attempts: [4]std.atomic.Value(usize) = @splat(.init(0)),
+        done: usize = 0,
+        ready: [3]usize = undefined,
+        ready_count: usize = 0,
+        failed: usize = 0,
+
+        fn fetchPage(ptr: *anyopaque, gpa: std.mem.Allocator, request: ImageRequest, _: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const i: usize = @intCast(request.page.index);
+            const attempt = self.attempts[i].fetchAdd(1, .acq_rel);
+            if (i == 0) {
+                self.first.set(self.io);
+                try self.release.wait(self.io);
+            }
+            if (i == 1) {
+                try self.first.wait(self.io);
+                if (attempt == 0) return error.Transient;
+            }
+            if (i == 2) {
+                tachi.setLastError("permanent failure");
+                return error.BadPage;
+            }
+            return std.fmt.allocPrint(gpa, "\x89PNG\r\n\x1a\npage {d}", .{i});
+        }
+        fn report(ptr: *anyopaque, done: usize, total: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(total == 4 and done == self.done + 1);
+            self.done = done;
+        }
+        fn page(ptr: *anyopaque, index: usize, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ready[self.ready_count] = index;
+            self.ready_count += 1;
+            if (index == 1) self.release.set(self.io);
+        }
+        fn failedPage(ptr: *anyopaque, index: usize, err: anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(index == 2 and err == error.BadPage);
+            std.debug.assert(std.mem.eql(u8, "permanent failure", tachi.lastError()));
+            self.failed += 1;
+        }
+    };
+    var fixture: Fixture = .{ .io = io };
+    var plan: [4]ImageRequest = undefined;
+    for (&plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(a, "/{d}", .{i}) }, .url = "jvm://page", .method = "GET", .headers = &.{} };
+    const chapter = try downloadChapter(std.testing.allocator, a, io, &plan, .{
+        .dir = root,
+        .chapter_id = "parallel",
+        .parallelism = 2,
+        .retry_ms = &.{0},
+        .keep_going = true,
+        .fallback = .{ .context = &fixture, .fetch = Fixture.fetchPage },
+        .progress = .{ .context = &fixture, .report = Fixture.report, .page = Fixture.page, .failed = Fixture.failedPage },
+    });
+    try std.testing.expectEqual(1, fixture.ready[0]);
+    try std.testing.expectEqual(4, fixture.done);
+    try std.testing.expectEqual(1, fixture.failed);
+    try std.testing.expectEqual(2, fixture.attempts[1].load(.acquire));
+    try std.testing.expectEqual(2, fixture.attempts[2].load(.acquire));
+    try std.testing.expectEqualStrings("", chapter.pages[2]);
+    for ([_]usize{ 0, 1, 3 }) |i| {
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ root, chapter.pages[i] }), a, .limited(1024));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "\x89PNG\r\n\x1a\npage {d}", .{i}), bytes);
+    }
+    const resumed = try downloadChapter(std.testing.allocator, a, io, &plan, .{ .dir = root, .chapter_id = "parallel", .keep_going = true, .retry_ms = &.{} });
+    try std.testing.expectEqual(3, resumed.stats.resumed);
+}
+
+test "canceling parallel pages joins every transfer and preserves completed files" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Fixture = struct {
+        io: Io,
+        dir: []const u8,
+        arena: std.mem.Allocator,
+        plan: []const ImageRequest,
+        both: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
+        ended: std.atomic.Value(usize) = .init(0),
+        fn fetchPage(ptr: *anyopaque, _: std.mem.Allocator, _: ImageRequest, _: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            defer _ = self.ended.fetchAdd(1, .acq_rel);
+            if (self.started.fetchAdd(1, .acq_rel) == 1) self.both.set(self.io);
+            try self.parked.wait(self.io);
+            return error.Unexpected;
+        }
+        fn run(self: *@This()) !Chapter {
+            return downloadChapter(std.testing.allocator, self.arena, self.io, self.plan, .{ .dir = self.dir, .chapter_id = "cancel", .parallelism = 3, .fallback = .{ .context = self, .fetch = fetchPage } });
+        }
+    };
+    var plan: [3]ImageRequest = undefined;
+    for (&plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(a, "/{d}", .{i}) }, .url = "jvm://page", .method = "GET", .headers = &.{} };
+    const store = try PageStore.init(a, io, root, "cancel", &plan);
+    _ = try store.put(2, "\x89PNG\r\n\x1a\nsaved");
+    var fixture: Fixture = .{ .io = io, .dir = root, .arena = a, .plan = &plan };
+    var future = try io.concurrent(Fixture.run, .{&fixture});
+    defer _ = future.cancel(io) catch {};
+    try fixture.both.wait(io);
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    try std.testing.expectEqual(2, fixture.ended.load(.acquire));
+    try std.testing.expect(try store.complete(2) != null);
+    try std.testing.expect(try store.complete(0) == null);
+    try std.testing.expect(try store.complete(1) == null);
+}
+
+test "parallel pages reject incomplete, duplicate and out-of-range dispatch orders" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const request: ImageRequest = .{ .page = .{ .index = 0, .url = "/page" }, .url = "jvm://page", .method = "GET", .headers = &.{} };
+    for ([_][]const usize{ &.{0}, &.{ 0, 0 }, &.{ 0, 2 } }) |order| {
+        try std.testing.expectError(error.InvalidPageOrder, downloadChapter(std.testing.allocator, a, io, &.{ request, request }, .{ .dir = root, .chapter_id = "invalid", .order = order }));
+    }
+}
+
+test "native chapter pages establish overlapping HTTP transfers" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Fixture = struct {
+        io: Io,
+        server: *Io.net.Server,
+        fn serve(self: *@This()) !void {
+            const first = try self.server.accept(self.io);
+            defer first.close(self.io);
+            try readHead(self.io, first);
+            // Respond only after another page has sent its request.
+            const second = try self.server.accept(self.io);
+            defer second.close(self.io);
+            try readHead(self.io, second);
+            for ([_]Io.net.Stream{ second, first }) |stream| {
+                var writer = stream.writer(self.io, &.{});
+                try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n\x89PNG\r\n\x1a\npage");
+                try writer.interface.flush();
+            }
+        }
+    };
+    var fixture: Fixture = .{ .io = io, .server = &server };
+    var serving = try io.concurrent(Fixture.serve, .{&fixture});
+    defer _ = serving.cancel(io) catch {};
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/page", .{server.socket.address.getPort()});
+    var plan: [2]ImageRequest = undefined;
+    for (&plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(a, "/{d}", .{i}) }, .url = url, .method = "GET", .headers = &.{} };
+    const chapter = try downloadChapter(std.testing.allocator, a, io, &plan, .{ .dir = root, .chapter_id = "native-parallel", .parallelism = 2, .retry_ms = &.{} });
+    try serving.await(io);
+    try std.testing.expectEqual(2, chapter.stats.native);
+    try std.testing.expectEqual(24, chapter.stats.bytes);
 }

@@ -663,6 +663,7 @@ pub const Engine = struct {
             .dir = self.options.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
+            .parallelism = self.options.parallelism,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages, .page = Job.reportReady, .failed = Job.reportFailed },
             .root = cache_pages,
@@ -2427,6 +2428,7 @@ pub const Engine = struct {
             .dir = self.options.dir,
             .chapter_id = chapter_id,
             .ca_file = self.options.ca_file,
+            .parallelism = self.options.parallelism,
             .fallback = .{ .context = job, .fetch = Job.fetchFallback },
             .progress = .{ .context = job, .report = Job.reportPages },
             .reuse = cache_pages,
@@ -2638,7 +2640,9 @@ pub const Job = struct {
     fn fetchFallback(context: *anyopaque, gpa: std.mem.Allocator, request: models.ImageRequest, reason: []const u8) anyerror![]u8 {
         _ = reason;
         const self: *Job = @ptrCast(@alignCast(context));
-        const reply = try self.call(.{ .image = .{ .source = self.fallback_source, .page = request.page, .url = request.url, .cookies = request.cookies } });
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const reply = try self.engine.backend.run(arena.allocator(), .{ .image = .{ .source = self.fallback_source, .page = request.page, .url = request.url, .cookies = request.cookies } }, self.status());
         return gpa.dupe(u8, reply.image orelse return error.InvalidImageResponse);
     }
 
@@ -3030,7 +3034,7 @@ test "engine reads a chapter online through the chapter cache" {
 
     const Fake = struct {
         plans: usize = 0,
-        images: usize = 0,
+        images: std.atomic.Value(usize) = .init(0),
         fail_page: ?i32 = 1,
         fn run(ptr: *anyopaque, arena: std.mem.Allocator, c: be.Call, status: ?be.Status) anyerror!be.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -3044,7 +3048,7 @@ test "engine reads a chapter online through the chapter cache" {
                 },
                 .image => |img| blk: {
                     if (self.fail_page) |f| if (img.page.index == f) break :blk error.ExtensionError;
-                    self.images += 1;
+                    _ = self.images.fetchAdd(1, .monotonic);
                     break :blk .{ .image = try arena.dupe(u8, "\x89PNG\r\n\x1a\nfake") };
                 },
                 else => error.Unexpected,
@@ -3079,12 +3083,12 @@ test "engine reads a chapter online through the chapter cache" {
     again.join();
     again.deinit();
     try std.testing.expectEqual(1, fake.plans);
-    try std.testing.expectEqual(3, fake.images);
+    try std.testing.expectEqual(3, fake.images.load(.acquire));
     const download = try Job.start(&engine, .{ .download = "7:/c" });
     download.join();
     try std.testing.expect(download.failure == null);
     download.deinit();
-    try std.testing.expectEqual(3, fake.images);
+    try std.testing.expectEqual(3, fake.images.load(.acquire));
     try engine.clearChapterCache();
     try std.testing.expectEqual(0, try engine.chapterCacheBytes());
 }
