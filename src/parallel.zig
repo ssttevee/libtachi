@@ -18,10 +18,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
         arena: std.heap.ArenaAllocator,
         index: usize,
         result: anyerror!Result = undefined,
+        future: ?Io.Future(void) = null,
 
-        fn execute(self: *@This(), ctx: @TypeOf(context), slot: usize) usize {
+        fn execute(self: *@This(), ctx: @TypeOf(context), slot: usize, task_io: Io, completions: *Io.Queue(usize)) void {
             self.result = work(ctx, self.arena.allocator(), self.index);
-            return slot;
+            completions.putOneUncancelable(task_io, slot) catch |err| switch (err) {
+                error.Closed => {},
+            };
         }
     };
     const width = @min(count, @max(1, limit));
@@ -29,23 +32,30 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
     defer gpa.free(slots);
     for (slots, 0..) |*slot, i| slot.* = .{ .arena = .init(gpa), .index = i };
     defer for (slots) |*slot| slot.arena.deinit();
-    const Completion = union(enum) { done: usize };
-    const buffer = try gpa.alloc(Completion, width);
+    const buffer = try gpa.alloc(usize, width);
     defer gpa.free(buffer);
-    var select: Io.Select(Completion) = .init(io, buffer);
-    defer select.cancelDiscard();
-    for (slots, 0..) |*slot, i| try select.concurrent(.done, Slot.execute, .{ slot, context, i });
+    var completions: Io.Queue(usize) = .init(buffer);
+    defer {
+        completions.close(io);
+        for (slots) |*slot| if (slot.future) |*future| future.cancel(io);
+    }
+    for (slots, 0..) |*slot, i| slot.future = try io.concurrent(Slot.execute, .{ slot, context, i, io, &completions });
     var next = width;
     for (0..count) |_| {
-        const i = (try select.await()).done;
+        const i = completions.getOne(io) catch |err| switch (err) {
+            error.Canceled => return err,
+            error.Closed => unreachable,
+        };
         try io.checkCancel();
         const slot = &slots[i];
+        slot.future.?.await(io);
+        slot.future = null;
         try publish(context, slot.index, try slot.result, &slot.arena);
         _ = slot.arena.reset(.free_all);
         if (next < count) {
             slot.index = next;
             next += 1;
-            try select.concurrent(.done, Slot.execute, .{ slot, context, i });
+            slot.future = try io.concurrent(Slot.execute, .{ slot, context, i, io, &completions });
         }
     }
 }
