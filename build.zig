@@ -11,6 +11,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Compile the pinned amalgamation into every consumer; do not depend on a
+    // firmware-provided SQLite shared library or its build options.
+    const sqlite = b.dependency("sqlite", .{});
+    tachi_mod.addIncludePath(sqlite.path(""));
+    tachi_mod.addCSourceFile(.{ .file = sqlite.path("sqlite3.c"), .flags = &.{
+        "-DSQLITE_THREADSAFE=1",
+        "-DSQLITE_OMIT_LOAD_EXTENSION",
+        "-DSQLITE_DQS=0",
+        "-DSQLITE_DEFAULT_MEMSTATUS=0",
+        "-DSQLITE_DEFAULT_MMAP_SIZE=0",
+    } });
     // Spawning the worker process and its socket calls.
     tachi_mod.addCSourceFile(.{ .file = b.path("src/worker_posix.c"), .flags = &.{} });
     tachi_mod.addCSourceFile(.{ .file = b.path("src/formats_time.c"), .flags = &.{} });

@@ -16,6 +16,7 @@ const tachi = @import("tachi.zig");
 const models = @import("models.zig");
 const manage = @import("manage.zig");
 const library = @import("library.zig");
+const persistence = @import("persistence.zig");
 const downloads = @import("downloads.zig");
 const parallel = @import("parallel.zig");
 const local = @import("local.zig");
@@ -272,7 +273,7 @@ pub const Engine = struct {
 
     /// Records the page shown in a chapter, marks it read once requested,
     /// and adds `read_ms` of reading time to its history. Cheap enough for
-    /// every page turn: only the reading-state file is rewritten.
+    /// every page turn: only the chapter's reading-state row is updated.
     pub fn setProgress(self: *Engine, chapter_id: []const u8, page: u32, read: bool, read_ms: i64) !void {
         _ = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = chapter_id, .page = page, .read = read, .now = wallMillis(self.io), .read_ms = read_ms }});
     }
@@ -967,23 +968,14 @@ pub const Engine = struct {
 
     const Pending = struct { chapters: []const []const u8 = &.{} };
 
-    fn pendingPath(self: *Engine, a: std.mem.Allocator) ![]const u8 {
-        return std.fs.path.join(a, &.{ self.options.dir, "downloads", "pending_delete.json" });
-    }
-
     /// The caller holds `pending_lock`.
     fn loadPending(self: *Engine, a: std.mem.Allocator) ![]const []const u8 {
-        const bytes = Io.Dir.cwd().readFileAlloc(self.io, try self.pendingPath(a), a, .limited(4 << 20)) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
-            else => return err,
-        };
-        return (try std.json.parseFromSliceLeaky(Pending, a, bytes, models.parse_options)).chapters;
+        const saved = try persistence.load(Pending, a, self.io, self.options.dir, "pending-delete", "downloads/pending_delete.json");
+        return if (saved) |value| value.chapters else &.{};
     }
 
     fn savePending(self: *Engine, a: std.mem.Allocator, ids: []const []const u8) !void {
-        const path = try self.pendingPath(a);
-        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
-        try library.writeJsonAtomic(a, self.io, path, Pending{ .chapters = ids });
+        try persistence.save(a, self.io, self.options.dir, "pending-delete", Pending{ .chapters = ids });
     }
 
     // ---- chapter actions ---------------------------------------------------------
@@ -2608,7 +2600,12 @@ pub const Engine = struct {
         return std.fmt.allocPrint(a, "{s}/downloads/queued-plans/{x}.json", .{ self.options.dir, std.hash.Wyhash.hash(0, chapter_id) });
     }
 
+    fn queuedPlanKey(a: std.mem.Allocator, chapter_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(a, "queued-plan/{s}", .{chapter_id});
+    }
+
     pub fn discardQueuedPlan(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !void {
+        try persistence.remove(a, self.io, self.options.dir, try queuedPlanKey(a, chapter_id));
         Io.Dir.cwd().deleteFile(self.io, try self.queuedPlanPath(a, chapter_id)) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -2629,21 +2626,21 @@ pub const Engine = struct {
         const source = found.manga.source_id orelse return error.LocalChapter;
         const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
         const plan = try self.requestDownloadPlan(job, source, remote);
-        const path = try self.queuedPlanPath(a, chapter_id);
-        try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(path).?);
-        try library.writeJsonAtomic(a, self.io, path, plan);
+        try persistence.save(a, self.io, self.options.dir, try queuedPlanKey(a, chapter_id), plan);
         job.pages_total.store(plan.len, .release);
     }
 
     pub fn loadQueuedPlan(self: *Engine, a: std.mem.Allocator, chapter_id: []const u8) !?[]const models.ImageRequest {
-        const bytes = Io.Dir.cwd().readFileAlloc(self.io, try self.queuedPlanPath(a, chapter_id), a, .limited(16 << 20)) catch |err| switch (err) {
-            error.FileNotFound => return null,
+        const legacy = try std.fmt.allocPrint(a, "downloads/queued-plans/{x}.json", .{std.hash.Wyhash.hash(0, chapter_id)});
+        const plan = (persistence.load([]const models.ImageRequest, a, self.io, self.options.dir, try queuedPlanKey(a, chapter_id), legacy) catch |err| switch (err) {
+            // A page list is a disposable cache. Invalid legacy/cache data can
+            // be fetched again; storage failures must remain visible.
+            error.SyntaxError, error.UnexpectedToken, error.UnexpectedEndOfInput, error.MissingField, error.InvalidCharacter, error.Overflow, error.InvalidEnumTag, error.LengthMismatch, error.DuplicateField => {
+                try self.discardQueuedPlan(a, chapter_id);
+                return null;
+            },
             else => return err,
-        };
-        const plan = std.json.parseFromSliceLeaky([]const models.ImageRequest, a, bytes, models.parse_options) catch {
-            try self.discardQueuedPlan(a, chapter_id);
-            return null;
-        };
+        }) orelse return null;
         if (plan.len == 0) {
             try self.discardQueuedPlan(a, chapter_id);
             return null;
@@ -4258,4 +4255,57 @@ test "SD downloads retain their volume when resuming and delete through the SD r
     try std.testing.expectEqual(1, try engine.removeDownloads(a, &.{"c"}));
     try std.testing.expect(try engine.downloadProgress(a, "c") == null);
     try std.testing.expect(try partial_store.complete(0) == null);
+}
+
+test "queued page lists migrate once and removing them cannot revive legacy cache" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var engine: Engine = .init(t.allocator, t.io, be.none, .{ .dir = root });
+    defer engine.deinit();
+    const plan: []const models.ImageRequest = &.{.{ .page = .{ .index = 0, .url = "page-one" }, .url = "https://images.example/one", .method = "GET", .headers = &.{} }};
+    const path = try engine.queuedPlanPath(a, "chapter");
+    try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(path).?);
+    try library.writeJsonAtomic(a, t.io, path, plan);
+    try t.expectEqualStrings(plan[0].url, (try engine.loadQueuedPlan(a, "chapter")).?[0].url);
+    // Import leaves the old cache available as a migration backup.
+    const original = try Io.Dir.cwd().readFileAlloc(t.io, path, a, .limited(4096));
+    try t.expect(original.len > 0);
+    // Persisted SQL data wins over edits to stale JSON.
+    try library.writeJsonAtomic(a, t.io, path, @as([]const models.ImageRequest, &.{}));
+    var reopened: Engine = .init(t.allocator, t.io, be.none, .{ .dir = root });
+    defer reopened.deinit();
+    try t.expectEqual(@as(usize, 1), (try reopened.loadQueuedPlan(a, "chapter")).?.len);
+    try reopened.discardQueuedPlan(a, "chapter");
+    try library.writeJsonAtomic(a, t.io, path, plan);
+    try t.expect(try engine.loadQueuedPlan(a, "chapter") == null);
+    // A malformed disposable plan can be refetched without masking IO errors.
+    const broken = try engine.queuedPlanPath(a, "broken");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = broken, .data = "{" });
+    try t.expect(try engine.loadQueuedPlan(a, "broken") == null);
+}
+
+test "pending deletions migrate once and clearing SQL state cannot revive legacy work" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.createDirPath(t.io, "downloads");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/pending_delete.json", .data = "{\"chapters\":[\"old\"]}" });
+    var engine: Engine = .init(t.allocator, t.io, be.none, .{ .dir = root });
+    defer engine.deinit();
+    try t.expectEqualStrings("old", (try engine.loadPending(a))[0]);
+    try engine.savePending(a, &.{});
+    var reopened: Engine = .init(t.allocator, t.io, be.none, .{ .dir = root });
+    defer reopened.deinit();
+    try t.expectEqual(@as(usize, 0), (try reopened.loadPending(a)).len);
+    const legacy = try tmp.dir.readFileAlloc(t.io, "downloads/pending_delete.json", a, .limited(4096));
+    try t.expectEqualStrings("{\"chapters\":[\"old\"]}", legacy);
 }

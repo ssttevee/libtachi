@@ -1,11 +1,14 @@
 //! Mihon's download queue: chapters waiting to download, worked through in
-//! order in the background. Entries are kept in `downloads/queue.json`, so
+//! order in the background. Ordered entries are kept in SQLite, importing
+//! legacy `downloads/queue.json` once, so
 //! the queue survives a restart; a chapter that fails stays queued for a
 //! retry, as in Mihon, and the next one goes on.
 const std = @import("std");
 const Io = std.Io;
 const library = @import("library.zig");
 const models = @import("models.zig");
+const sqlite = @import("sqlite.zig");
+const persistence = @import("persistence.zig");
 const engine_mod = @import("engine.zig");
 const downloads = @import("downloads.zig");
 const parallel = @import("parallel.zig");
@@ -92,8 +95,64 @@ pub const Queue = struct {
         try self.items.append(gpa, .{ .chapter_id = owned_id, .source = source });
     }
 
-    fn path(engine: *Engine, a: std.mem.Allocator) ![]const u8 {
-        return std.fs.path.join(a, &.{ engine.options.dir, "downloads", "queue.json" });
+    const migration_key = "download-queue";
+
+    fn openDatabase(engine: *Engine) !sqlite.Db {
+        var db = try sqlite.Db.open(engine.gpa, engine.io, engine.options.dir);
+        errdefer db.close();
+        try db.exec("CREATE TABLE IF NOT EXISTS queue_entries(position INTEGER PRIMARY KEY, chapter_id TEXT NOT NULL UNIQUE, browser_failure TEXT)");
+        return db;
+    }
+
+    fn saveRows(db: *sqlite.Db, saved: Saved) !void {
+        try db.exec("DELETE FROM queue_entries");
+        const stmt = try db.prepare("INSERT INTO queue_entries(position,chapter_id,browser_failure) VALUES(?1,?2,?3)");
+        defer stmt.close();
+        for (saved.chapters, 0..) |id, i| {
+            try stmt.bindInt(1, @intCast(i));
+            try stmt.bindText(2, id);
+            // An empty failure denotes a retryable queue entry. Browser
+            // verification failures stay blocked across restarts.
+            const failure = for (saved.browser_verification_required) |blocked| {
+                if (std.mem.eql(u8, id, blocked.chapter_id)) break blocked.failure;
+            } else "";
+            try stmt.bindText(3, failure);
+            _ = try stmt.step();
+            try stmt.reset();
+        }
+        try persistence.markMigrated(db, migration_key);
+    }
+
+    fn loadSaved(engine: *Engine, a: std.mem.Allocator) !Saved {
+        var db = try openDatabase(engine);
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        if (!try persistence.migrated(&db, migration_key)) {
+            const file = try std.fs.path.join(a, &.{ engine.options.dir, "downloads", "queue.json" });
+            const bytes = Io.Dir.cwd().readFileAlloc(engine.io, file, a, .limited(16 << 20)) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            const saved = if (bytes) |json| try std.json.parseFromSliceLeaky(Saved, a, json, models.parse_options) else Saved{};
+            // Parsing and the entire ordered import must succeed before the
+            // marker commits. A malformed backup remains retryable.
+            try saveRows(&db, saved);
+            try db.commit();
+            return saved;
+        }
+        var ids: std.ArrayList([]const u8) = .empty;
+        var blocked: std.ArrayList(Blocked) = .empty;
+        const stmt = try db.prepare("SELECT chapter_id,browser_failure FROM queue_entries ORDER BY position");
+        defer stmt.close();
+        while (try stmt.step()) {
+            const id = try a.dupe(u8, stmt.columnText(0));
+            try ids.append(a, id);
+            const failure = stmt.columnText(1);
+            if (failure.len != 0) try blocked.append(a, .{ .chapter_id = id, .failure = try a.dupe(u8, failure) });
+        }
+        try db.commit();
+        return .{ .chapters = ids.items, .browser_verification_required = blocked.items };
     }
 
     /// Loads the saved queue once; the caller holds the lock.
@@ -102,14 +161,7 @@ pub const Queue = struct {
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const bytes = Io.Dir.cwd().readFileAlloc(engine.io, try path(engine, a), a, .limited(16 << 20)) catch |err| switch (err) {
-            error.FileNotFound => {
-                self.loaded = true;
-                return;
-            },
-            else => return err,
-        };
-        const saved = try std.json.parseFromSliceLeaky(Saved, a, bytes, models.parse_options);
+        const saved = try loadSaved(engine, a);
         const lib = try engine.store.load(a);
         const original_len = self.items.items.len;
         errdefer {
@@ -150,13 +202,16 @@ pub const Queue = struct {
         const a = arena.allocator();
         const ids = try a.alloc([]const u8, self.items.items.len);
         for (self.items.items, ids) |item, *id| id.* = item.chapter_id;
-        const file = try path(engine, a);
-        try Io.Dir.cwd().createDirPath(engine.io, std.fs.path.dirname(file).?);
         var blocked: std.ArrayList(Blocked) = .empty;
         for (self.items.items) |item| if (item.browser_verification_required) {
             try blocked.append(a, .{ .chapter_id = item.chapter_id, .failure = item.failure orelse "BrowserVerificationRequired" });
         };
-        try library.writeJsonAtomic(a, engine.io, file, Saved{ .chapters = ids, .browser_verification_required = blocked.items });
+        var db = try openDatabase(engine);
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        try saveRows(&db, .{ .chapters = ids, .browser_verification_required = blocked.items });
+        try db.commit();
     }
 
     /// Adds chapters, skipping those already downloaded, local or queued,
@@ -282,9 +337,10 @@ pub const Queue = struct {
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         // Clear even before the saved queue has been loaded, and clean up
-        // orphan plans left by an interrupted queue-file update.
+        // orphan plans left by an interrupted queue update.
         for (self.items.items) |*item| item.prepared = false;
         try Io.Dir.cwd().deleteTree(engine.io, try std.fs.path.join(arena.allocator(), &.{ engine.options.dir, "downloads", "queued-plans" }));
+        try persistence.removePrefix(arena.allocator(), engine.io, engine.options.dir, "queued-plan/");
         self.loaded = true;
         for (self.items.items) |item| freeItem(engine.gpa, item);
         self.items.clearRetainingCapacity();
@@ -1138,4 +1194,60 @@ test "queued reader snapshots expose saved pages before the chapter completes" {
     const bytes = try Io.Dir.cwd().readFileAlloc(t.io, try engine.pagePath(a, saved_path), a, .limited(128));
     try t.expect(std.mem.startsWith(u8, bytes, "\x89PNG"));
     try t.expectEqual(2, (try engine.downloadProgress(a, "1:/c1")).?.done);
+}
+
+test "queue rows preserve priority and blocked failures without reimporting a stale backup" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.createDirPath(t.io, "downloads");
+    const original = "{\"chapters\":[\"first\",\"blocked\"],\"browser_verification_required\":[{\"chapter_id\":\"blocked\",\"failure\":\"Verification required\"}]}";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = original });
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = root });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    const imported = try Queue.loadSaved(&engine, a);
+    try t.expectEqualStrings("first", imported.chapters[0]);
+    try t.expectEqualStrings("blocked", imported.chapters[1]);
+    try t.expectEqualStrings("Verification required", imported.browser_verification_required[0].failure);
+    // Reordering is a single transaction, preserving the blocking reason.
+    {
+        var db = try Queue.openDatabase(&engine);
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        try Queue.saveRows(&db, .{ .chapters = &.{ "blocked", "first" }, .browser_verification_required = imported.browser_verification_required });
+        try db.commit();
+    }
+    const restored = try Queue.loadSaved(&engine, a);
+    try t.expectEqualStrings("blocked", restored.chapters[0]);
+    try t.expectEqualStrings("first", restored.chapters[1]);
+    try t.expectEqualStrings("blocked", restored.browser_verification_required[0].chapter_id);
+    try t.expectEqualStrings(original, try tmp.dir.readFileAlloc(t.io, "downloads/queue.json", a, .unlimited));
+    // clear() works before ensureLoaded and cannot resurrect the retained JSON.
+    try engine.queue.clear(&engine);
+    try t.expectEqual(0, (try Queue.loadSaved(&engine, a)).chapters.len);
+}
+
+test "clearing the queue removes orphan SQLite page plans and retains unrelated documents" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const Value = struct { count: u32 };
+    try persistence.save(a, t.io, root, "queued-plan/orphan", Value{ .count = 4 });
+    try persistence.save(a, t.io, root, "settings", Value{ .count = 8 });
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = root });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    try engine.queue.clear(&engine);
+    try t.expectEqual(null, try persistence.load(Value, a, t.io, root, "queued-plan/orphan", "missing.json"));
+    try t.expectEqual(8, (try persistence.load(Value, a, t.io, root, "settings", "missing.json")).?.count);
 }

@@ -1,5 +1,5 @@
 //! The user's library: titles, their chapters, read progress and downloaded
-//! pages, persisted as one JSON file. Nothing here needs the JVM, so a UI
+//! pages, persisted in SQLite with one-time legacy JSON import. Nothing here needs the JVM, so a UI
 //! process can own the library while extensions run elsewhere.
 const std = @import("std");
 const Io = std.Io;
@@ -218,8 +218,8 @@ pub fn validate(gpa: std.mem.Allocator, library: Library) ValidateError!void {
     };
 }
 
-/// One chapter's reading state. Kept apart from the library's metadata, so
-/// a page turn rewrites a small file rather than the whole library.
+/// One chapter's reading state, stored in its own SQL row so a page turn
+/// does not rewrite library metadata.
 pub const Reading = struct {
     id: []const u8,
     page: u32 = 0,
@@ -235,149 +235,91 @@ pub const Reading = struct {
     }
 };
 
-const ReadingFile = struct {
-    version: u32 = 1,
-    chapters: []const Reading = &.{},
-};
-
-/// The library in a directory: `library.json` for titles, chapters and
-/// downloaded pages, `reading.json` for each chapter's reading state, and the
-/// page files. Edits from different threads are serialized; reads may run at
-/// any time, because every save replaces a file atomically.
+/// Transactional library metadata and reading state in `tachi.sqlite3`.
+/// Legacy JSON is imported once and retained untouched as a backup.
 pub const Store = struct {
     io: Io,
-    /// The library directory; page paths are relative to it.
     dir: []const u8,
-    /// Optional removable storage root. `sdcard/` page paths resolve here.
     sd_dir: ?[]const u8 = null,
     mutex: Io.Mutex = .init,
 
+    /// Legacy import names. New writes use SQLite exclusively.
     pub const file_name = "library.json";
     pub const reading_name = "reading.json";
+    const sql = @import("library_sqlite.zig");
 
-    /// The library with reading state applied, allocated in `arena`; empty
-    /// if there is no file yet.
     pub fn load(self: *Store, arena: std.mem.Allocator) !Library {
-        const bytes = self.read(arena, file_name) catch |err| switch (err) {
-            error.FileNotFound => return .{},
-            else => return err,
-        };
-        const library = try std.json.parseFromSliceLeaky(Library, arena, bytes, models.parse_options);
-        try validate(arena, library);
-        const reading = try self.loadReading(arena);
-        if (reading.len == 0) return library;
-        var by_id: std.StringHashMapUnmanaged(Reading) = .empty;
-        try by_id.ensureTotalCapacity(arena, @intCast(reading.len));
-        for (reading) |r| by_id.putAssumeCapacity(r.id, r);
-        for (library.manga) |m| for (@constCast(m.chapters)) |*ch| if (by_id.get(ch.id)) |r| {
-            ch.last_page_read = r.page;
-            ch.read = r.read;
-            ch.bookmark = r.bookmark;
-            ch.last_read = r.last_read;
-            ch.read_ms = r.read_ms;
-        };
-        return library;
+        var db = try sql.open(self, arena);
+        defer db.close();
+        try db.exec("BEGIN");
+        errdefer db.rollback();
+        const result = try sql.load(&db, arena);
+        try db.commit();
+        return result;
     }
 
-    fn read(self: *Store, arena: std.mem.Allocator, name: []const u8) ![]u8 {
-        const path = try std.fs.path.join(arena, &.{ self.dir, name });
-        return Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 << 20));
-    }
-
-    fn loadReading(self: *Store, arena: std.mem.Allocator) ![]const Reading {
-        const bytes = self.read(arena, reading_name) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
-            else => return err,
-        };
-        return (try std.json.parseFromSliceLeaky(ReadingFile, arena, bytes, models.parse_options)).chapters;
-    }
-
-    fn saveReading(self: *Store, gpa: std.mem.Allocator, reading: []const Reading) !void {
-        const path = try std.fs.path.join(gpa, &.{ self.dir, reading_name });
-        defer gpa.free(path);
-        try writeJsonAtomic(gpa, self.io, path, ReadingFile{ .chapters = reading });
-    }
-
-    /// Replaces both files atomically.
+    /// Atomically replaces metadata and its supplied reading state.
     pub fn save(self: *Store, gpa: std.mem.Allocator, library: Library) !void {
-        var current = library;
-        current.version = version;
-        try validate(gpa, current);
-        var reading: std.ArrayList(Reading) = .empty;
-        defer reading.deinit(gpa);
-        for (current.manga) |m| for (m.chapters) |ch| if (Reading.of(ch)) |r| try reading.append(gpa, r);
-        const path = try std.fs.path.join(gpa, &.{ self.dir, file_name });
-        defer gpa.free(path);
-        try writeJsonAtomic(gpa, self.io, path, current);
-        try self.saveReading(gpa, reading.items);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var db = try sql.open(self, arena);
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        try sql.save(&db, arena, library);
+        try db.commit();
     }
 
-    /// Loads the library, applies `edit` and saves the result, holding the
-    /// store's lock throughout. `edit` returns the new library, allocated in
-    /// `arena`, or null to leave the files alone.
+    /// The lock and SQLite write transaction span the complete read/edit/save.
     pub fn update(self: *Store, arena: std.mem.Allocator, context: anytype, comptime edit: fn (@TypeOf(context), std.mem.Allocator, Library) anyerror!?Library) !Library {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const current = try self.load(arena);
-        const next = try edit(context, arena, current) orelse return current;
-        try self.save(arena, next);
+        var db = try sql.open(self, arena);
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        const current = try sql.load(&db, arena);
+        const next = try edit(context, arena, current) orelse {
+            try db.commit();
+            return current;
+        };
+        try sql.save(&db, arena, next);
+        try db.commit();
         return next;
     }
 
-    /// Replaces chapters' reading state, as for marking them read or unread,
-    /// without touching the library file.
+    /// Explicitly replaces reading state, including marking chapters unread.
     pub fn putReading(self: *Store, gpa: std.mem.Allocator, states: []const Reading) !void {
         if (states.len == 0) return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        var reading: std.ArrayList(Reading) = .empty;
-        try reading.appendSlice(arena, try self.loadReading(arena));
-        for (states) |state| {
-            for (reading.items) |*r| {
-                if (std.mem.eql(u8, r.id, state.id)) {
-                    r.* = state;
-                    break;
-                }
-            } else try reading.append(arena, state);
-        }
-        try self.saveReading(arena, reading.items);
+        var db = try sql.open(self, arena_state.allocator());
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        try sql.putReading(&db, states);
+        try db.commit();
     }
 
-    /// Records reading progress without touching the library file. Unknown
-    /// chapters are recorded too; they apply once the chapter is in the
-    /// library. Returns how many chapters this marked read.
-    pub fn setProgress(self: *Store, gpa: std.mem.Allocator, progress: []const Progress) !usize {
+    /// Updates only affected reading rows. Completion and reading time are
+    /// monotonic; progress for unknown chapters survives later metadata saves.
+    pub fn setProgress(self: *Store, gpa: std.mem.Allocator, values: []const Progress) !usize {
+        if (values.len == 0) return 0;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        var reading: std.ArrayList(Reading) = .empty;
-        try reading.appendSlice(arena, try self.loadReading(arena));
-        var changed = false;
-        var newly_read: usize = 0;
-        for (progress) |p| {
-            for (reading.items) |*r| {
-                if (!std.mem.eql(u8, r.id, p.chapter_id)) continue;
-                const read_now = r.read or p.read;
-                if (r.page == p.page and r.read == read_now and p.read_ms == 0) break;
-                if (read_now and !r.read) newly_read += 1;
-                r.page = p.page;
-                r.read = read_now;
-                r.last_read = p.now;
-                r.read_ms += p.read_ms;
-                changed = true;
-                break;
-            } else {
-                try reading.append(arena, .{ .id = p.chapter_id, .page = p.page, .read = p.read, .last_read = p.now, .read_ms = p.read_ms });
-                if (p.read) newly_read += 1;
-                changed = true;
-            }
-        }
-        if (changed) try self.saveReading(arena, reading.items);
+        var db = try sql.open(self, arena_state.allocator());
+        defer db.close();
+        try db.begin();
+        errdefer db.rollback();
+        const newly_read = try sql.progress(&db, values);
+        try db.commit();
         return newly_read;
     }
 
@@ -960,7 +902,7 @@ test "natural order compares numbers by value" {
     try std.testing.expect(!naturalLess({}, "b", "A"));
 }
 
-test "reading state lives in its own file and overlays the library" {
+test "reading rows change without rewriting chapter metadata" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -970,11 +912,18 @@ test "reading state lives in its own file and overlays the library" {
     var store: Store = .{ .io = io, .dir = try tmp.dir.realPathFileAlloc(io, ".", a) };
     const manga: Manga = .{ .id = "1:/m", .title = "M", .chapters = &.{ .{ .id = "1:/c1", .title = "1" }, .{ .id = "1:/c2", .title = "2" } } };
     try store.save(std.testing.allocator, try merge(a, .{}, manga, 1));
-    const before = try tmp.dir.statFile(io, Store.file_name, .{});
+    var db = try @import("sqlite.zig").Db.open(a, io, store.dir);
+    defer db.close();
+    var query = try db.prepare("SELECT metadata FROM library_chapters WHERE id='1:/c2'");
+    defer query.close();
+    try std.testing.expect(try query.step());
+    const before = try a.dupe(u8, query.columnText(0));
+    try query.reset();
     _ = try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 7, .now = 50, .read_ms = 1000 }});
     _ = try store.setProgress(std.testing.allocator, &.{.{ .chapter_id = "1:/c2", .page = 9, .read = true, .now = 60, .read_ms = 500 }});
-    const after = try tmp.dir.statFile(io, Store.file_name, .{});
-    try std.testing.expectEqual(before.mtime.nanoseconds, after.mtime.nanoseconds);
+    try std.testing.expect(try query.step());
+    try std.testing.expectEqualStrings(before, query.columnText(0));
+    try query.reset();
     const loaded = try store.load(a);
     const ch = loaded.manga[0].chapters[1];
     try std.testing.expectEqual(9, ch.last_page_read);

@@ -53,6 +53,33 @@ Not yet: WebView-dependent sources (Cloudflare challenges, JS-rendered pages),
 iOS (no JVM). Hooks exist for the host app to plug in a Cloudflare solver and a
 JavaScript engine. See the roadmap in `docs/DESIGN.md`.
 
+## Persistent data
+
+The engine stores library metadata, chapter reading state, settings, the ordered
+download queue, queued page lists, and pending deletions in `tachi.sqlite3` under
+`Engine.Options.dir`. SQLite is statically compiled from the pinned official
+3.54.1 amalgamation; consumers do not need a system SQLite library. Connections
+use foreign keys, FULL synchronization, and rollback journaling. Library edits
+and their reading state commit together; progress updates touch only affected
+reading rows. Metadata is stored per series/chapter, with source-specific
+payloads retained as JSON inside those rows. The existing in-memory library API
+remains unchanged; view sorting still uses that API.
+
+Legacy `library.json` and `reading.json` are validated and imported together in
+one transaction on first library access. Settings, queue, and queued-plan files
+are imported on first use. Successful imports are marked in the database;
+original files remain migration backups and are never re-imported over newer
+SQL state. Invalid imports fail visibly and roll back so they can be corrected
+and retried. Newer database schema versions are rejected, not reset.
+
+Images, removable-storage destination markers, resumable-image manifests,
+disposable reader caches, extension registries, and the JVM host's preference
+files remain ordinary files. Moving/deleting files on a second disk is not part
+of a SQLite transaction. Close the engine before copying its data directory for
+a filesystem backup; retain the database and any recovery journal. Existing
+Mihon backup import/export APIs remain available. Downgrading to a JSON-only
+build does not export current SQLite data back to the retained JSON backups.
+
 ## Build
 
 Requirements: Zig 0.17, a JDK 17+ (to build and to run), and an `android.jar`

@@ -1,11 +1,10 @@
 //! Engine settings, with Mihon's defaults (mihonapp/mihon 487c313, the
 //! LibraryPreferences, DownloadPreferences and ReaderPreferences an engine
-//! applies). Kept as `settings.json` in the library directory; a missing
-//! file or field means the default. Display-only preferences are the app's.
+//! applies). Stored as a typed SQLite document, importing `settings.json`
+//! once; a missing setting means the default. Display-only preferences are the app's.
 const std = @import("std");
 const Io = std.Io;
-const models = @import("models.zig");
-const library = @import("library.zig");
+const persistence = @import("persistence.zig");
 const views = @import("views.zig");
 const backup = @import("backup.zig");
 
@@ -179,18 +178,11 @@ pub const Settings = struct {
 
     /// The settings in `dir`, allocated in `arena`; defaults if there are none.
     pub fn load(arena: std.mem.Allocator, io: Io, dir: []const u8) !Settings {
-        const path = try std.fs.path.join(arena, &.{ dir, file_name });
-        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err| switch (err) {
-            error.FileNotFound => return .{},
-            else => return err,
-        };
-        return std.json.parseFromSliceLeaky(Settings, arena, bytes, models.parse_options);
+        return try persistence.load(Settings, arena, io, dir, "settings", file_name) orelse .{};
     }
 
     pub fn save(self: Settings, gpa: std.mem.Allocator, io: Io, dir: []const u8) !void {
-        const path = try std.fs.path.join(gpa, &.{ dir, file_name });
-        defer gpa.free(path);
-        try library.writeJsonAtomic(gpa, io, path, self);
+        try persistence.save(gpa, io, dir, "settings", self);
     }
 };
 
@@ -227,4 +219,26 @@ test "category filters treat uncategorized as 0 and let exclusion win" {
     try std.testing.expect(!categoryAllowed(&.{}, &.{1}, &.{}));
     try std.testing.expect(!categoryAllowed(&.{ 1, 2 }, &.{1}, &.{2}));
     try std.testing.expect(categoryAllowed(&.{ 1, 3 }, &.{1}, &.{2}));
+}
+
+test "settings migrate legacy fields once without changing the backup" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const original = "{\"downloads\":{\"storage\":\"sd_card\",\"parallel_pages\":3},\"reader\":{\"incognito\":true},\"future_field\":true}";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = Settings.file_name, .data = original });
+    const first = try Settings.load(a, t.io, dir);
+    try t.expectEqual(.sd_card, first.downloads.storage);
+    try t.expectEqual(3, first.downloads.parallel_pages);
+    try t.expect(first.reader.incognito);
+    try t.expect(first.update.skip_completed);
+    try (Settings{}).save(a, t.io, dir);
+    const restored = try Settings.load(a, t.io, dir);
+    try t.expectEqual(.internal, restored.downloads.storage);
+    try t.expect(!restored.reader.incognito);
+    try t.expectEqualStrings(original, try tmp.dir.readFileAlloc(t.io, Settings.file_name, a, .unlimited));
 }
