@@ -2302,10 +2302,19 @@ pub const Engine = struct {
     fn fetchTitle(self: *Engine, job: *Job, source: i64, remote: models.Manga, existing: []const library.Chapter, schedule: Schedule) !Fetched {
         const a = job.arena.allocator();
         const started = millis(self.io);
+        const update = try self.fetchTitleUpdate(a, source, remote, existing, schedule.details, job.status());
+        return self.syncTitle(a, source, update, schedule, started, millis(self.io));
+    }
+
+    fn fetchTitleUpdate(self: *Engine, a: std.mem.Allocator, source: i64, remote: models.Manga, existing: []const library.Chapter, details: bool, status: ?be.Status) !models.MangaUpdate {
         var known: std.ArrayList(models.Chapter) = .empty;
         for (existing) |ch| if (ch.remote) |r| try known.append(a, r);
-        const update = (try job.call(.{ .update = .{ .source = source, .manga = remote, .chapters = known.items, .details = schedule.details } })).update orelse return error.InvalidReply;
-        const fetched = millis(self.io);
+        return (try self.backend.run(a, .{ .update = .{ .source = source, .manga = remote, .chapters = known.items, .details = details } }, status)).update orelse error.InvalidReply;
+    }
+
+    // Network work can overlap; apply each result on the parent task while its
+    // scratch arena is alive, under the library's existing transaction lock.
+    fn syncTitle(self: *Engine, a: std.mem.Allocator, source: i64, update: models.MangaUpdate, schedule: Schedule, started: u64, fetched: u64) !Fetched {
         try self.io.checkCancel();
         const Edit = struct {
             source: i64,
@@ -2396,24 +2405,72 @@ pub const Engine = struct {
                 return std.ascii.lessThanIgnoreCase(x.title, y.title);
             }
         }.less);
-        var errors: std.ArrayList(UpdateError) = .empty;
-        var updated: usize = 0;
-        var new_chapters: std.ArrayList([]const u8) = .empty;
-        job.pages_total.store(queue.items.len, .release);
-        for (queue.items, 1..) |book, done| {
-            try self.io.checkCancel();
-            if (self.fetchTitle(job, book.source_id.?, book.remote.?, book.chapters, .{ .window = window, .details = s.update.metadata })) |fetched| {
-                updated += 1;
-                try new_chapters.appendSlice(a, fetched.new_chapters);
-            } else |err| switch (err) {
-                error.Canceled => return err,
-                else => {
-                    const message = try std.fmt.allocPrint(a, "{s}: {s}", .{ @errorName(err), tachi.lastError() });
-                    try errors.append(a, .{ .manga_id = book.id, .title = book.title, .message = message });
-                    log.warn("update {s}: {s}", .{ book.title, message });
-                },
+        const Refresh = struct {
+            job: *Job,
+            books: []const library.Manga,
+            schedule: Schedule,
+            failures: []?UpdateError,
+            updated: usize = 0,
+            done: usize = 0,
+            chapters: [][]const []const u8,
+
+            const Outcome = union(enum) {
+                fetched: struct { update: models.MangaUpdate, started: u64, fetched: u64 },
+                failure: []const u8,
+            };
+            fn work(ctx: *@This(), scratch: std.mem.Allocator, i: usize) !Outcome {
+                const book = ctx.books[i];
+                const engine = ctx.job.engine;
+                const started = millis(engine.io);
+                tachi.setLastError("");
+                const update = engine.fetchTitleUpdate(scratch, book.source_id.?, book.remote.?, book.chapters, ctx.schedule.details, ctx.job.status()) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => return .{ .failure = try std.fmt.allocPrint(scratch, "{s}: {s}", .{ @errorName(err), tachi.lastError() }) },
+                };
+                return .{ .fetched = .{ .update = update, .started = started, .fetched = millis(engine.io) } };
             }
-            job.pages_done.store(done, .release);
+            fn publish(ctx: *@This(), i: usize, outcome: Outcome, _: *std.heap.ArenaAllocator) !void {
+                const book = ctx.books[i];
+                const allocator = ctx.job.arena.allocator();
+                var failure: ?[]const u8 = null;
+                switch (outcome) {
+                    .failure => |message| failure = message,
+                    .fetched => |result| {
+                        tachi.setLastError("");
+                        if (ctx.job.engine.syncTitle(allocator, book.source_id.?, result.update, ctx.schedule, result.started, result.fetched)) |fetched| {
+                            ctx.updated += 1;
+                            ctx.chapters[i] = fetched.new_chapters;
+                        } else |err| switch (err) {
+                            error.Canceled, error.OutOfMemory => return err,
+                            else => failure = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ @errorName(err), tachi.lastError() }),
+                        }
+                    },
+                }
+                if (failure) |message| {
+                    ctx.failures[i] = .{ .manga_id = book.id, .title = book.title, .message = try allocator.dupe(u8, message) };
+                    log.warn("update {s}: {s}", .{ book.title, message });
+                }
+                ctx.done += 1;
+                ctx.job.pages_done.store(ctx.done, .release);
+            }
+        };
+        var refresh: Refresh = .{
+            .job = job,
+            .books = queue.items,
+            .schedule = .{ .window = window, .details = s.update.metadata },
+            .failures = try a.alloc(?UpdateError, queue.items.len),
+            .chapters = try a.alloc([]const []const u8, queue.items.len),
+        };
+        @memset(refresh.failures, null);
+        @memset(refresh.chapters, &.{});
+        job.pages_total.store(queue.items.len, .release);
+        try parallel.run(self.gpa, self.io, queue.items.len, self.options.parallelism, &refresh, Refresh.work, Refresh.publish);
+        // Preserve title dispatch order in final reports and automatic downloads.
+        var errors: std.ArrayList(UpdateError) = .empty;
+        var new_chapters: std.ArrayList([]const u8) = .empty;
+        for (refresh.failures, refresh.chapters) |failure, chapters| {
+            if (failure) |err| try errors.append(a, err);
+            try new_chapters.appendSlice(a, chapters);
         }
         try self.autoDownload(job, new_chapters.items);
         if (new_chapters.items.len > 0) {
@@ -2422,7 +2479,7 @@ pub const Engine = struct {
             try self.saveSettings(latest);
         }
         job.result = .{
-            .library_changed = updated > 0,
+            .library_changed = refresh.updated > 0,
             .new_chapters = new_chapters.items,
             .update_errors = errors.items,
             .update_skipped = skipped,
@@ -3659,4 +3716,80 @@ test "store refresh overlaps requests and retains unreachable stores" {
     try std.testing.expectEqualStrings("Fresh", refreshed.stores[1].name);
     try std.testing.expectEqualStrings("Old", refreshed.stores[2].name);
     try std.testing.expectEqualStrings("Stores refreshed; 1 could not be reached", job.result.message);
+}
+
+test "library refresh overlaps fetches and serially publishes updates, failures and skips" {
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Fixture = struct {
+        first: Io.Event = .unset,
+        second: Io.Event = .unset,
+        fn run(ptr: *anyopaque, scratch: std.mem.Allocator, call: be.Call, status: ?be.Status) !be.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (status) |s| s.ready(s.context);
+            const update = switch (call) {
+                .update => |u| u,
+                else => return error.Unexpected,
+            };
+            switch (update.source) {
+                1 => {
+                    self.first.set(std.testing.io);
+                    try self.second.wait(std.testing.io);
+                },
+                2 => {
+                    try self.first.wait(std.testing.io);
+                    self.second.set(std.testing.io);
+                },
+                3 => {
+                    tachi.setLastError("broken source");
+                    return error.ExtensionError;
+                },
+                else => return error.Unexpected,
+            }
+            const chapters = try scratch.alloc(models.Chapter, 1);
+            chapters[0] = .{ .url = try scratch.dupe(u8, "/c1"), .name = try scratch.dupe(u8, "Chapter 1"), .chapterNumber = 1 };
+            return .{ .update = .{ .manga = .{ .url = update.manga.url, .title = try scratch.dupe(u8, "Fresh") }, .chapters = chapters } };
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn none(_: *anyopaque) void {}
+    };
+    var fixture: Fixture = .{};
+    const backend: be.Backend = .{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .warm = Fixture.yes, .cancel = Fixture.none, .release = Fixture.none, .idle = Fixture.none } };
+    var engine: Engine = .init(std.testing.allocator, io, backend, .{ .dir = dir, .parallelism = 2 });
+    defer engine.deinit();
+    var titles: [4]library.Manga = undefined;
+    for (&titles, 1..) |*title, id| title.* = .{
+        .id = try library.mangaId(a, @intCast(id), "/m"),
+        .source_id = @intCast(id),
+        .title = try std.fmt.allocPrint(a, "Title {d}", .{id}),
+        .remote = .{ .url = "/m", .title = "Title", .status = if (id == 4) 2 else 1 },
+    };
+    try engine.store.save(a, .{ .manga = &titles });
+    const job = try Job.start(&engine, .{ .update_library = .{} });
+    defer job.deinit();
+    job.join();
+    try std.testing.expect(job.failure == null);
+    try std.testing.expect(fixture.first.isSet() and fixture.second.isSet());
+    try std.testing.expectEqual(3, job.pages_done.load(.acquire));
+    try std.testing.expectEqual(3, job.pages_total.load(.acquire));
+    try std.testing.expectEqual(1, job.result.update_skipped);
+    try std.testing.expectEqual(2, job.result.new_chapters.len);
+    try std.testing.expectEqualStrings("1:/c1", job.result.new_chapters[0]);
+    try std.testing.expectEqualStrings("2:/c1", job.result.new_chapters[1]);
+    try std.testing.expectEqual(1, job.result.update_errors.len);
+    try std.testing.expectEqualStrings("3:/m", job.result.update_errors[0].manga_id);
+    try std.testing.expectEqualStrings("ExtensionError: broken source", job.result.update_errors[0].message);
+    const updated = try engine.store.load(a);
+    try std.testing.expectEqual(1, updated.manga[updated.find("1:/m").?].chapters.len);
+    try std.testing.expectEqual(1, updated.manga[updated.find("2:/m").?].chapters.len);
+    try std.testing.expectEqual(0, updated.manga[updated.find("3:/m").?].chapters.len);
+    try std.testing.expectEqual(0, updated.manga[updated.find("4:/m").?].chapters.len);
+    try std.testing.expectEqual(2, (try engine.loadSettings(a)).updates.unseen);
 }
