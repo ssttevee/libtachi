@@ -116,6 +116,47 @@ fn testWorker(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, dir:
     var restarted: WorkerProbe = .{ .io = io };
     try WorkerProbe.run(&client, 104, &restarted);
     std.debug.print("PASS: queued worker cancellation isolation, uncooperative worker termination and restart\n", .{});
+    const SearchProbe = struct {
+        io: std.Io,
+        dir: []const u8,
+        count: usize = 0,
+        successful: usize = 0,
+        failed: usize = 0,
+        fn starting(_: *anyopaque) void {}
+        fn ready(_: *anyopaque) void {}
+        fn loading(_: *anyopaque, _: ?[]const u8) void {}
+        fn result(ptr: *anyopaque, value: tachi.backend.SourceSearch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            if (value.failure) |failure| {
+                try std.testing.expectEqual(108, value.source);
+                try std.testing.expect(std.mem.indexOf(u8, failure, "search fixture diagnostic") != null);
+                self.failed += 1;
+            } else {
+                try std.testing.expectEqualStrings("Parallel query", value.mangas[0].title);
+                self.successful += 1;
+            }
+            if (value.source == 107) {
+                var root = try std.Io.Dir.cwd().openDir(self.io, self.dir, .{});
+                defer root.close(self.io);
+                try root.writeFile(self.io, .{ .sub_path = "search.release", .data = "release" });
+            }
+        }
+    };
+    var search: SearchProbe = .{ .io = io, .dir = child_dir };
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    try client.backend().search(gpa, io, arena.allocator(), .{ .sources = &.{ 106, 107, 108 }, .query = "Parallel query", .parallelism = 2 }, .{
+        .context = &search,
+        .starting = SearchProbe.starting,
+        .ready = SearchProbe.ready,
+        .loading = SearchProbe.loading,
+        .search_result = SearchProbe.result,
+    });
+    try std.testing.expectEqual(3, search.count);
+    try std.testing.expectEqual(2, search.successful);
+    try std.testing.expectEqual(1, search.failed);
+    std.debug.print("PASS: concurrent single-JVM worker searches, streamed partial results and isolated source failure\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {

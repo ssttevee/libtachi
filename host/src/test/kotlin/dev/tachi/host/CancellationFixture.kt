@@ -12,6 +12,8 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -46,7 +48,18 @@ object CancellationFixture {
             } finally { ended.add(id) }
         }
         override suspend fun getLatestUpdates(page: Int) = error("unused")
-        override suspend fun getSearchManga(page: Int, query: String, filters: FilterList) = error("unused")
+        override suspend fun getSearchManga(page: Int, query: String, filters: FilterList): MangasPage {
+            if (id == 108L) throw IOException("search fixture diagnostic")
+            if (id == 106L) {
+                java.io.File(TachiRuntime.config.dataDir, "search.started").writeText("ready")
+                // Only the parent callback for source 107 can release this:
+                // both concurrent execution and streamed results are required.
+                withTimeout(5000) {
+                    while (!java.io.File(TachiRuntime.config.dataDir, "search.release").exists()) delay(5)
+                }
+            }
+            return MangasPage(listOf(SManga.create().apply { url = "/$id"; title = query }), false)
+        }
         override suspend fun getMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean): SMangaUpdate = error("unused")
         override suspend fun getPageList(chapter: SChapter): List<Page> = error("unused")
     }
@@ -67,7 +80,7 @@ object CancellationFixture {
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         val sources = field.get(ExtensionLoader) as ConcurrentHashMap<Long, Source>
-        for (id in 101L..105L) sources[id] = FixtureSource(id)
+        for (id in 101L..108L) sources[id] = FixtureSource(id)
         val fixture = FixtureSource(104)
         sources[104] = object : HttpSource(), Source by fixture {
             override val id = 104L

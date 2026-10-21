@@ -1503,46 +1503,52 @@ pub const Engine = struct {
             try targets.append(a, source);
         }
         job.pages_total.store(targets.items.len, .release);
-        // Independent sources overlap; a worker backend still serializes its connection.
         const Search = struct {
             job: *Job,
             targets: []const models.SourceInfo,
             browse: @FieldType(settings.Settings, "browse"),
-            query: []const u8,
 
-            fn work(ctx: *@This(), scratch: std.mem.Allocator, index: usize) !SearchResult {
-                const source = ctx.targets[index];
-                var result: SearchResult = .{ .source = source, .pinned = views.sourcePinned(source, ctx.browse) };
-                tachi.setLastError("");
-                const reply = ctx.job.engine.backend.run(scratch, .{ .browse = .{
-                    .source = source.idInt() catch unreachable,
-                    .kind = .{ .search = .{ .query = ctx.query } },
-                } }, ctx.job.status()) catch |err| switch (err) {
-                    error.Canceled, error.OutOfMemory => return err,
-                    else => {
-                        result.failure = try std.fmt.allocPrint(scratch, "{s}: {s}", .{ @errorName(err), tachi.lastError() });
-                        return result;
-                    },
-                };
-                var seen: std.StringHashMapUnmanaged(void) = .empty;
-                var mangas: std.ArrayList(models.Manga) = .empty;
-                if (reply.page) |page| for (page.mangas) |m| {
-                    if ((try seen.getOrPut(scratch, m.url)).found_existing) continue;
-                    try mangas.append(scratch, m);
-                };
-                result.mangas = mangas.items;
-                return result;
+            fn starting(ptr: *anyopaque) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                Job.starting(ctx.job);
             }
-            fn publish(ctx: *@This(), _: usize, result: SearchResult, scratch: *std.heap.ArenaAllocator) !void {
-                try ctx.job.keepArena(scratch);
+            fn ready(ptr: *anyopaque) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                Job.ready(ctx.job);
+            }
+            fn loading(ptr: *anyopaque, extension: ?[]const u8) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                Job.loading(ctx.job, extension);
+            }
+            fn publish(ptr: *anyopaque, result: be.SourceSearch) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                const source = for (ctx.targets) |target| {
+                    if ((target.idInt() catch unreachable) == result.source) break target;
+                } else return error.InvalidSearchSource;
+                // A worker response and in-process task scratch are both borrowed.
+                // Keep a private arena before publishing pointers to the UI.
+                var scratch: std.heap.ArenaAllocator = .init(ctx.job.engine.gpa);
+                defer scratch.deinit();
+                const json = try std.json.Stringify.valueAlloc(scratch.allocator(), result, .{});
+                const kept = try std.json.parseFromSliceLeaky(be.SourceSearch, scratch.allocator(), json, models.parse_options);
+                const value: SearchResult = .{ .source = source, .pinned = views.sourcePinned(source, ctx.browse), .mangas = kept.mangas, .failure = kept.failure };
+                try ctx.job.keepArena(&scratch);
                 while (!ctx.job.search_lock.tryLock()) std.atomic.spinLoopHint();
                 defer ctx.job.search_lock.unlock();
-                try ctx.job.search_partial.append(ctx.job.arena.allocator(), result);
+                try ctx.job.search_partial.append(ctx.job.arena.allocator(), value);
                 ctx.job.pages_done.store(ctx.job.search_partial.items.len, .release);
             }
         };
-        var search: Search = .{ .job = job, .targets = targets.items, .browse = s.browse, .query = query };
-        try parallel.run(self.gpa, self.io, targets.items.len, self.options.parallelism, &search, Search.work, Search.publish);
+        const ids = try a.alloc(i64, targets.items.len);
+        for (targets.items, ids) |source, *id| id.* = source.idInt() catch unreachable;
+        var search: Search = .{ .job = job, .targets = targets.items, .browse = s.browse };
+        try self.backend.search(self.gpa, self.io, a, .{ .sources = ids, .query = query, .parallelism = self.options.parallelism }, .{
+            .context = &search,
+            .starting = Search.starting,
+            .ready = Search.ready,
+            .loading = Search.loading,
+            .search_result = Search.publish,
+        });
         const results = try a.dupe(SearchResult, job.search_partial.items);
         sortSearch(results);
         job.result.search = results;

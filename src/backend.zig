@@ -7,6 +7,7 @@ const Io = std.Io;
 const tachi = @import("tachi.zig");
 const models = @import("models.zig");
 const manage = @import("manage.zig");
+const parallel = @import("parallel.zig");
 
 const log = std.log.scoped(.tachi);
 
@@ -21,6 +22,8 @@ pub const Call = union(enum) {
     /// Updates every installed extension the repository has a newer version of.
     update_extensions: Repo,
     browse: struct { source: i64, page: i32 = 1, kind: tachi.Runtime.Browse = .popular },
+    /// A bounded search batch, kept inside one worker/JVM.
+    search: Search,
     /// Details and chapters of a title, in one source call.
     update: struct { source: i64, manga: models.Manga, chapters: []const models.Chapter = &.{}, details: bool = true, chapter_list: bool = true },
     pages: struct { source: i64, chapter: models.Chapter },
@@ -53,9 +56,21 @@ pub const Call = union(enum) {
         return switch (self) {
             inline .browse, .update, .pages, .image_requests, .image, .related, .set_preference => |c| c.source,
             .filters, .preferences => |id| id,
-            .sources, .extensions, .install, .install_file, .uninstall, .update_extensions, .reload_preferences => null,
+            .sources, .extensions, .install, .install_file, .uninstall, .update_extensions, .reload_preferences, .search => null,
         };
     }
+};
+
+pub const Search = struct {
+    sources: []const i64,
+    query: []const u8,
+    parallelism: usize = parallel.default_limit,
+};
+
+pub const SourceSearch = struct {
+    source: i64,
+    mangas: []const models.Manga = &.{},
+    failure: ?[]const u8 = null,
 };
 
 /// What a call returns; only the field for that call is set.
@@ -83,6 +98,9 @@ pub const Status = struct {
     ready: *const fn (context: *anyopaque) void,
     /// An extension is loading before its first call, or `null` once it has.
     loading: *const fn (context: *anyopaque, extension: ?[]const u8) void,
+    /// One source completed. Output is borrowed for this callback only;
+    /// callbacks are serialized even though source requests overlap.
+    search_result: ?*const fn (context: *anyopaque, result: SourceSearch) anyerror!void = null,
 };
 
 pub const Backend = struct {
@@ -95,6 +113,9 @@ pub const Backend = struct {
         /// Calls may overlap; serialize internally if the backend requires it.
         /// Returns a reply allocated in the call's private `arena`.
         run: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, call: Call, status: ?Status) anyerror!Reply,
+        /// A serialized transport batches searches on its far side, rather
+        /// than serializing the otherwise independent source calls.
+        search: ?*const fn (ptr: *anyopaque, arena: std.mem.Allocator, request: Search, status: Status) anyerror!void = null,
         /// Whether a call would run without starting the JVM first.
         warm: *const fn (ptr: *anyopaque) bool,
         /// Backend-wide administrative cancellation, for pause/shutdown.
@@ -111,6 +132,38 @@ pub const Backend = struct {
     pub fn run(self: Backend, arena: std.mem.Allocator, call: Call, status: ?Status) !Reply {
         return self.vtable.run(self.ptr, arena, call, status);
     }
+    pub fn search(self: Backend, gpa: std.mem.Allocator, io: Io, arena: std.mem.Allocator, request: Search, status: Status) !void {
+        if (self.vtable.search) |batch| return batch(self.ptr, arena, request, status);
+        const Context = struct {
+            backend: Backend,
+            request: Search,
+            status: Status,
+            fn work(ctx: *@This(), scratch: std.mem.Allocator, index: usize) !SourceSearch {
+                const source = ctx.request.sources[index];
+                tachi.setLastError("");
+                const reply = ctx.backend.run(scratch, .{ .browse = .{
+                    .source = source,
+                    .kind = .{ .search = .{ .query = ctx.request.query } },
+                } }, ctx.status) catch |err| switch (err) {
+                    error.Canceled, error.OutOfMemory => return err,
+                    else => return .{ .source = source, .failure = try std.fmt.allocPrint(scratch, "{s}: {s}", .{ @errorName(err), tachi.lastError() }) },
+                };
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var mangas: std.ArrayList(models.Manga) = .empty;
+                if (reply.page) |page| for (page.mangas) |m| {
+                    if ((try seen.getOrPut(scratch, m.url)).found_existing) continue;
+                    try mangas.append(scratch, m);
+                };
+                return .{ .source = source, .mangas = mangas.items };
+            }
+            fn publish(ctx: *@This(), _: usize, result: SourceSearch, _: *std.heap.ArenaAllocator) !void {
+                if (ctx.status.search_result) |callback| try callback(ctx.status.context, result);
+            }
+        };
+        var context: Context = .{ .backend = self, .request = request, .status = status };
+        try parallel.run(gpa, io, request.sources.len, request.parallelism, &context, Context.work, Context.publish);
+    }
+
     pub fn warm(self: Backend) bool {
         return self.vtable.warm(self.ptr);
     }
@@ -211,6 +264,10 @@ pub const InProcess = struct {
         }
         return switch (call) {
             .sources => .{ .sources = try sources(rt, arena) },
+            .search => |request| blk: {
+                try self.backend().search(self.gpa, self.io, arena, request, status orelse return error.MissingSearchStatus);
+                break :blk .{};
+            },
             .extensions => |repo| .{ .extensions = try rt.repoList(arena, repo.options()) },
             .install => |c| blk: {
                 self.gpa.free(try rt.repoInstall(c.pkg, c.repo.options()));
@@ -366,4 +423,53 @@ fn callInto(comptime T: type, rt: *tachi.Runtime, arena: std.mem.Allocator, sour
 
 fn now(io: Io) i64 {
     return @intCast(@divTrunc(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+}
+
+test "search batches bound active sources and cancel and join unfinished calls" {
+    const Context = struct {
+        io: Io,
+        started: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: usize = 0,
+        fn run(ptr: *anyopaque, _: std.mem.Allocator, call: Call, _: ?Status) anyerror!Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(call == .browse);
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .acq_rel);
+            if (active == 2) self.started.set(self.io);
+            try self.parked.wait(self.io);
+            return .{};
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn quiet(_: *anyopaque) void {}
+        fn starting(_: *anyopaque) void {}
+        fn loading(_: *anyopaque, _: ?[]const u8) void {}
+        fn result(ptr: *anyopaque, _: SourceSearch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.completed += 1;
+        }
+        fn search(self: *@This()) !void {
+            const backend: Backend = .{ .ptr = self, .vtable = &.{ .run = run, .warm = yes, .cancel = quiet, .release = quiet, .idle = quiet } };
+            try backend.search(std.testing.allocator, self.io, std.testing.allocator, .{ .sources = &.{ 1, 2, 3, 4, 5 }, .query = "test", .parallelism = 2 }, .{
+                .context = self,
+                .starting = starting,
+                .ready = starting,
+                .loading = loading,
+                .search_result = result,
+            });
+        }
+    };
+    var context: Context = .{ .io = std.testing.io };
+    var future = try context.io.concurrent(Context.search, .{&context});
+    defer future.cancel(context.io) catch {};
+    try context.started.wait(context.io);
+    try std.testing.expectEqual(2, context.peak.load(.acquire));
+    try std.testing.expectError(error.Canceled, future.cancel(context.io));
+    try std.testing.expectEqual(0, context.active.load(.acquire));
+    try std.testing.expectEqual(0, context.completed);
 }

@@ -38,7 +38,8 @@ pub const Command = struct {
 pub const Response = struct {
     version: u32 = version,
     id: u64,
-    kind: enum { ready, loading, result, failure },
+    kind: enum { ready, loading, search_result, result, failure },
+    search_result: ?be.SourceSearch = null,
     /// `.loading`: the extension being loaded, or null once it has.
     extension: ?[]const u8 = null,
     reply: ?WireReply = null,
@@ -251,7 +252,7 @@ pub const Client = struct {
     }
 
     pub fn backend(self: *Client) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .run = runErased, .warm = warmErased, .cancel = cancelErased, .release = releaseErased, .idle = idleErased } };
+        return .{ .ptr = self, .vtable = &.{ .run = runErased, .search = searchErased, .warm = warmErased, .cancel = cancelErased, .release = releaseErased, .idle = idleErased } };
     }
 
     fn lock(self: *Client) void {
@@ -465,6 +466,9 @@ pub const Client = struct {
                     if (status) |s| s.ready(s.context);
                 },
                 .loading => if (status) |s| s.loading(s.context, response.extension),
+                .search_result => if (status) |s| {
+                    if (s.search_result) |callback| try callback(s.context, response.search_result orelse return error.InvalidWorkerReply);
+                },
                 .failure => {
                     return responseError(response);
                 },
@@ -490,6 +494,10 @@ pub const Client = struct {
     fn runErased(ptr: *anyopaque, arena: std.mem.Allocator, call: be.Call, status: ?be.Status) anyerror!be.Reply {
         const self: *Client = @ptrCast(@alignCast(ptr));
         return self.run(arena, call, status);
+    }
+    fn searchErased(ptr: *anyopaque, arena: std.mem.Allocator, request: be.Search, status: be.Status) anyerror!void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        _ = try self.run(arena, .{ .search = request }, status);
     }
     fn warmErased(ptr: *anyopaque) bool {
         const self: *Client = @ptrCast(@alignCast(ptr));
@@ -609,10 +617,11 @@ const Job = struct {
     /// client must still hear about it.
     events_lock: std.atomic.Mutex = .unlocked,
     events: std.ArrayList(?[]const u8) = .empty,
+    searches: std.ArrayList(be.SourceSearch) = .empty,
 
     fn work(self: *Job) void {
         defer self.done.store(true, .release);
-        const status: be.Status = .{ .context = self, .starting = starting, .ready = isReady, .loading = loading };
+        const status: be.Status = .{ .context = self, .starting = starting, .ready = isReady, .loading = loading, .search_result = searchResult };
         self.reply = self.runtime.run(self.arena.allocator(), self.call, status) catch |err| blk: {
             self.failure_code = if (err == error.BrowserVerificationRequired) .browser_verification_required else null;
             self.failure = std.fmt.allocPrint(self.arena.allocator(), "{s}: {s}", .{ @errorName(err), tachi.lastError() }) catch "Operation failed (out of memory)";
@@ -631,6 +640,22 @@ const Job = struct {
         defer self.events_lock.unlock();
         const name = if (extension) |n| self.arena.allocator().dupe(u8, n) catch return else null;
         self.events.append(self.arena.allocator(), name) catch {};
+    }
+
+    fn searchResult(context: *anyopaque, result: be.SourceSearch) !void {
+        const self: *Job = @ptrCast(@alignCast(context));
+        while (!self.events_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.events_lock.unlock();
+        const a = self.arena.allocator();
+        const json = try std.json.Stringify.valueAlloc(a, result, .{});
+        try self.searches.append(a, try std.json.parseFromSliceLeaky(be.SourceSearch, a, json, parse_options));
+    }
+
+    fn takeSearches(self: *Job, out: *std.ArrayList(be.SourceSearch), gpa: std.mem.Allocator) !void {
+        while (!self.events_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.events_lock.unlock();
+        try out.appendSlice(gpa, self.searches.items);
+        self.searches.clearRetainingCapacity();
     }
 
     /// Takes the events reported since the last call, into `out`.
@@ -660,7 +685,14 @@ fn serveLoop(gpa: std.mem.Allocator, runtime: *be.InProcess, options: ServeOptio
             defer events.deinit(gpa);
             try job.takeEvents(&events, gpa);
             for (events.items) |extension| try send(fd, gpa, Response{ .id = id, .kind = .loading, .extension = extension, .rss_kib = tachi_rss_kib() });
-            if (job.done.load(.acquire)) {
+            const done = job.done.load(.acquire);
+            // Acquire completion before draining, so the final result cannot
+            // overtake a source that finished since the previous poll.
+            var searches: std.ArrayList(be.SourceSearch) = .empty;
+            defer searches.deinit(gpa);
+            try job.takeSearches(&searches, gpa);
+            for (searches.items) |result| try send(fd, gpa, Response{ .id = id, .kind = .search_result, .search_result = result, .rss_kib = tachi_rss_kib() });
+            if (done) {
                 job.thread.?.join();
                 if (options.after_call) |after| after();
                 const reply: ?WireReply = if (job.reply) |r| try WireReply.from(job.arena.allocator(), r) else null;
@@ -747,4 +779,21 @@ test "worker failures preserve typed browser verification without guessing from 
     try t.expectEqual(error.BrowserVerificationRequired, responseError(parsed.value));
     try t.expectEqualStrings(diagnostic, tachi.lastError());
     try t.expectEqual(error.ExtensionError, responseError(.{ .id = 1, .kind = .failure, .failure = diagnostic }));
+}
+
+test "parallel search requests and partial results survive worker framing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const command: Command = .{ .id = 9, .kind = .call, .call = .{ .search = .{ .sources = &.{ 1, 2 }, .query = "Title", .parallelism = 2 } } };
+    const request_json = try std.json.Stringify.valueAlloc(a, command, .{});
+    const request = try std.json.parseFromSliceLeaky(Command, a, request_json, parse_options);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, request.call.?.search.sources);
+    try std.testing.expectEqualStrings("Title", request.call.?.search.query);
+    const response: Response = .{ .id = 9, .kind = .search_result, .search_result = .{ .source = 2, .mangas = &.{.{ .url = "/two", .title = "Two" }} } };
+    const json = try std.json.Stringify.valueAlloc(a, response, .{});
+    const parsed = try std.json.parseFromSliceLeaky(Response, a, json, parse_options);
+    try std.testing.expectEqual(.search_result, parsed.kind);
+    try std.testing.expectEqual(2, parsed.search_result.?.source);
+    try std.testing.expectEqualStrings("Two", parsed.search_result.?.mangas[0].title);
 }
