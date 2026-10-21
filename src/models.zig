@@ -161,3 +161,17 @@ pub const parse_options: std.json.ParseOptions = .{
     .ignore_unknown_fields = true,
     .allocate = .alloc_always,
 };
+
+/// Source arguments are always JSON objects, including an empty Zig tuple.
+pub fn sourceArguments(gpa: std.mem.Allocator, args: anytype) std.mem.Allocator.Error![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, if (@TypeOf(args) == @TypeOf(.{})) struct {}{} else args, .{ .emit_null_optional_fields = false });
+}
+
+test "source arguments encode empty objects and omit absent optional fields" {
+    const empty = try sourceArguments(std.testing.allocator, .{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("{}", empty);
+    const fields = try sourceArguments(std.testing.allocator, .{ .page = @as(i32, 1), .query = @as(?[]const u8, null) });
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqualStrings("{\"page\":1}", fields);
+}

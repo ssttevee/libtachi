@@ -307,7 +307,7 @@ fn into(comptime T: type, arena: std.mem.Allocator, json: []u8, gpa: std.mem.All
 }
 
 fn callInto(comptime T: type, rt: *tachi.Runtime, arena: std.mem.Allocator, source: i64, method: []const u8, args: anytype) !T {
-    const args_json = try std.json.Stringify.valueAlloc(arena, args, .{ .emit_null_optional_fields = false });
+    const args_json = try models.sourceArguments(arena, args);
     return into(T, arena, try rt.call(source, method, args_json), rt.gpa);
 }
 

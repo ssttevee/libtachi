@@ -480,7 +480,7 @@ pub const Runtime = struct {
     }
 
     fn callWith(self: *Runtime, comptime T: type, source_id: i64, method: []const u8, args: anytype) Error!Result(T) {
-        const json = std.json.Stringify.valueAlloc(self.gpa, args, .{ .emit_null_optional_fields = false }) catch return error.OutOfMemory;
+        const json = try models.sourceArguments(self.gpa, args);
         defer self.gpa.free(json);
         return self.callParsed(T, source_id, method, json);
     }
