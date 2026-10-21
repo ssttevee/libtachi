@@ -942,6 +942,7 @@ fn registerLogHook(env: *jni.JNIEnv) Error!void {
 // ---- tests ---------------------------------------------------------------------
 
 test {
+    _ = @import("parallel.zig");
     _ = jvm;
     _ = transport;
     _ = repo;
