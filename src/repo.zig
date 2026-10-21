@@ -16,6 +16,7 @@ const max_index_len = 64 << 20;
 const max_package_len = 256 << 20;
 
 pub const Error = error{
+    Canceled,
     NetworkError,
     InvalidIndex,
     FileSystemError,
@@ -366,7 +367,7 @@ pub const Http = struct {
     /// Use explicit PEM roots without changing system files or disabling TLS.
     pub fn useCaFile(h: *Http, path: []const u8) Error!void {
         const now = Io.Clock.real.now(h.client.io);
-        h.client.ca_bundle.addCertsFromFilePath(h.client.allocator, h.client.io, now, Io.Dir.cwd(), path) catch return error.NetworkError;
+        h.client.ca_bundle.addCertsFromFilePath(h.client.allocator, h.client.io, now, Io.Dir.cwd(), path) catch |err| return httpError(err);
         h.client.now = now;
     }
 
@@ -381,9 +382,12 @@ pub const Http = struct {
             .headers = .{ .user_agent = .{ .override = h.user_agent } },
         }) catch |err| return httpError(err);
         defer request.deinit();
-        request.sendBodiless() catch |err| return httpError(err);
+        request.sendBodiless() catch |err| return httpError(request.connection.?.stream_writer.err orelse err);
         var redirect_buffer: [8 << 10]u8 = undefined;
-        var response = request.receiveHead(&redirect_buffer) catch |err| return httpError(err);
+        var response = request.receiveHead(&redirect_buffer) catch |err| {
+            if (request.connection) |connection| if (connection.stream_reader.err) |cause| return httpError(cause);
+            return httpError(err);
+        };
         if (response.head.status.class() != .success) return error.NetworkError;
 
         const window_len: usize = switch (response.head.content_encoding) {
@@ -397,7 +401,13 @@ pub const Http = struct {
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, window);
-        return reader.allocRemaining(gpa, .limited(limit)) catch |err| return httpError(err);
+        return reader.allocRemaining(gpa, .limited(limit)) catch |err| {
+            if (err == error.ReadFailed) {
+                if (response.bodyErr()) |cause| return httpError(cause);
+                if (request.connection) |connection| if (connection.stream_reader.err) |cause| return httpError(cause);
+            }
+            return httpError(err);
+        };
     }
 
     /// GETs `url` straight into `dir/sub_path`, replacing any existing file.
@@ -417,6 +427,7 @@ pub const Http = struct {
             .response_writer = w,
             .headers = .{ .user_agent = .{ .override = h.user_agent } },
         }) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
             error.WriteFailed => return error.FileSystemError,
             else => return error.NetworkError,
@@ -489,6 +500,7 @@ pub fn resolveExtensionList(h: *Http, arena: Allocator, index: Store) Error!Stor
 
 fn httpError(err: anyerror) Error {
     return switch (err) {
+        error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
         else => error.NetworkError,
     };
@@ -837,4 +849,43 @@ test "a legacy repo.json can point to a JSON store, whose list may live elsewher
     try testing.expectEqualStrings("d", store.discord.?);
     try testing.expectEqual(ContentWarning.mixed, store.extensions[0].content_warning);
     try testing.expectEqualStrings("https://m", store.extensions[0].sources[0].mirror_urls[0]);
+}
+
+test "repository HTTP preserves task cancellation while reading a stalled response" {
+    const io = testing.io;
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const Fixture = struct {
+        server: *Io.net.Server,
+        sent: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        fn serve(self: *@This()) !void {
+            const stream = try self.server.accept(testing.io);
+            defer stream.close(testing.io);
+            var buffer: [4096]u8 = undefined;
+            var reader = stream.reader(testing.io, &buffer);
+            while ((try reader.interface.takeDelimiterInclusive('\n')).len > 2) {}
+            var writer = stream.writer(testing.io, &.{});
+            try writer.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n{\"name\":");
+            try writer.interface.flush();
+            self.sent.set(testing.io);
+            try self.parked.wait(testing.io);
+        }
+        fn fetch(url: []const u8) !void {
+            var http: Http = .init(testing.allocator, testing.io);
+            defer http.deinit();
+            const bytes = try http.getAlloc(testing.allocator, url, max_index_len);
+            defer testing.allocator.free(bytes);
+        }
+    };
+    var fixture: Fixture = .{ .server = &server };
+    var serving = try io.concurrent(Fixture.serve, .{&fixture});
+    defer _ = serving.cancel(io) catch {};
+    const url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/index.json", .{server.socket.address.getPort()});
+    defer testing.allocator.free(url);
+    var fetching = try io.concurrent(Fixture.fetch, .{url});
+    defer _ = fetching.cancel(io) catch {};
+    try fixture.sent.wait(io);
+    try testing.expectError(error.Canceled, fetching.cancel(io));
 }
