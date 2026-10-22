@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const core_mod = b.addModule("tachicore", .{
+        .root_source_file = b.path("src/core.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     // Public Zig module: @import("tachi")
     const tachi_mod = b.addModule("tachi", .{
         .root_source_file = b.path("src/tachi.zig"),
@@ -11,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    tachi_mod.addImport("tachicore", core_mod);
     // Compile the pinned amalgamation into every consumer; do not depend on a
     // firmware-provided SQLite shared library or its build options.
     const sqlite = b.dependency("sqlite", .{});
@@ -39,7 +47,7 @@ pub fn build(b: *std.Build) void {
         "embed-host-jar",
         "Embed tachi-host.jar in the library and CLI so nothing else needs to be distributed (default: false)",
     ) orelse false;
-    tachi_mod.addImport("host_jar", embeddedHostJar(b, if (embed_host_jar) host_jar else null));
+    core_mod.addImport("host_jar", embeddedHostJar(b, if (embed_host_jar) host_jar else null));
 
     // Modules that depend on the library share one shape; only the root differs.
     const dependent = struct {
@@ -78,6 +86,10 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Module{ tachi_mod, capi_static }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
+
+    const core_tests = b.addRunArtifact(b.addTest(.{ .root_module = core_mod }));
+    test_step.dependOn(&core_tests.step);
+    b.step("test-core", "Test the independent extension core").dependOn(&core_tests.step);
 
     // Opt-in integration test: a real JVM and test-only synthetic sources.
     const fixture_jar = b.addSystemCommand(&.{ "./gradlew", "cancellationFixtureJar", "-q" });

@@ -8,7 +8,7 @@ const Io = std.Io;
 const repo = @import("repo.zig");
 const manage = @import("manage.zig");
 const library = @import("library.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 
 pub const Store = struct {
     /// The index URL after legacy redirects, as Mihon stores it.

@@ -3,7 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const discovery = @import("discovery.zig");
+const discovery = @import("tachicore").discovery;
 pub const Error = discovery.Error || error{ Canceled, NetworkError, FileSystemError };
 const max_index_len = discovery.max_index_len;
 const max_package_len = 256 << 20;

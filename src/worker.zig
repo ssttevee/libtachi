@@ -6,7 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tachi = @import("tachi.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 const be = @import("backend.zig");
 const manage = @import("manage.zig");
 

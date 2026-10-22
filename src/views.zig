@@ -6,7 +6,7 @@ const std = @import("std");
 const library = @import("library.zig");
 const settings = @import("settings.zig");
 const query = @import("query.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 
 const Library = library.Library;
 const Manga = library.Manga;

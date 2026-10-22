@@ -14,7 +14,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const tachi = @import("tachi.zig");
 const repo = @import("repo.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 const Runtime = tachi.Runtime;
 const Error = tachi.Error;
 

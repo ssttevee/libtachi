@@ -3,7 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const library = @import("library.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 pub const Track = library.Track;
 pub const Status = struct { value: i32, name: []const u8 };
 pub const AnilistScore = enum { POINT_100, POINT_10_DECIMAL, POINT_10, POINT_5, POINT_3 };

@@ -3,7 +3,7 @@
 //! process can own the library while extensions run elsewhere.
 const std = @import("std");
 const Io = std.Io;
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 const recognition = @import("recognition.zig");
 
 pub const Chapter = struct {

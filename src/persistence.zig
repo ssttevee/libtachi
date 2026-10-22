@@ -3,7 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const sqlite = @import("sqlite.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 
 pub fn load(comptime T: type, gpa: std.mem.Allocator, io: Io, dir: []const u8, key: []const u8, legacy_relative: []const u8) !?T {
     var db = try sqlite.Db.open(gpa, io, dir);

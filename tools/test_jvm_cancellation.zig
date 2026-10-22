@@ -8,17 +8,17 @@ const Fixture = struct {
     cls: jni.jclass,
 
     fn init(rt: *tachi.Runtime) !Fixture {
-        const env = try rt.vm.env();
+        const env = try rt.core.vm.env();
         const local = env.f.FindClass(env, "dev/tachi/host/CancellationFixture") orelse return error.FixtureNotFound;
         defer env.f.DeleteLocalRef(env, local);
         return .{ .rt = rt, .cls = env.f.NewGlobalRef(env, local) orelse return error.OutOfMemory };
     }
     fn deinit(self: Fixture) void {
-        const env = self.rt.vm.env() catch return;
+        const env = self.rt.core.vm.env() catch return;
         env.f.DeleteGlobalRef(env, self.cls);
     }
     fn command(self: Fixture, name: [*:0]const u8) !void {
-        const env = try self.rt.vm.env();
+        const env = try self.rt.core.vm.env();
         const method = env.f.GetStaticMethodID(env, self.cls, name, "()V") orelse return error.FixtureMethodMissing;
         env.f.CallStaticVoidMethodA(env, self.cls, method, &.{});
         if (env.f.ExceptionCheck(env) != 0) {
@@ -28,7 +28,7 @@ const Fixture = struct {
         }
     }
     fn flag(self: Fixture, name: [*:0]const u8, id: i64) !bool {
-        const env = try self.rt.vm.env();
+        const env = try self.rt.core.vm.env();
         const method = env.f.GetStaticMethodID(env, self.cls, name, "(J)Z") orelse return error.FixtureMethodMissing;
         const value = env.f.CallStaticBooleanMethodA(env, self.cls, method, &.{.{ .j = id }});
         if (env.f.ExceptionCheck(env) != 0) return error.FixtureFailed;
@@ -43,7 +43,7 @@ const Fixture = struct {
         }
     }
     fn checkEmpty(self: Fixture) !void {
-        const env = try self.rt.vm.env();
+        const env = try self.rt.core.vm.env();
         const method = env.f.GetStaticMethodID(env, self.cls, "activeCount", "()I") orelse return error.FixtureMethodMissing;
         try std.testing.expectEqual(0, env.f.CallStaticIntMethodA(env, self.cls, method, &.{}));
     }

@@ -12,7 +12,7 @@
 //! Unknown fields are skipped; extension stores are kept as encoded messages.
 const std = @import("std");
 const library = @import("library.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 
 // ---- model ------------------------------------------------------------------------
 

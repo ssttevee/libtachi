@@ -3,7 +3,7 @@
 const std = @import("std");
 const lib = @import("library.zig");
 const sqlite = @import("sqlite.zig");
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 const ReadingFile = struct { version: u32 = 1, chapters: []const lib.Reading = &.{} };
 
 pub fn open(store: *lib.Store, arena: std.mem.Allocator) !sqlite.Db {

@@ -5,7 +5,7 @@
 //! and survive failure or cancellation, so a retry resumes the chapter.
 const std = @import("std");
 const Io = std.Io;
-const models = @import("models.zig");
+const models = @import("tachicore").models;
 const library = @import("library.zig");
 const parallel = @import("parallel.zig");
 const tachi = @import("tachi.zig");

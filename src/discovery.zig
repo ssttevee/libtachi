@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 pub const default_index_url = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.pb";
 
-/// Largest index / package we are willing to hold in memory.
+/// Maximum decoded index size accepted by the codecs.
 pub const max_index_len = 64 << 20;
 
 pub const Error = error{ InvalidIndex, OutOfMemory };
