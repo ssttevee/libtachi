@@ -20,7 +20,12 @@ them on a desktop JVM is used here, but packaged as an embeddable library in
 the spirit of [PatchBukkit](https://github.com/Pumpkin-MC/PatchBukkit): the
 JVM lives inside your process and you talk to it through a small, stable C API.
 
-On top of the runtime sits a turnkey engine for Tachiyomi-style apps: the
+`libtachicore` (`tachicore.h`, Zig module `tachicore`) is the independent
+extension runtime and repository decoder. It accepts integrator-owned package
+files and repository bytes; your application owns downloads, installation
+records and storage. See [docs/CORE.md](docs/CORE.md) for the boundary and APIs.
+
+On top of this core, `libtachi` provides a turnkey engine for Tachiyomi-style apps: the
 library, downloads, the local source, library updates, backups and every
 list Mihon shows, with Mihon's behavior. An app only adds a UI.
 
@@ -42,7 +47,7 @@ Working today (macOS/Linux, HotSpot JDK 17+):
   `Context`/`Application`, `SharedPreferences`, `androidx.preference.*`,
   `Uri`, `Base64`, `Log`, `SystemClock`, `Build`, `Handler`/`Looper`,
   `webkit.CookieManager` (shared with OkHttp), `Toast`.
-- Extension repositories: lists Mihon-style `index.pb` repos (keiyoushi by
+- Turnkey `libtachi` repository management: lists Mihon-style `index.pb` repos (keiyoushi by
   default), downloads packages, checks them against the repo's signing key,
   and remembers installs across runs. All of it in Zig on `std.Io`; the JVM
   only ever loads files.
@@ -88,8 +93,10 @@ Requirements: Zig 0.17, a JDK 17+ (to build and to run), and an `android.jar`
 and pass `-Dandroid-jar=host/lib/android.jar`.
 
 ```sh
-zig build             # zig-out/lib/libtachi.{a,dylib|so}, zig-out/lib/tachi-host.jar,
-                      # zig-out/include/tachi.h, zig-out/bin/tachi-cli
+zig build             # both libtachicore and libtachi, their headers, host jar and CLI
+zig build core -Dcore-only --prefix zig-out/core # independent core, no SQLite
+zig build test-core -Dcore-only # core + standalone Zig/C consumers
+zig build test-core-jvm -Dcore-only # standalone runtime against the real host
 zig build host        # only the jar (Gradle, ~1 min the first time)
 zig build test        # no Gradle unless -Dembed-host-jar
 zig build test-jvm    # opt-in real-JVM cancellation, isolation and worker recovery tests

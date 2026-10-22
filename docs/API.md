@@ -1,8 +1,11 @@
 # Bridge API
 
-Everything crosses the native/JVM boundary as UTF-8 JSON. The Zig API
-(`tachi.Runtime`) and the C API (`tachi.h`) are thin wrappers over the same
-five entry points; `tachi.models` mirrors the documents below.
+Everything crosses the native/JVM boundary as UTF-8 JSON. The independent
+extension interface is `tachicore.Runtime` / `tachicore.h`; `tachi.Runtime` /
+`tachi.h` add persistent package and repository management over the same core.
+Both use the source schemas below and share model types (`tachicore.models`,
+also re-exported as `tachi.models`). See [CORE.md](CORE.md) for standalone builds
+and integration responsibilities.
 
 Every reply from the host is an envelope:
 
@@ -12,8 +15,9 @@ Every reply from the host is an envelope:
 ```
 
 The wrappers unwrap it: Zig returns the `ok` payload (or `error.ExtensionError`
-with `tachi.lastError()`), C returns the payload through `out_json` (or
-`TACHI_E_EXTENSION_ERROR` with `tachi_last_error()`).
+with `lastError()`), C returns the payload through `out_json`. Each C frontend
+uses its own prefix: `TACHICORE_E_EXTENSION_ERROR` / `tachicore_last_error()` or
+`TACHI_E_EXTENSION_ERROR` / `tachi_last_error()`.
 
 Source ids are 63-bit integers. They are **strings** in JSON (`"id": "2131…"`)
 so JavaScript consumers do not lose precision, and `int64_t` in the C API.
@@ -46,8 +50,9 @@ SourceInfo {
 ```
 
 `install` and `register` are the only ways a package enters the JVM. The
-Zig/C layers wrap them with a registry so installs survive the process; see
-below. A registered package is listed with its recorded sources, but its
+managed `libtachi` layer wraps them with a registry so installs survive the
+process; see below. Core `loadPackage` / `tachicore_load` and `registerPackage` /
+`tachicore_register` leave that policy to the integrator. A registered package is listed with its recorded sources, but its
 classes load, and its sources are created, only when one of them is first
 called. Classes from a signed jar load from an unsigned copy in
 `<cacheDir>/extensions`: the signatures attach no permissions here, and

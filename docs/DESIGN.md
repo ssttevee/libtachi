@@ -7,6 +7,20 @@ application's process, exposed through a C ABI (and a Zig module), so that
 desktop or server apps written in Zig, C, Swift, Rust, etc. can browse manga
 sources without an Android device and without running a separate web server.
 
+## Library boundary
+
+`libtachicore` owns the extension runtime: JNI/JVM lifetime, compatibility host,
+source calls and byte-based repository decoding. It exports the `tachicore`
+Zig module and `tachicore.h` without application storage or download policy.
+`libtachi` imports that module and adds its managed Runtime adapter, engine,
+SQLite database, registry, repository HTTP/cache, worker protocol and downloads.
+The adapters share models, diagnostics and the actual runtime implementation.
+
+The core still needs a caller-owned sandbox for extension preferences, cookies,
+APK conversion and JVM caches. It does not own library data or downloaded
+chapters. The independent build path skips SQLite entirely; standalone Zig/C
+consumer and JVM tests enforce the boundary. See [CORE.md](CORE.md).
+
 ## What an extension actually is
 
 An extension is an Android APK compiled against

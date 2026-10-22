@@ -1,6 +1,7 @@
 //! Minimal extension runtime. Acquisition and library persistence belong to the integrator.
 //!
 //! ```zig
+//! const tachi = @import("tachicore");
 //! var rt = try tachi.Runtime.init(gpa, io, .{ .data_dir = "/tmp/tachi", .environ = environ });
 //! defer rt.deinit();
 //! const ext = try rt.loadPackageParsed("tachiyomi-en.weebcentral-v1.6.25.jar");
