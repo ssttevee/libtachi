@@ -24,7 +24,7 @@ from build configuration and dependency resolution. A normal `zig build`
 installs both libraries. `-Dhost-jar=PATH` uses a prebuilt host jar;
 `-Dembed-host-jar` embeds it instead of installing a sidecar. Building the host
 requires the same JDK and Android API jar as the turnkey build; using a prebuilt
-host avoids that Gradle build. Running extension code still requires a JVM.
+host avoids that Gradle build. Running extension code requires a JVM.
 
 A separate Zig package can consume only the core:
 
@@ -64,7 +64,7 @@ no network or filesystem I/O. Follow `extension_list_url`/`index_v2` using the
 integrator's HTTP client, then supply the resulting bytes to the appropriate
 parser. `parseLegacyList` takes the repository base URL for package/icon URLs.
 
-`Runtime.Options.data_dir` is still required as a host sandbox: extensions use
+`Runtime.Options.data_dir` is required as a host sandbox: extensions use
 Android preferences, cookies and file APIs, and APK conversion/class loading
 and optional JVM caches need files. The integrator selects and owns this
 location. The core creates no installation registry, SQLite database, chapter
@@ -119,7 +119,7 @@ does not choose a worker-process or task scheduling policy for the application.
 ## C interface
 
 Include `tachicore.h` and link only `libtachicore`. The `tachicore_*` symbols
-are independent of the existing `tachi_*` API; both headers can be included
+are independent of the `tachi_*` API; both headers can be included
 together. Their runtime handles are distinct types and must not be cast between
 frontends. Use one runtime frontend to own a JVM.
 
@@ -153,14 +153,16 @@ saving a page. Free all returned JSON, image and MIME allocations with
 `tachicore_cancel_requests` is source-wide HTTP cancellation; per-operation
 `std.Io` cancellation is exposed by the Zig API.
 
-## Existing libtachi applications
+## Managed integration with libtachi
 
-`tachi.Runtime`, `tachi.Engine`, the CLI and `tachi.h` retain their managed
-behavior. Runtime source methods delegate to `tachicore.Runtime`;
-`installExtension`, `restore`, `repoInstall` and `repoUpdate` remain solely in
-the managed adapter. Its registry mutex and package policy are outside the
-core. Advanced Zig integrations can access the shared raw runtime through
-`tachi.Runtime.core`; low-level JNI access is now `rt.core.vm`.
+`libtachi` provides package installation, persistent registration, library
+storage and download management through `tachi.Runtime`, `tachi.Engine`, the
+CLI and `tachi.h`. Runtime source methods delegate to `tachicore.Runtime`.
+`installExtension`, `restore`, `repoInstall` and `repoUpdate` belong to the
+managed adapter, which owns the registry mutex and package policy.
 
-Choose `tachicore` for a new integrator that owns its data model and download
-system. Choose `tachi` when the existing engine and management policies fit.
+Zig integrations can access the underlying core runtime through
+`tachi.Runtime.core` and its JVM through `rt.core.vm`.
+
+Choose `tachicore` when the integrator owns its data model and download system.
+Choose `tachi` when its engine and management policies fit.
