@@ -3,126 +3,129 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-
+    const core_only = b.option(bool, "core-only", "Build only the independent extension core; do not resolve SQLite") orelse false;
     const core_mod = b.addModule("tachicore", .{
         .root_source_file = b.path("src/core.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-
-    // Public Zig module: @import("tachi")
-    const tachi_mod = b.addModule("tachi", .{
-        .root_source_file = b.path("src/tachi.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    tachi_mod.addImport("tachicore", core_mod);
-    // Compile the pinned amalgamation into every consumer; do not depend on a
-    // firmware-provided SQLite shared library or its build options.
-    const sqlite = b.dependency("sqlite", .{});
-    tachi_mod.addIncludePath(sqlite.path(""));
-    tachi_mod.addCSourceFile(.{ .file = sqlite.path("sqlite3.c"), .flags = &.{
-        "-DSQLITE_THREADSAFE=1",
-        "-DSQLITE_OMIT_LOAD_EXTENSION",
-        "-DSQLITE_DQS=0",
-        "-DSQLITE_DEFAULT_MEMSTATUS=0",
-        "-DSQLITE_DEFAULT_MMAP_SIZE=0",
-    } });
-    // Spawning the worker process and its socket calls.
-    tachi_mod.addCSourceFile(.{ .file = b.path("src/worker_posix.c"), .flags = &.{} });
-    tachi_mod.addCSourceFile(.{ .file = b.path("src/formats_time.c"), .flags = &.{} });
-
     const android_jar = b.option([]const u8, "android-jar", "android.jar for Gradle (default: newest installed platform)");
-
-    // Kotlin host jar: built by Gradle as a cached step unless -Dhost-jar names one.
-    const host_jar = if (b.option(
-        []const u8,
-        "host-jar",
-        "Use this tachi-host.jar instead of building it with Gradle",
-    )) |path| sourcePath(b, path) else gradleHostJar(b, android_jar);
-    const embed_host_jar = b.option(
-        bool,
-        "embed-host-jar",
-        "Embed tachi-host.jar in the library and CLI so nothing else needs to be distributed (default: false)",
-    ) orelse false;
+    const host_jar = if (b.option([]const u8, "host-jar", "Use this tachi-host.jar instead of building it with Gradle")) |path|
+        sourcePath(b, path)
+    else
+        gradleHostJar(b, android_jar);
+    const embed_host_jar = b.option(bool, "embed-host-jar", "Embed tachi-host.jar in libraries and CLI (default: false)") orelse false;
     core_mod.addImport("host_jar", embeddedHostJar(b, if (embed_host_jar) host_jar else null));
 
-    // Modules that depend on the library share one shape; only the root differs.
     const dependent = struct {
-        fn module(bb: *std.Build, root: []const u8, lib: *std.Build.Module) *std.Build.Module {
+        fn module(bb: *std.Build, root: []const u8, lib: *std.Build.Module, name: []const u8) *std.Build.Module {
             return bb.createModule(.{
                 .root_source_file = bb.path(root),
                 .target = lib.resolved_target.?,
                 .optimize = lib.optimize.?,
                 .link_libc = true,
-                .imports = &.{.{ .name = "tachi", .module = lib }},
+                .imports = &.{.{ .name = name, .module = lib }},
             });
         }
     }.module;
 
-    // C library (static + shared) exposing include/tachi.h. Each linkage gets
-    // its own module because a module can only belong to one compilation.
-    const capi_static = dependent(b, "src/capi.zig", tachi_mod);
-    const static_lib = b.addLibrary(.{ .name = "tachi", .linkage = .static, .root_module = capi_static });
-    static_lib.installHeader(b.path("include/tachi.h"), "tachi.h");
-    b.installArtifact(static_lib);
-
-    const capi_shared = dependent(b, "src/capi.zig", tachi_mod);
-    const shared_lib = b.addLibrary(.{ .name = "tachi", .linkage = .dynamic, .root_module = capi_shared });
-    b.installArtifact(shared_lib);
-
-    // CLI
-    const cli = b.addExecutable(.{ .name = "tachi-cli", .root_module = dependent(b, "src/main.zig", tachi_mod) });
-    b.installArtifact(cli);
-
-    const run_cli = b.addRunArtifact(cli);
-    run_cli.step.dependOn(b.getInstallStep());
-    b.step("run", "Run tachi-cli").dependOn(&run_cli.step);
-
-    // Tests (pure Zig; no JVM needed). The library and the C ABI each have their own.
-    const test_step = b.step("test", "Run unit tests");
-    for ([_]*std.Build.Module{ tachi_mod, capi_static }) |m| {
-        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const core_step = b.step("core", "Install the standalone libtachicore libraries, header and host");
+    const core_capi = dependent(b, "src/core_capi.zig", core_mod, "tachicore");
+    const core_static = b.addLibrary(.{ .name = "tachicore", .linkage = .static, .root_module = core_capi });
+    core_static.installHeader(b.path("include/tachicore.h"), "tachicore.h");
+    const core_shared = b.addLibrary(.{ .name = "tachicore", .linkage = .dynamic, .root_module = dependent(b, "src/core_capi.zig", core_mod, "tachicore") });
+    for ([_]*std.Build.Step.Compile{ core_static, core_shared }) |lib| {
+        const install = b.addInstallArtifact(lib, .{});
+        core_step.dependOn(&install.step);
+        b.getInstallStep().dependOn(&install.step);
     }
-
-    const core_tests = b.addRunArtifact(b.addTest(.{ .root_module = core_mod }));
-    test_step.dependOn(&core_tests.step);
-    b.step("test-core", "Test the independent extension core").dependOn(&core_tests.step);
-
-    // Opt-in integration test: a real JVM and test-only synthetic sources.
-    const fixture_jar = b.addSystemCommand(&.{ "./gradlew", "cancellationFixtureJar", "-q" });
-    fixture_jar.setCwd(b.path("host"));
-    const fixture_dir = fixture_jar.addPrefixedOutputDirectoryArg("-Ptachi.outputDir=", "fixtures");
-    if (android_jar) |path|
-        fixture_jar.addPrefixedFileArg("-Ptachi.androidJar=", sourcePath(b, path));
-    for ([_][]const u8{ "host/src", "host/gradle" }) |dir| addFileInputsUnder(b, fixture_jar, dir);
-    fixture_jar.addFileInput(b.path("host/build.gradle.kts"));
-    const jvm_test = b.addExecutable(.{ .name = "test-jvm-cancellation", .root_module = dependent(b, "tools/test_jvm_cancellation.zig", tachi_mod) });
-    const run_jvm_test = b.addRunArtifact(jvm_test);
-    run_jvm_test.addFileArg(host_jar);
-    run_jvm_test.addFileArg(fixture_dir.path(b, "cancellation-fixture.jar"));
-    b.step("test-jvm", "Test operation cancellation through a real JVM").dependOn(&run_jvm_test.step);
-
-    // Without embedding, the jar ships beside the library; the runtime looks in
-    // <prefix>/lib relative to the executable. `zig build host` builds just that.
     const install_jar = b.addInstallLibFile(host_jar, "tachi-host.jar");
-    if (!embed_host_jar) b.getInstallStep().dependOn(&install_jar.step);
+    if (!embed_host_jar) {
+        core_step.dependOn(&install_jar.step);
+        b.getInstallStep().dependOn(&install_jar.step);
+    }
     b.step("host", "Build tachi-host.jar and copy it to <prefix>/lib").dependOn(&install_jar.step);
 
-    // libzstd's decoder and the JNI bridge behind okhttp3.zstd.Zstd, for -Dtarget.
-    // The host loads it from disk, so consumers install the named lazy paths
-    // `pocketmanga-zstd` and `zstd-license` wherever their JVM looks.
-    const zstd_step = b.step("zstd", "Build libpocketmanga-zstd for -Dtarget into <prefix>/lib");
-    if (b.lazyDependency("zstd", .{})) |upstream| {
-        const jdk = b.option([]const u8, "jdk", "JDK whose include/jni.h the zstd bridge compiles against (default: $JAVA_HOME)") orelse
-            b.graph.environ_map.get("JAVA_HOME");
-        const zstd = zstdJni(b, upstream, jdk, target, optimize);
-        b.addNamedLazyPath("pocketmanga-zstd", zstd.getEmittedBin());
-        b.addNamedLazyPath("zstd-license", upstream.path("LICENSE"));
-        zstd_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
-        zstd_step.dependOn(&b.addInstallFile(upstream.path("LICENSE"), "share/licenses/zstd-LICENSE.txt").step);
+    const test_step = b.step("test", "Run unit and independent consumer tests");
+    const core_test_step = b.step("test-core", "Test the core and standalone Zig/C consumers without SQLite");
+    for ([_]*std.Build.Module{ core_mod, core_capi }) |module| {
+        const tests = b.addRunArtifact(b.addTest(.{ .root_module = module }));
+        test_step.dependOn(&tests.step);
+        core_test_step.dependOn(&tests.step);
+    }
+    const zig_consumer = b.addExecutable(.{ .name = "test-core-zig-consumer", .root_module = dependent(b, "tools/test_core_consumer.zig", core_mod, "tachicore") });
+    const c_consumer = b.addExecutable(.{ .name = "test-core-c-consumer", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    c_consumer.root_module.addCSourceFile(.{ .file = b.path("tools/test_core_consumer.c"), .flags = &.{"-std=c11"} });
+    c_consumer.root_module.addIncludePath(b.path("include"));
+    c_consumer.root_module.linkLibrary(core_static);
+    for ([_]*std.Build.Step.Compile{ zig_consumer, c_consumer }) |consumer| {
+        const run = b.addRunArtifact(consumer);
+        test_step.dependOn(&run.step);
+        core_test_step.dependOn(&run.step);
+    }
+    const core_jvm = b.addExecutable(.{ .name = "test-core-jvm", .root_module = dependent(b, "tools/test_core_jvm.zig", core_mod, "tachicore") });
+    const run_core_jvm = b.addRunArtifact(core_jvm);
+    run_core_jvm.addFileArg(host_jar);
+    b.step("test-core-jvm", "Test the standalone extension runtime against the real host").dependOn(&run_core_jvm.step);
+
+    if (!core_only) {
+        const tachi_mod = b.addModule("tachi", .{
+            .root_source_file = b.path("src/tachi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tachi_mod.addImport("tachicore", core_mod);
+        // SQLite belongs exclusively to the turnkey integrator.
+        const sqlite = b.dependency("sqlite", .{});
+        tachi_mod.addIncludePath(sqlite.path(""));
+        tachi_mod.addCSourceFile(.{ .file = sqlite.path("sqlite3.c"), .flags = &.{
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-DSQLITE_DEFAULT_MMAP_SIZE=0",
+        } });
+        tachi_mod.addCSourceFile(.{ .file = b.path("src/worker_posix.c"), .flags = &.{} });
+        tachi_mod.addCSourceFile(.{ .file = b.path("src/formats_time.c"), .flags = &.{} });
+        const capi_static = dependent(b, "src/capi.zig", tachi_mod, "tachi");
+        const static_lib = b.addLibrary(.{ .name = "tachi", .linkage = .static, .root_module = capi_static });
+        static_lib.installHeader(b.path("include/tachi.h"), "tachi.h");
+        b.installArtifact(static_lib);
+        b.installArtifact(b.addLibrary(.{ .name = "tachi", .linkage = .dynamic, .root_module = dependent(b, "src/capi.zig", tachi_mod, "tachi") }));
+        const cli = b.addExecutable(.{ .name = "tachi-cli", .root_module = dependent(b, "src/main.zig", tachi_mod, "tachi") });
+        b.installArtifact(cli);
+        const run_cli = b.addRunArtifact(cli);
+        run_cli.step.dependOn(b.getInstallStep());
+        b.step("run", "Run tachi-cli").dependOn(&run_cli.step);
+        for ([_]*std.Build.Module{ tachi_mod, capi_static }) |module| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+
+        const fixture_jar = b.addSystemCommand(&.{ "./gradlew", "cancellationFixtureJar", "-q" });
+        fixture_jar.setCwd(b.path("host"));
+        const fixture_dir = fixture_jar.addPrefixedOutputDirectoryArg("-Ptachi.outputDir=", "fixtures");
+        if (android_jar) |path| fixture_jar.addPrefixedFileArg("-Ptachi.androidJar=", sourcePath(b, path));
+        for ([_][]const u8{ "host/src", "host/gradle" }) |dir| addFileInputsUnder(b, fixture_jar, dir);
+        fixture_jar.addFileInput(b.path("host/build.gradle.kts"));
+        const jvm_test = b.addExecutable(.{ .name = "test-jvm-cancellation", .root_module = dependent(b, "tools/test_jvm_cancellation.zig", tachi_mod, "tachi") });
+        const run_jvm_test = b.addRunArtifact(jvm_test);
+        run_jvm_test.addFileArg(host_jar);
+        run_jvm_test.addFileArg(fixture_dir.path(b, "cancellation-fixture.jar"));
+        b.step("test-jvm", "Test operation cancellation through a real JVM").dependOn(&run_jvm_test.step);
+
+        // libzstd's decoder and the JNI bridge behind okhttp3.zstd.Zstd, for -Dtarget.
+        // The host loads it from disk, so consumers install the named lazy paths
+        // `pocketmanga-zstd` and `zstd-license` wherever their JVM looks.
+        const zstd_step = b.step("zstd", "Build libpocketmanga-zstd for -Dtarget into <prefix>/lib");
+        if (b.lazyDependency("zstd", .{})) |upstream| {
+            const jdk = b.option([]const u8, "jdk", "JDK whose include/jni.h the zstd bridge compiles against (default: $JAVA_HOME)") orelse
+                b.graph.environ_map.get("JAVA_HOME");
+            const zstd = zstdJni(b, upstream, jdk, target, optimize);
+            b.addNamedLazyPath("pocketmanga-zstd", zstd.getEmittedBin());
+            b.addNamedLazyPath("zstd-license", upstream.path("LICENSE"));
+            zstd_step.dependOn(&b.addInstallArtifact(zstd, .{}).step);
+            zstd_step.dependOn(&b.addInstallFile(upstream.path("LICENSE"), "share/licenses/zstd-LICENSE.txt").step);
+        }
     }
 }
 

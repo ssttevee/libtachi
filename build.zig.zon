@@ -7,6 +7,7 @@
         .sqlite = .{
             .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip",
             .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
+            .lazy = true,
         },
         .zstd = .{
             .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
@@ -20,6 +21,13 @@
         "src",
         "include",
         "host/native",
+        "host/src",
+        "host/gradle",
+        "host/gradlew",
+        "host/build.gradle.kts",
+        "host/settings.gradle.kts",
+        "host/gradle.properties",
+        "tools",
         "README.md",
     },
 }
