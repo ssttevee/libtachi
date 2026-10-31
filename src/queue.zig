@@ -250,18 +250,38 @@ pub const Queue = struct {
         return added;
     }
 
+    /// Explicit user retry: clear the block without dropping plans or saved pages.
+    /// An active item is left alone so repeated taps cannot duplicate a job.
+    pub fn retry(self: *Queue, engine: *Engine, chapter_id: []const u8) !void {
+        self.acquire();
+        defer self.lock.unlock();
+        try self.ensureLoaded(engine);
+        for (self.items.items) |*item| {
+            if (!std.mem.eql(u8, item.chapter_id, chapter_id)) continue;
+            if (item.status != .failed) return;
+            item.browser_verification_required = false;
+            if (item.failure) |f| engine.gpa.free(f);
+            item.failure = null;
+            item.status = .queued;
+            try self.persist(engine);
+            try self.startLocked(engine);
+            self.notify(engine.io);
+            return;
+        }
+    }
+
     /// Works through the queue, retrying failures except unsupported browser verification.
     pub fn start(self: *Queue, engine: *Engine) !void {
         self.acquire();
         defer self.lock.unlock();
         try self.ensureLoaded(engine);
+        for (self.items.items) |*item| if (item.status == .failed and !item.browser_verification_required) {
+            item.status = .queued;
+        };
         try self.startLocked(engine);
     }
 
     fn startLocked(self: *Queue, engine: *Engine) !void {
-        for (self.items.items) |*item| if (item.status == .failed and !item.browser_verification_required) {
-            item.status = .queued;
-        };
         self.paused = false;
         if (self.runner) |*r| {
             if (!self.runner_done) return;
@@ -362,6 +382,26 @@ pub const Queue = struct {
             }
         }
         return out;
+    }
+
+    pub const SnapshotPage = struct { entries: []Entry, total: usize, offset: usize };
+    pub fn snapshotPage(self: *Queue, engine: *Engine, arena: std.mem.Allocator, offset: usize, limit: usize) !SnapshotPage {
+        if (limit == 0 or limit > 256) return error.InvalidPageSize;
+        self.acquire();
+        defer self.lock.unlock();
+        try self.ensureLoaded(engine);
+        const total = self.items.items.len;
+        const base = if (total == 0) 0 else @min(offset / limit, (total - 1) / limit) * limit;
+        const out = try arena.alloc(Entry, @min(limit, total - base));
+        for (self.items.items[base..][0..out.len], out) |item, *e| {
+            e.* = .{ .stage = if (item.planning) .listing_pages else if (item.status == .downloading) .downloading else if (item.prepared) .pages_ready else .queued, .pages_done = item.pages_done, .pages_total = item.pages_total, .phase = .operation, .chapter_id = try arena.dupe(u8, item.chapter_id), .status = item.status, .failure = if (item.failure) |f| try arena.dupe(u8, f) else null };
+            if (item.job) |job| {
+                e.phase = job.phase.load(.acquire);
+                e.pages_done = job.pages_done.load(.acquire);
+                e.pages_total = job.pages_total.load(.acquire);
+            }
+        }
+        return .{ .entries = out, .total = total, .offset = base };
     }
 
     /// A queued transfer's page states. All strings belong to `arena`, so
@@ -493,7 +533,20 @@ pub const Queue = struct {
             next.?.job = &job;
             self.lock.unlock();
             tachi.setLastError("");
-            const outcome = engine.prepareQueuedChapter(&job, id);
+            const outcome: anyerror!void = blk: {
+                var attempt: usize = 0;
+                while (true) : (attempt += 1) {
+                    engine.prepareQueuedChapter(&job, id) catch |err| {
+                        // JVM extension errors and verification have no reliable
+                        // transient classification. Only retry known transport failures.
+                        if (err != error.NetworkError and err != error.Timeout and err != error.ConnectionResetByPeer) break :blk err;
+                        if (attempt >= downloads.mihon_retry_ms.len) break :blk err;
+                        engine.io.sleep(.fromMilliseconds(downloads.mihon_retry_ms[attempt]), .awake) catch |cancel| break :blk cancel;
+                        continue;
+                    };
+                    break :blk {};
+                }
+            };
             self.finish(engine, id, &job, outcome, true);
             if (outcome) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
         }

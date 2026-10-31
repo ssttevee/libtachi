@@ -67,32 +67,75 @@ fn legacy(store: *lib.Store, arena: std.mem.Allocator, name: []const u8) !?[]con
 }
 
 pub fn load(db: *sqlite.Db, arena: std.mem.Allocator) !lib.Library {
-    var manga: std.ArrayList(lib.Manga) = .empty;
-    var rows = try db.prepare("SELECT metadata,id FROM library_manga ORDER BY position");
+    // Compatibility snapshots for explicit bulk/export operations are assembled
+    // from bounded reads. Interactive root views use rootPage instead.
+    const root = @import("root_sqlite.zig");
+    var result = try root.metadata(db, arena);
+    var titles: std.ArrayList(lib.Manga) = .empty;
+    var rows = try db.prepare("SELECT id FROM library_manga ORDER BY position LIMIT 64 OFFSET ?1");
     defer rows.close();
-    while (try rows.step()) {
-        var m = try std.json.parseFromSliceLeaky(lib.Manga, arena, rows.columnText(0), models.parse_options);
-        if (!std.mem.eql(u8, m.id, rows.columnText(1))) return error.SqliteCorrupt;
-        var chapters: std.ArrayList(lib.Chapter) = .empty;
-        var chs = try db.prepare("SELECT c.metadata,r.page,r.read,r.bookmark,r.last_read,r.read_ms,c.id FROM library_chapters c LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=? ORDER BY c.position");
-        defer chs.close();
-        try chs.bindText(1, rows.columnText(1));
-        while (try chs.step()) {
-            var ch = try std.json.parseFromSliceLeaky(lib.Chapter, arena, chs.columnText(0), models.parse_options);
-            if (!std.mem.eql(u8, ch.id, chs.columnText(6))) return error.SqliteCorrupt;
-            ch.last_page_read = @intCast(chs.columnInt(1));
-            ch.read = chs.columnInt(2) != 0;
-            ch.bookmark = chs.columnInt(3) != 0;
-            ch.last_read = chs.columnInt(4);
-            ch.read_ms = chs.columnInt(5);
-            try chapters.append(arena, ch);
+    var offset: usize = 0;
+    while (true) {
+        try rows.bindInt(1, @intCast(offset));
+        var n: usize = 0;
+        while (try rows.step()) {
+            try titles.append(arena, try root.title(db, arena, rows.columnText(0)));
+            n += 1;
         }
-        m.chapters = try chapters.toOwnedSlice(arena);
-        try manga.append(arena, m);
+        if (n < 64) break;
+        offset += n;
+        try rows.reset();
     }
-    const result: lib.Library = .{ .manga = try manga.toOwnedSlice(arena), .categories = try loadRows(lib.Category, db, arena, "SELECT metadata,id FROM library_categories ORDER BY position"), .sources = try loadRows(lib.SourceName, db, arena, "SELECT metadata,id FROM library_sources ORDER BY position") };
+    result.manga = try titles.toOwnedSlice(arena);
     try lib.validate(arena, result);
     return result;
+}
+
+/// Predicates are identical for COUNT and page, including reading overlays and
+/// excluded groups. JSON stays inside SQLite; no chapter metadata is decoded.
+pub fn chapterPage(db: *sqlite.Db, arena: std.mem.Allocator, manga_id: []const u8, bits: u32, downloaded_only: bool, offset: usize, limit: usize) !lib.Store.ChapterPage {
+    var exists = try db.prepare("SELECT 1 FROM library_manga WHERE id=?");
+    defer exists.close();
+    try exists.bindText(1, manga_id);
+    if (!try exists.step()) return error.UnknownManga;
+    const flags = @import("views.zig").ChapterFlags.decode(bits);
+    const downloaded = if (downloaded_only) @import("views.zig").TriState.include else flags.downloaded;
+    const predicate = " FROM library_chapters c JOIN library_manga m ON m.id=c.manga_id LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 AND (?2=0 OR (coalesce(r.read,0)=0)= (?2=1)) AND (?3=0 OR (coalesce(r.bookmark,0)!=0)= (?3=1)) AND (?4=0 OR (json_extract(m.metadata,'$.source_id') IS NULL OR coalesce(json_array_length(c.metadata,'$.pages'),0)>0)= (?4=1)) AND NOT EXISTS (SELECT 1 FROM json_each(m.metadata,'$.excluded_scanlators') e WHERE e.value=json_extract(c.metadata,'$.scanlator'))";
+    const order = switch (flags.sort) {
+        .source => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.source_order'),0) DESC" else "coalesce(json_extract(c.metadata,'$.source_order'),0) ASC",
+        .number => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.number'),-1) ASC" else "coalesce(json_extract(c.metadata,'$.number'),-1) DESC",
+        .upload => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.date_upload'),0) ASC" else "coalesce(json_extract(c.metadata,'$.date_upload'),0) DESC",
+        .alphabetical => if (flags.ascending) "json_extract(c.metadata,'$.title') COLLATE NOCASE ASC" else "json_extract(c.metadata,'$.title') COLLATE NOCASE DESC",
+    };
+    var count = try db.prepare(try std.fmt.allocPrintSentinel(arena, "SELECT count(*){s}", .{predicate}, 0));
+    defer count.close();
+    var rows = try db.prepare(try std.fmt.allocPrintSentinel(arena, "SELECT c.id,c.position{s} ORDER BY {s},c.position ASC LIMIT ?5 OFFSET ?6", .{ predicate, order }, 0));
+    defer rows.close();
+    for ([_]sqlite.Stmt{ count, rows }) |stmt| {
+        try stmt.bindText(1, manga_id);
+        try stmt.bindInt(2, switch (flags.unread) {
+            .disabled => 0,
+            .include => 1,
+            .exclude => 2,
+        });
+        try stmt.bindInt(3, switch (flags.bookmarked) {
+            .disabled => 0,
+            .include => 1,
+            .exclude => 2,
+        });
+        try stmt.bindInt(4, switch (downloaded) {
+            .disabled => 0,
+            .include => 1,
+            .exclude => 2,
+        });
+    }
+    _ = try count.step();
+    const total: usize = @intCast(count.columnInt(0));
+    try rows.bindInt(5, @intCast(limit));
+    try rows.bindInt(6, @intCast(offset));
+    var entries: std.ArrayList(lib.Store.ChapterPage.Entry) = .empty;
+    while (try rows.step()) try entries.append(arena, .{ .id = try arena.dupe(u8, rows.columnText(0)), .position = @intCast(rows.columnInt(1)) });
+    return .{ .entries = try entries.toOwnedSlice(arena), .total = total };
 }
 
 fn loadRows(comptime T: type, db: *sqlite.Db, arena: std.mem.Allocator, sql: [:0]const u8) ![]const T {
@@ -429,4 +472,68 @@ test "mismatched SQL metadata identities are rejected as corrupt" {
         try db.exec(damage);
         try t.expectError(error.SqliteCorrupt, store.load(a));
     }
+}
+
+test "large chapter SQL pages bound returned IDs and preserve view order and filters" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: lib.Store = .{ .io = t.io, .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a) };
+    const chapters = try a.alloc(lib.Chapter, 10000);
+    for (chapters, 0..) |*ch, i| ch.* = .{
+        .id = try std.fmt.allocPrint(a, "c{d}", .{i}),
+        .title = try std.fmt.allocPrint(a, "Chapter {d:0>5}", .{i}),
+        .source_order = @intCast(i),
+        .number = @floatFromInt(i),
+        .date_upload = @intCast(i),
+        .read = i % 2 == 0,
+        .bookmark = i % 3 == 0,
+        .scanlator = if (i % 7 == 0) "hidden" else null,
+    };
+    var manga: lib.Manga = .{ .id = "m", .title = "Large", .source_id = 123, .chapters = chapters, .excluded_scanlators = &.{"hidden"} };
+    try store.save(a, .{ .manga = &.{manga} });
+    const views = @import("views.zig");
+    for ([_]views.ChapterSort{ .source, .number, .upload, .alphabetical }) |sort| {
+        for ([_]bool{ false, true }) |ascending| {
+            for ([_]views.TriState{ .disabled, .include, .exclude }) |unread| {
+                manga.chapter_flags = (views.ChapterFlags{ .sort = sort, .ascending = ascending, .unread = unread }).encode(0);
+                const expected = try views.chapterList(a, manga, false);
+                // Page two must select the same stable IDs as the reference view.
+                const page = try store.chapterPage(a, "m", manga.chapter_flags, false, 31, 31);
+                try t.expectEqual(expected.len, page.total);
+                try t.expectEqual(31, page.entries.len);
+                for (page.entries, 31..) |entry, row| {
+                    try t.expectEqualStrings(expected[row].id, entry.id);
+                    try t.expectEqualStrings(chapters[entry.position].id, entry.id);
+                }
+            }
+        }
+    }
+    // All temporary SQL strings, DB path and copied IDs must fit in 32 KiB;
+    // materializing 10,000 chapters or IDs would exhaust this allocator.
+    var storage: [32768]u8 = undefined;
+    var bounded: std.heap.FixedBufferAllocator = .init(&storage);
+    const bounded_page = try store.chapterPage(bounded.allocator(), "m", 0, false, 31, 31);
+    try t.expectEqual(31, bounded_page.entries.len);
+    try t.expect(bounded_page.total > 8000);
+    try t.expectError(error.InvalidPageSize, store.chapterPage(a, "m", 0, false, 0, 10000));
+    try t.expectEqual(0, (try store.chapterPage(a, "m", 0, true, 0, 31)).total);
+    {
+        var guard = try open(&store, a);
+        defer guard.close();
+        try guard.exec("CREATE TRIGGER reject_chapter_flag_rewrite BEFORE UPDATE ON library_chapters BEGIN SELECT RAISE(ABORT,'chapter rewrite'); END; CREATE TRIGGER reject_chapter_flag_delete BEFORE DELETE ON library_chapters BEGIN SELECT RAISE(ABORT,'chapter delete'); END;");
+    }
+    try store.setChapterFlags(a, "m", 257);
+    try store.setReaderFlags(a, "m", 3);
+    try t.expectError(error.UnknownManga, store.setChapterFlags(a, "missing", 1));
+    var db = try open(&store, a);
+    defer db.close();
+    var row = try db.prepare("SELECT json_extract(metadata,'$.chapter_flags'),(SELECT count(*) FROM library_chapters) FROM library_manga WHERE id='m'");
+    defer row.close();
+    try t.expect(try row.step());
+    try t.expectEqual(257, row.columnInt(0));
+    try t.expectEqual(10000, row.columnInt(1));
 }

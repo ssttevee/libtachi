@@ -756,15 +756,14 @@ pub const Engine = struct {
     /// A title's chapters as its chapter list flags show them.
     pub fn chapterList(self: *Engine, arena: std.mem.Allocator, manga_id: []const u8) ![]library.Chapter {
         const s = try self.loadSettings(arena);
-        const lib = try self.store.load(arena);
-        return views.chapterList(arena, lib.manga[lib.find(manga_id) orelse return error.UnknownManga], s.library.downloaded_only);
+        return views.chapterList(arena, try self.store.loadTitle(arena, manga_id), s.library.downloaded_only);
     }
 
     /// The chapters the reader moves through from `chapter_id`.
     pub fn readerChapters(self: *Engine, arena: std.mem.Allocator, chapter_id: []const u8) !views.ReaderChapters {
         const s = try self.loadSettings(arena);
-        const found = findChapter(try self.store.load(arena), chapter_id) orelse return error.UnknownChapter;
-        return (try views.readerChapters(arena, found.manga, chapter_id, s.reader, s.library.downloaded_only)).?;
+        const preview = try self.store.chapterPreview(arena, chapter_id);
+        return (try views.readerChapters(arena, try self.store.loadTitle(arena, preview.id), chapter_id, s.reader, s.library.downloaded_only)).?;
     }
 
     /// Mihon's updates feed with the settings' filters.
@@ -1212,12 +1211,16 @@ pub const Engine = struct {
 
     /// Sets a title's chapter list bits; see `views.ChapterFlags`.
     pub fn setChapterFlags(self: *Engine, manga_id: []const u8, flags: u32) !void {
-        try self.setField(manga_id, "chapter_flags", flags);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        try self.store.setChapterFlags(arena.allocator(), manga_id, flags);
     }
 
     /// Sets a title's reader bits: reading mode in 0x7, orientation in 0x38.
     pub fn setReaderFlags(self: *Engine, manga_id: []const u8, flags: u32) !void {
-        try self.setField(manga_id, "reader_flags", flags);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        try self.store.setReaderFlags(arena.allocator(), manga_id, flags);
     }
 
     /// Sets how many days a title waits between updates, as Mihon's custom

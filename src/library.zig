@@ -235,6 +235,19 @@ pub const Reading = struct {
     }
 };
 
+pub const RootKind = enum { library, history, updates, upcoming };
+pub const RootOptions = struct {
+    kind: RootKind,
+    offset: usize = 0,
+    limit: usize = 6,
+    category_id: u32 = 0,
+    query: []const u8 = "",
+    settings: @import("settings.zig").Settings = .{},
+    now: i64 = 0,
+};
+pub const RootFeed = struct { manga: usize, chapter: usize };
+pub const RootPage = struct { tabs: []const Category = &.{}, library: Library, total: usize, offset: usize, counts: []const Counts, feed: []const RootFeed };
+
 /// Transactional library metadata and reading state in `tachi.sqlite3`.
 /// Legacy JSON is imported once and retained untouched as a backup.
 pub const Store = struct {
@@ -256,6 +269,88 @@ pub const Store = struct {
         const result = try sql.load(&db, arena);
         try db.commit();
         return result;
+    }
+
+    pub fn rootPage(self: *Store, a: std.mem.Allocator, options: RootOptions) !RootPage {
+        if (options.limit == 0 or options.limit > 256) return error.InvalidPageSize;
+        var db = try sql.open(self, a);
+        defer db.close();
+        try db.exec("BEGIN");
+        errdefer db.rollback();
+        const result = try @import("root_sqlite.zig").page(&db, a, options);
+        try db.commit();
+        return result;
+    }
+
+    pub fn chapterPreview(self: *Store, a: std.mem.Allocator, id: []const u8) !Manga {
+        var db = try sql.open(self, a);
+        defer db.close();
+        return @import("root_sqlite.zig").chapterPreview(&db, a, id);
+    }
+    pub fn categoryTabs(self: *Store, a: std.mem.Allocator, sort: u32) ![]const Category {
+        var db = try sql.open(self, a);
+        defer db.close();
+        return @import("root_sqlite.zig").categoryTabs(&db, a, sort);
+    }
+    pub fn metadata(self: *Store, a: std.mem.Allocator) !Library {
+        var db = try sql.open(self, a);
+        defer db.close();
+        try db.exec("BEGIN");
+        errdefer db.rollback();
+        const result = try @import("root_sqlite.zig").metadata(&db, a);
+        try db.commit();
+        return result;
+    }
+
+    pub fn loadTitle(self: *Store, a: std.mem.Allocator, id: []const u8) !Manga {
+        var db = try sql.open(self, a);
+        defer db.close();
+        try db.exec("BEGIN");
+        errdefer db.rollback();
+        const result = try @import("root_sqlite.zig").title(&db, a, id);
+        try db.commit();
+        return result;
+    }
+
+    pub const ChapterPage = struct {
+        entries: []const Entry,
+        total: usize,
+        pub const Entry = struct { id: []const u8, position: usize };
+    };
+
+    /// SQL filters and sorts before LIMIT; only IDs for the requested page are copied.
+    /// Count and page share a SQLite read transaction.
+    pub fn chapterPage(self: *Store, arena: std.mem.Allocator, manga_id: []const u8, flags: u32, downloaded_only: bool, offset: usize, limit: usize) !ChapterPage {
+        if (limit == 0 or limit > 256) return error.InvalidPageSize;
+        var db = try sql.open(self, arena);
+        defer db.close();
+        try db.exec("BEGIN");
+        errdefer db.rollback();
+        const result = try sql.chapterPage(&db, arena, manga_id, flags, downloaded_only, offset, limit);
+        try db.commit();
+        return result;
+    }
+
+    /// Targeted metadata edit: never loads chapters or saves a library snapshot.
+    pub fn setChapterFlags(self: *Store, arena: std.mem.Allocator, manga_id: []const u8, flags: u32) !void {
+        try self.setFlags(arena, manga_id, flags, "chapter_flags");
+    }
+
+    pub fn setReaderFlags(self: *Store, arena: std.mem.Allocator, manga_id: []const u8, flags: u32) !void {
+        try self.setFlags(arena, manga_id, flags, "reader_flags");
+    }
+
+    fn setFlags(self: *Store, arena: std.mem.Allocator, manga_id: []const u8, flags: u32, comptime field: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var db = try sql.open(self, arena);
+        defer db.close();
+        var stmt = try db.prepare("UPDATE library_manga SET metadata=json_set(metadata,'$." ++ field ++ "',?2) WHERE id=?1 RETURNING id");
+        defer stmt.close();
+        try stmt.bindText(1, manga_id);
+        try stmt.bindInt(2, flags);
+        if (!try stmt.step()) return error.UnknownManga;
+        _ = try stmt.step();
     }
 
     /// Atomically replaces metadata and its supplied reading state.
@@ -959,4 +1054,8 @@ test "known chapter page totals survive deletion, metadata refresh and reload" {
     try std.testing.expect((try setPageCount(a, lib, "c", 4)) == null);
     lib = (try setPages(a, lib, "c", &.{ "downloads/new1.png", "downloads/new2.png" })).?;
     try std.testing.expectEqual(2, lib.manga[0].chapters[0].page_count);
+}
+
+test "root SQLite backend" {
+    _ = @import("root_sqlite.zig");
 }

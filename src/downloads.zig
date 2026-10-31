@@ -279,9 +279,10 @@ pub fn fetch(client: *std.http.Client, store: PageStore, index: usize, request: 
         else => return err,
     };
     if (response.head.status.class() == .redirect) return error.JvmRedirect;
-    if (response.head.status == .forbidden or response.head.status == .service_unavailable or response.head.status == .unauthorized) return error.JvmChallengeOrAuthentication;
+    if (response.head.status == .forbidden or response.head.status == .unauthorized) return error.JvmChallengeOrAuthentication;
     if (response.head.status.class() != .success) {
         log.warn("page {d} HTTP status {d}", .{ index + 1, @backingInt(response.head.status) });
+        if (response.head.status.class() == .server_error or response.head.status == .request_timeout or @backingInt(response.head.status) == 429) return error.TransientHttpFailure;
         return error.HttpStatusFailure;
     }
     if (response.head.content_encoding != .identity) return error.JvmContentEncoding;
@@ -510,7 +511,7 @@ pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io,
             var attempt: usize = 0;
             const transfer = while (true) : (attempt += 1) {
                 break fetcher.page(ctx.plan, i, &stats) catch |err| switch (err) {
-                    error.Canceled, error.OutOfMemory, error.BrowserVerificationRequired => return err,
+                    error.Canceled, error.OutOfMemory, error.BrowserVerificationRequired, error.HttpStatusFailure, error.ExtensionError => return err,
                     else => {
                         if (attempt >= ctx.options.retry_ms.len or err == error.NeedsJvm) return err;
                         log.info("page {d}/{d} failed ({s}); retrying in {d} ms", .{ i + 1, ctx.plan.len, @errorName(err), ctx.options.retry_ms[attempt] });
@@ -1092,7 +1093,7 @@ test "unsupported browser verification skips page retries and keeps task diagnos
             .retry_ms = &.{ 0, 0, 0 },
             .fallback = .{ .context = &fixture, .fetch = Fixture.fetch },
         }));
-        try t.expectEqual(@as(usize, if (failure == error.BrowserVerificationRequired) 1 else 4), fixture.attempts.load(.acquire));
+        try t.expectEqual(@as(usize, 1), fixture.attempts.load(.acquire));
         try t.expectEqualStrings("Cloudflare challenge on images.example", tachi.lastError());
     }
 }

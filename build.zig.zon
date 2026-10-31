@@ -21,6 +21,7 @@
         "src",
         "include",
         "host/native",
+        "host/licenses",
         "host/src",
         "host/gradle",
         "host/gradlew",
@@ -29,5 +30,6 @@
         "host/gradle.properties",
         "tools",
         "README.md",
+        "NOTICE",
     },
 }

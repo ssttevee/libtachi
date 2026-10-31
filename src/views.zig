@@ -461,7 +461,7 @@ fn inCategory(manga: Manga, id: u32) bool {
     return std.mem.indexOfScalar(u32, manga.categories, id) != null;
 }
 
-fn libraryPasses(manga: Manga, counts: library.Counts, options: LibraryOptions) bool {
+pub fn libraryPasses(manga: Manga, counts: library.Counts, options: LibraryOptions) bool {
     const f = options.filters;
     const downloaded: TriState = if (options.downloaded_only) .include else f.downloaded;
     const interval: TriState = if (options.skip_outside_release_period) f.interval_custom else .disabled;
