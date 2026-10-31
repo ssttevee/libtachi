@@ -162,18 +162,13 @@ pub const Queue = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const saved = try loadSaved(engine, a);
-        const lib = try engine.store.load(a);
+        const sources = try engine.store.chapterSources(a, saved.chapters);
         const original_len = self.items.items.len;
         errdefer {
             for (self.items.items[original_len..]) |item| freeItem(engine.gpa, item);
             self.items.shrinkRetainingCapacity(original_len);
         }
-        for (saved.chapters) |id| {
-            var source: i64 = 0;
-            find: for (lib.manga) |m| for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id)) {
-                source = m.source_id orelse 0;
-                break :find;
-            };
+        for (saved.chapters, sources) |id, source| {
             try self.append(engine.gpa, id, source);
             const progress = engine.downloadProgress(a, id) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -1303,4 +1298,33 @@ test "clearing the queue removes orphan SQLite page plans and retains unrelated 
     try engine.queue.clear(&engine);
     try t.expectEqual(null, try persistence.load(Value, a, t.io, root, "queued-plan/orphan", "missing.json"));
     try t.expectEqual(8, (try persistence.load(Value, a, t.io, root, "settings", "missing.json")).?.count);
+}
+
+test "cold queue restore resolves sources without loading unrelated library metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var engine: Engine = .init(std.testing.allocator, std.testing.io, @import("backend.zig").none, .{ .dir = dir });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    try engine.store.save(a, .{ .manga = &.{
+        .{ .id = "m", .title = "Queued title", .source_id = 42, .chapters = &.{.{ .id = "c", .title = "Chapter" }} },
+        .{ .id = "unrelated", .title = "Unrelated", .chapters = &.{.{ .id = "other", .title = "Other" }} },
+    } });
+    try std.testing.expectEqual(1, try engine.queue.enqueue(&engine, &.{"c"}, false));
+    engine.queue.deinit(&engine);
+    engine.queue = .{};
+    var db = try Queue.openDatabase(&engine);
+    defer db.close();
+    // Valid JSON with an invalid title type makes a full library parse fail.
+    try db.exec("UPDATE library_manga SET metadata=json_set(metadata,'$.title',123) WHERE id='unrelated'");
+    const page = try engine.queue.snapshotPage(&engine, a, 0, 10);
+    try std.testing.expectEqual(1, page.entries.len);
+    try std.testing.expectEqualStrings("c", page.entries[0].chapter_id);
+    try std.testing.expectEqual(42, engine.queue.items.items[0].source);
+    const sources = try engine.store.chapterSources(a, &.{ "c", "other", "missing" });
+    try std.testing.expectEqualSlices(i64, &.{ 42, 0, 0 }, sources);
 }

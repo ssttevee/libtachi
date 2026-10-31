@@ -282,6 +282,23 @@ pub const Store = struct {
         return result;
     }
 
+    /// Resolve queue source IDs without parsing titles or chapter collections.
+    /// Missing and local chapters retain the queue's source-zero fallback.
+    pub fn chapterSources(self: *Store, a: std.mem.Allocator, ids: []const []const u8) ![]i64 {
+        var db = try sql.open(self, a);
+        defer db.close();
+        const sources = try a.alloc(i64, ids.len);
+        errdefer a.free(sources);
+        var row = try db.prepare("SELECT coalesce(json_extract(m.metadata,'$.source_id'),0) FROM library_chapters c JOIN library_manga m ON m.id=c.manga_id WHERE c.id=?1 LIMIT 1");
+        defer row.close();
+        for (ids, sources) |id, *source| {
+            try row.bindText(1, id);
+            source.* = if (try row.step()) row.columnInt(0) else 0;
+            try row.reset();
+        }
+        return sources;
+    }
+
     pub fn chapterPreview(self: *Store, a: std.mem.Allocator, id: []const u8) !Manga {
         var db = try sql.open(self, a);
         defer db.close();
