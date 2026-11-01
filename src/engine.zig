@@ -842,34 +842,70 @@ pub const Engine = struct {
         completed: ?bool = null,
     };
 
-    /// The reader's hook for each page shown, doing what Mihon's reader
-    /// does: records the page, and on the last one marks the chapter read,
-    /// queues the download `remove_after_read_slots` chapters behind for
-    /// deletion and marks same-numbered chapters read if the settings say
-    /// so. Past a quarter of a downloaded chapter whose next chapter is
-    /// downloaded, it queues the next unread ones (`Settings.downloads.ahead`).
-    /// Records nothing in incognito. Call `leaveReader` when the reader closes.
+    /// Retain one receipt alongside one immutable PageShown until it succeeds.
+    /// A receipt borrows no memory. Do not reuse it for another event, merge an
+    /// attempted event, or apply it concurrently. Retries must precede later
+    /// events, policy changes and leaveReader. This is an in-memory retry token,
+    /// not a crash-recovery journal.
+    pub const PageShownReceipt = struct {
+        phase: enum { progress, completion, tracking, tracking_start, ahead, done } = .progress,
+    };
+
+    /// The reader's hook for each page shown: records progress and completion,
+    /// queues deletion/tracking and downloads ahead. Records nothing in
+    /// incognito. Call leaveReader when the reader closes.
+    /// Existing one-shot API; retrying its additive read_ms after an error is
+    /// unsafe. Queued callers should retain a receipt and use pageShownResumable.
     pub fn pageShown(self: *Engine, shown: PageShown) !void {
+        var receipt: PageShownReceipt = .{};
+        try self.pageShownResumable(shown, &receipt);
+    }
+
+    /// Resume only unfinished effects. Each phase advances immediately after
+    /// its commit, before any further fallible work. Completion itself can be
+    /// retried: pending deletions are deduplicated and duplicate reads absolute.
+    pub fn pageShownResumable(self: *Engine, shown: PageShown, receipt: *PageShownReceipt) !void {
+        if (receipt.phase == .done) return;
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const a = arena_state.allocator();
         const s = try self.loadSettings(a);
-        if (s.reader.incognito) return;
-        if (s.reader.incognito_extensions.len > 0 and try self.incognitoSource(a, s, shown.chapter_id)) return;
-        const last = shown.completed orelse (shown.pages > 0 and shown.page + 1 >= shown.pages);
-        const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
-        const hash: u32 = @truncate(std.hash.Wyhash.hash(0, shown.chapter_id));
-        const ahead = s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash;
-        if (!newly_read and !ahead) return;
-        const lib = try self.store.load(a);
-        const found = findChapter(lib, shown.chapter_id) orelse return;
-        if (newly_read) {
-            try self.chapterFinished(a, s, found);
-            if (s.tracking.auto_update and found.chapter.recognized()) {
-                if (try self.queueTracking(found.manga.id, found.chapter.number)) try self.startTracking();
+        if (receipt.phase == .progress) {
+            if (s.reader.incognito or (s.reader.incognito_extensions.len > 0 and try self.incognitoSource(a, s, shown.chapter_id))) {
+                receipt.phase = .done;
+                return;
             }
+            const last = shown.completed orelse (shown.pages > 0 and shown.page + 1 >= shown.pages);
+            const newly_read = try self.store.setProgress(self.gpa, &.{.{ .chapter_id = shown.chapter_id, .page = shown.page, .read = last, .now = wallMillis(self.io), .read_ms = shown.read_ms }}) > 0;
+            receipt.phase = if (newly_read) .completion else .ahead;
         }
-        if (ahead) try self.downloadAhead(a, s, found, hash);
+        const hash: u32 = @truncate(std.hash.Wyhash.hash(0, shown.chapter_id));
+        if (receipt.phase == .ahead and !(s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash)) {
+            receipt.phase = .done;
+            return;
+        }
+        const lib = try self.store.load(a);
+        const found = findChapter(lib, shown.chapter_id) orelse {
+            receipt.phase = .done;
+            return;
+        };
+        if (receipt.phase == .completion) {
+            try self.chapterFinished(a, s, found);
+            receipt.phase = .tracking;
+        }
+        if (receipt.phase == .tracking) {
+            const queued = s.tracking.auto_update and found.chapter.recognized() and try self.queueTracking(found.manga.id, found.chapter.number);
+            receipt.phase = if (queued) .tracking_start else .ahead;
+        }
+        if (receipt.phase == .tracking_start) {
+            try self.startTracking();
+            receipt.phase = .ahead;
+        }
+        if (receipt.phase == .ahead) {
+            if (s.downloads.ahead > 0 and @as(u64, shown.page + 1) * 4 > shown.pages and self.ahead_checked.load(.acquire) != hash)
+                try self.downloadAhead(a, s, found, hash);
+            receipt.phase = .done;
+        }
     }
 
     /// Whether the chapter's source comes from an extension read in
@@ -945,13 +981,13 @@ pub const Engine = struct {
         const next = list.next() orelse return self.ahead_checked.store(hash, .release);
         // Checked again on later pages, in case it finishes downloading.
         if (!next.downloaded()) return;
-        self.ahead_checked.store(hash, .release);
         var chapters = try views.nextUnread(a, manga, next.id);
         if (s.reader.skip_duplicates) chapters = try views.removeDuplicates(a, chapters, next);
         const take = chapters[0..@min(chapters.len, s.downloads.ahead)];
         const ids = try a.alloc([]const u8, take.len);
         for (take, ids) |ch, *id| id.* = ch.id;
         if (ids.len > 0) _ = try self.queue.enqueue(self, ids, true);
+        self.ahead_checked.store(hash, .release);
     }
 
     const Pending = struct { chapters: []const []const u8 = &.{} };
@@ -4293,4 +4329,98 @@ test "pending deletions migrate once and clearing SQL state cannot revive legacy
     try t.expectEqual(@as(usize, 0), (try reopened.loadPending(a)).len);
     const legacy = try tmp.dir.readFileAlloc(t.io, "downloads/pending_delete.json", a, .limited(4096));
     try t.expectEqualStrings("{\"chapters\":[\"old\"]}", legacy);
+}
+
+test "resumable reader completion retries deletion and tracking without replaying elapsed time" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var engine: Engine = .init(t.allocator, io, be.none, .{ .dir = dir });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    defer engine.finishTracking();
+    // Keep automatic delivery pending; this test verifies its durable intent.
+    engine.paused.store(true, .release);
+    try tmp.dir.createDirPath(io, "downloads/c");
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/c/p.png", .data = "x" });
+    try engine.store.save(a, .{ .manga = &.{.{ .id = "m", .title = "M", .source_id = 7, .tracks = &.{.{ .tracker_id = 2, .remote_id = 42 }}, .chapters = &.{
+        .{ .id = "c", .title = "C", .number = 1, .pages = &.{"downloads/c/p.png"} },
+        .{ .id = "duplicate", .title = "Duplicate", .number = 1 },
+    } }} });
+    var s = try engine.loadSettings(a);
+    s.downloads.remove_after_read_slots = 0;
+    s.update.mark_existing_duplicates_read = true;
+    s.tracking.auto_update = true;
+    try engine.saveSettings(s);
+    try (tracking.State{ .credentials = &.{.{ .tracker_id = 2, .username = "u", .password = "p" }} }).save(a, io, dir);
+    const db = try @import("sqlite.zig").Db.open(a, io, dir);
+    defer db.close();
+    const fail_deletion = "CREATE TRIGGER fail_deletion BEFORE INSERT ON documents WHEN NEW.key='pending-delete' BEGIN SELECT RAISE(ABORT,'injected deletion failure'); END";
+    const shown: Engine.PageShown = .{ .chapter_id = "c", .page = 0, .pages = 1, .completed = true, .read_ms = 10 };
+    var receipt: Engine.PageShownReceipt = .{};
+    try db.exec("CREATE TRIGGER fail_progress BEFORE INSERT ON library_reading WHEN NEW.id='c' BEGIN SELECT RAISE(ABORT,'injected progress failure'); END");
+    try t.expectError(error.SqliteConstraint, engine.pageShownResumable(shown, &receipt));
+    try t.expectEqual(.progress, receipt.phase);
+    try t.expectEqual(@as(i64, 0), (try engine.loadLibrary(a)).manga[0].chapters[0].read_ms);
+    try db.exec("DROP TRIGGER fail_progress");
+    try db.exec(fail_deletion);
+    try t.expectError(error.SqliteConstraint, engine.pageShownResumable(shown, &receipt));
+    try t.expectEqual(.completion, receipt.phase);
+    var m = (try engine.loadLibrary(a)).manga[0];
+    try t.expect(m.chapters[0].read);
+    try t.expectEqual(@as(i64, 10), m.chapters[0].read_ms);
+    try t.expect(!m.chapters[1].read);
+    try t.expectError(error.SqliteConstraint, engine.pageShownResumable(shown, &receipt));
+    try db.exec("DROP TRIGGER fail_deletion");
+    // Now completion succeeds, but the independently persisted tracking fails.
+    try tmp.dir.createDir(io, "trackers.json.tmp", .default_dir);
+    if (engine.pageShownResumable(shown, &receipt)) |_| return error.ExpectedTrackingFailure else |_| {}
+    try t.expectEqual(.tracking, receipt.phase);
+    m = (try engine.loadLibrary(a)).manga[0];
+    try t.expectEqual(@as(i64, 10), m.chapters[0].read_ms);
+    try t.expect(m.chapters[1].read);
+    try t.expectEqual(@as(usize, 2), (try engine.loadPending(a)).len);
+    // A tracking retry must never re-enter the committed completion phase.
+    try db.exec(fail_deletion);
+    try tmp.dir.deleteDir(io, "trackers.json.tmp");
+    var vtable = io.vtable.*;
+    vtable.concurrent = struct {
+        fn fail(_: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+            return error.ConcurrencyUnavailable;
+        }
+    }.fail;
+    engine.io = .{ .userdata = io.userdata, .vtable = &vtable };
+    engine.paused.store(false, .release);
+    try t.expectError(error.ConcurrencyUnavailable, engine.pageShownResumable(shown, &receipt));
+    try t.expectEqual(.tracking_start, receipt.phase);
+    try t.expectEqual(@as(usize, 1), (try engine.loadTrackers(a)).pending.len);
+    // Starting the worker can fail after tracking intent was saved. A retry
+    // must start it even if re-queueing tracking would now fail.
+    try tmp.dir.createDir(io, "trackers.json.tmp", .default_dir);
+    engine.io = io;
+    engine.execute_fn = struct {
+        fn run(_: *Engine, job: *Job) !void {
+            job.result.message = "Tracking started";
+        }
+    }.run;
+    try engine.pageShownResumable(shown, &receipt);
+    engine.tracking_job.?.join();
+    try t.expectEqualStrings("Tracking started", engine.tracking_job.?.result.message);
+    try tmp.dir.deleteDir(io, "trackers.json.tmp");
+    try t.expectEqual(.done, receipt.phase);
+    try engine.pageShownResumable(shown, &receipt);
+    try t.expectEqual(@as(i64, 10), (try engine.loadLibrary(a)).manga[0].chapters[0].read_ms);
+    const pending = (try engine.loadTrackers(a)).pending;
+    try t.expectEqual(@as(usize, 1), pending.len);
+    try t.expectEqual(@as(f64, 1), pending[0].chapter);
+    try db.exec("DROP TRIGGER fail_deletion");
+    try engine.leaveReader();
+    try engine.leaveReader();
+    try t.expect(!(try engine.loadLibrary(a)).manga[0].chapters[0].downloaded());
+    try t.expectError(error.FileNotFound, tmp.dir.access(io, "downloads/c/p.png", .{}));
 }

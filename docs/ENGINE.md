@@ -143,6 +143,15 @@ Quick local edits are plain methods:
 
 - Reading: `pageShown` (call on every page; it records progress and does
   what Mihon's reader does when a chapter is finished), `leaveReader`.
+  Queued writers should use `pageShownResumable(shown, &receipt)` with a fresh
+  `Engine.PageShownReceipt` retained per immutable event. On error, retry the
+  same event and receipt before later events, policy changes or `leaveReader`.
+  The receipt records the committed progress/completion/tracking/ahead phases,
+  so elapsed time is applied once and unfinished effects are resumed. Never
+  coalesce an attempted event. A successful receipt is also safe to call again.
+  Receipts contain no borrowed memory and require no cleanup; they are not
+  persistent across process crashes. The original `pageShown` remains a
+  one-shot API: blindly replaying it after an error can double elapsed time.
 - Chapters: `markRead`, `markTitleRead`, `markPreviousRead`, `setBookmark`,
   `deleteDownloads`, `removeHistory`.
 - Titles: `setFavorite`, `setNotes`, `setExcludedScanlators`,
