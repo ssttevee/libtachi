@@ -4,6 +4,16 @@ const Io = std.Io;
 
 pub const default_limit = 4;
 
+// Resource bookkeeping must not acknowledge cancellation through incidental
+// allocator I/O (e.g. SafeAllocator's best-effort diagnostic stack capture).
+// Keep cancellation on the coordinator until an explicit cancellation point;
+// work and publication callbacks still run with the caller's protection.
+fn uncancelable(io: Io, comptime function: anytype, args: anytype) @TypeOf(@call(.auto, function, args)) {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    return @call(.auto, function, args);
+}
+
 /// Starts items in index order, publishing in completion order on the caller's
 /// task. `work(context, scratch, index)` returns an error union; all its output
 /// must belong to `scratch` or be borrowed. `publish(context, index, value,
@@ -28,18 +38,18 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
         }
     };
     const width = @min(count, @max(1, limit));
-    const slots = try gpa.alloc(Slot, width);
-    defer gpa.free(slots);
+    const slots = try uncancelable(io, std.mem.Allocator.alloc, .{ gpa, Slot, width });
+    defer uncancelable(io, std.mem.Allocator.free, .{ gpa, slots });
     for (slots, 0..) |*slot, i| slot.* = .{ .arena = .init(gpa), .index = i };
-    defer for (slots) |*slot| slot.arena.deinit();
-    const buffer = try gpa.alloc(usize, width);
-    defer gpa.free(buffer);
+    defer for (slots) |*slot| uncancelable(io, std.heap.ArenaAllocator.deinit, .{slot.arena});
+    const buffer = try uncancelable(io, std.mem.Allocator.alloc, .{ gpa, usize, width });
+    defer uncancelable(io, std.mem.Allocator.free, .{ gpa, buffer });
     var completions: Io.Queue(usize) = .init(buffer);
     defer {
         completions.close(io);
         for (slots) |*slot| if (slot.future) |*future| future.cancel(io);
     }
-    for (slots, 0..) |*slot, i| slot.future = try io.concurrent(Slot.execute, .{ slot, context, i, io, &completions });
+    for (slots, 0..) |*slot, i| slot.future = try uncancelable(io, Io.concurrent, .{ io, Slot.execute, .{ slot, context, i, io, &completions } });
     var next = width;
     for (0..count) |_| {
         const i = completions.getOne(io) catch |err| switch (err) {
@@ -48,14 +58,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
         };
         try io.checkCancel();
         const slot = &slots[i];
-        slot.future.?.await(io);
+        // A completion fixes result, but the future still owns task storage.
+        // Await can free that storage using an allocator whose diagnostic I/O
+        // silently consumes Canceled. Do not lose the coordinator's one-shot
+        // cancellation here and then park forever waiting for live siblings.
+        uncancelable(io, Io.Future(void).await, .{ &slot.future.?, io });
         slot.future = null;
+        try io.checkCancel();
         try publish(context, slot.index, try slot.result, &slot.arena);
-        _ = slot.arena.reset(.free_all);
+        _ = uncancelable(io, std.heap.ArenaAllocator.reset, .{ &slot.arena, .free_all });
         if (next < count) {
             slot.index = next;
             next += 1;
-            slot.future = try io.concurrent(Slot.execute, .{ slot, context, i, io, &completions });
+            slot.future = try uncancelable(io, Io.concurrent, .{ io, Slot.execute, .{ slot, context, i, io, &completions } });
         }
     }
 }
@@ -155,4 +170,63 @@ test "bounded work handles empty input and a zero limit" {
     try std.testing.expectEqual(0, ctx.done);
     try run(std.testing.allocator, std.testing.io, 3, 0, &ctx, Context.work, Context.publish);
     try std.testing.expectEqual(3, ctx.done);
+}
+
+// Inject the allocator-diagnostic cancellation point in Future.await teardown.
+// Real SafeAllocator stack capture can acknowledge Canceled and discard it.
+// Gate it after the completed result is fixed, with nested siblings parked.
+test "completed task teardown cannot consume cancellation with nested downloads parked" {
+    const t = std.testing;
+    const Context = struct {
+        io: Io,
+        at_teardown: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        pages_started: Io.Event = .unset,
+        active: std.atomic.Value(usize) = .init(0),
+        ended: std.atomic.Value(usize) = .init(0),
+        swallowed: bool = false,
+        published: usize = 0,
+        var current: *@This() = undefined;
+
+        fn awaitTask(userdata: ?*anyopaque, future: *Io.AnyFuture, result: []u8, alignment: std.mem.Alignment) void {
+            t.io.vtable.await(userdata, future, result, alignment);
+            const ctx = current;
+            ctx.at_teardown.set(t.io);
+            // Deliver and re-arm a real cancellation at this exact boundary.
+            // Temporarily unblock solely for the test gate, then restore the
+            // caller's protection before simulating allocator diagnostics.
+            const protection = t.io.swapCancelProtection(.unblocked);
+            ctx.parked.wait(t.io) catch {};
+            t.io.recancel();
+            _ = t.io.swapCancelProtection(protection);
+            t.io.checkCancel() catch {
+                ctx.swallowed = true;
+            };
+        }
+        fn page(ctx: *@This(), _: std.mem.Allocator, _: usize) !void {
+            if (ctx.active.fetchAdd(1, .acq_rel) + 1 == 2) ctx.pages_started.set(t.io);
+            defer _ = ctx.ended.fetchAdd(1, .acq_rel);
+            try ctx.parked.wait(t.io);
+        }
+        fn chapter(ctx: *@This(), _: std.mem.Allocator, i: usize) !void {
+            if (i == 0) return ctx.pages_started.wait(t.io);
+            try run(t.allocator, ctx.io, 2, 2, ctx, page, publish);
+        }
+        fn publish(ctx: *@This(), _: usize, _: void, _: *std.heap.ArenaAllocator) !void {
+            ctx.published += 1;
+        }
+        fn call(ctx: *@This()) !void {
+            try run(t.allocator, ctx.io, 2, 2, ctx, chapter, publish);
+        }
+    };
+    var vtable = t.io.vtable.*;
+    vtable.await = Context.awaitTask;
+    var ctx: Context = .{ .io = .{ .userdata = t.io.userdata, .vtable = &vtable } };
+    Context.current = &ctx;
+    var future = try t.io.concurrent(Context.call, .{&ctx});
+    try ctx.at_teardown.wait(t.io);
+    try t.expectError(error.Canceled, future.cancel(t.io));
+    try t.expect(!ctx.swallowed);
+    try t.expectEqual(2, ctx.ended.load(.acquire));
+    try t.expectEqual(0, ctx.published);
 }
