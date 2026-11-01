@@ -62,6 +62,8 @@ pub const Queue = struct {
     /// acquired with state held, and never needed by a runner or its workers.
     lifecycle_lock: Io.Mutex = .init,
     closed: bool = false,
+    /// Stop requests invalidate starts that crossed an unlocked load/save/join.
+    generation: u64 = 0,
     items: std.ArrayList(Item) = .empty,
     loaded: bool = false,
     paused: bool = true,
@@ -85,6 +87,7 @@ pub const Queue = struct {
     pub fn deinit(self: *Queue, engine: *Engine) void {
         self.acquire();
         self.closed = true;
+        self.generation +%= 1;
         self.paused = true;
         self.notify(engine.io);
         self.lock.unlock();
@@ -264,6 +267,11 @@ pub const Queue = struct {
     /// Adds chapters, skipping those already downloaded, local or queued,
     /// oldest first as Mihon does. Starts downloading unless `start` is false.
     pub fn enqueue(self: *Queue, engine: *Engine, chapter_ids: []const []const u8, autostart: bool) !usize {
+        self.acquire();
+        const generation = self.generation;
+        const closed = self.closed;
+        self.lock.unlock();
+        if (closed) return error.QueueClosed;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -297,7 +305,7 @@ pub const Queue = struct {
             added += 1;
         }
         if (added > 0) try self.persist(engine);
-        if (autostart) try self.startLocked(engine);
+        if (autostart) try self.startLocked(engine, generation);
         return added;
     }
 
@@ -306,6 +314,7 @@ pub const Queue = struct {
     pub fn retry(self: *Queue, engine: *Engine, chapter_id: []const u8) !void {
         self.acquire();
         defer self.lock.unlock();
+        const generation = self.generation;
         try self.ensureLoaded(engine);
         for (self.items.items) |*item| {
             if (!std.mem.eql(u8, item.chapter_id, chapter_id)) continue;
@@ -315,7 +324,7 @@ pub const Queue = struct {
             item.failure = null;
             item.status = .queued;
             try self.persist(engine);
-            try self.startLocked(engine);
+            try self.startLocked(engine, generation);
             self.notify(engine.io);
             return;
         }
@@ -325,26 +334,29 @@ pub const Queue = struct {
     pub fn start(self: *Queue, engine: *Engine) !void {
         self.acquire();
         defer self.lock.unlock();
+        const generation = self.generation;
         try self.ensureLoaded(engine);
         for (self.items.items) |*item| if (item.status == .failed and !item.browser_verification_required) {
             item.status = .queued;
         };
-        try self.startLocked(engine);
+        try self.startLocked(engine, generation);
     }
 
     /// State is held on entry/return; only lifecycle owners touch the future.
-    fn startLocked(self: *Queue, engine: *Engine) !void {
+    fn startLocked(self: *Queue, engine: *Engine, generation: u64) !void {
         self.lock.unlock();
         self.lifecycle_lock.lockUncancelable(engine.io);
         self.acquire();
         defer self.lifecycle_lock.unlock(engine.io);
         if (self.closed) return error.QueueClosed;
-        self.paused = false;
+        if (generation != self.generation) return;
         if (self.runner != null) {
             if (!self.runner_done) return;
             self.joinLocked(engine, false);
         }
         if (self.closed) return error.QueueClosed;
+        if (generation != self.generation) return;
+        self.paused = false;
         if (self.items.items.len == 0) return;
         self.runner_done = false;
         self.runner = try engine.io.concurrent(run, .{ self, engine });
@@ -365,6 +377,7 @@ pub const Queue = struct {
     /// Stops after cancelling the download in progress; its saved pages stay.
     pub fn pause(self: *Queue, engine: *Engine) void {
         self.acquire();
+        self.generation +%= 1;
         self.paused = true;
         self.notify(engine.io);
         self.lock.unlock();
@@ -374,11 +387,14 @@ pub const Queue = struct {
         defer self.lock.unlock();
         self.paused = true;
         self.joinLocked(engine, true);
+        // Also invalidate starts requested while cancellation was joining.
+        self.generation +%= 1;
     }
 
     /// Removes a chapter from the queue, cancelling it if it is downloading.
     pub fn remove(self: *Queue, engine: *Engine, chapter_id: []const u8) !void {
         self.acquire();
+        const request_generation = self.generation;
         self.ensureLoaded(engine) catch |err| {
             self.lock.unlock();
             return err;
@@ -401,6 +417,9 @@ pub const Queue = struct {
             self.lifecycle_lock.unlock(engine.io);
             return error.QueueClosed;
         }
+        const should_resume = was_running and request_generation == self.generation;
+        self.generation +%= 1;
+        const generation = self.generation;
         self.paused = true;
         self.notify(engine.io);
         self.joinLocked(engine, true);
@@ -419,7 +438,7 @@ pub const Queue = struct {
         self.lifecycle_lock.unlock(engine.io);
         lifecycle_held = false;
         try self.persist(engine);
-        if (was_running) try self.startLocked(engine);
+        if (should_resume) try self.startLocked(engine, generation);
     }
 
     /// Moves a queued chapter to the front.
@@ -437,6 +456,7 @@ pub const Queue = struct {
 
     pub fn clear(self: *Queue, engine: *Engine) !void {
         self.acquire();
+        self.generation +%= 1;
         self.paused = true;
         self.notify(engine.io);
         self.lock.unlock();
@@ -447,6 +467,7 @@ pub const Queue = struct {
         defer self.lock.unlock();
         self.paused = true;
         self.joinLocked(engine, true);
+        self.generation +%= 1;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         if (self.closed) return error.QueueClosed;
@@ -1822,4 +1843,122 @@ test "queue removal waits for another pause to finish owning its job" {
     try t.expect(retained);
     try t.expect(old.ended.load(.acquire));
     try t.expectEqual(0, engine.queue.items.items.len);
+}
+
+const StaleStartFixture = struct {
+    const Operation = enum { enqueue, retry, remove, start };
+    fn call(engine: *Engine, operation: Operation) !void {
+        switch (operation) {
+            .enqueue => _ = try engine.queue.enqueue(engine, &.{"1:/c1"}, true),
+            .retry => try engine.queue.retry(engine, "1:/c1"),
+            .remove => try engine.queue.remove(engine, "1:/c1"),
+            .start => try engine.queue.start(engine),
+        }
+    }
+    fn check(operation: Operation, cold: bool) !void {
+        const t = std.testing;
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a) });
+        defer engine.deinit();
+        defer engine.queue.deinit(&engine);
+        try PipelineFixture.setup(&engine, a);
+        if (cold) {
+            var db = try Queue.openDatabase(&engine);
+            defer db.close();
+            try db.begin();
+            errdefer db.rollback();
+            try Queue.saveRows(&db, .{
+                .chapters = &.{ "1:/c1", "1:/c2" },
+                .browser_verification_required = if (operation == .retry) &.{.{ .chapter_id = "1:/c1", .failure = "blocked" }} else &.{},
+            });
+            try db.commit();
+        } else {
+            engine.queue.loaded = true;
+            if (operation != .enqueue) {
+                try engine.queue.append(t.allocator, "1:/c1", 1);
+                try engine.queue.append(t.allocator, "1:/c2", 1);
+                if (operation == .retry) engine.queue.items.items[0].status = .failed;
+            }
+        }
+        // Removal normally joins a real active runner before persisting. Keep
+        // its lifecycle deterministic and avoid backend or scheduling timing.
+        var old: LifecycleGate = .{ .engine = &engine };
+        old.release.set(t.io);
+        if (operation == .remove) {
+            engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+            engine.queue.paused = false;
+        }
+        engine.queue.persistence_lock.lockUncancelable(t.io);
+        var pending = try t.io.concurrent(call, .{ &engine, operation });
+        try LifecycleGate.waitContended(&engine.queue.persistence_lock);
+        // For cold calls the barrier is ensureLoaded; for warm calls it is
+        // persist. Pause must return with persistence still gated in both.
+        engine.queue.pause(&engine);
+        const stopped = engine.queue.paused and !engine.queue.running();
+        engine.queue.persistence_lock.unlock(t.io);
+        try pending.await(t.io);
+        try t.expect(stopped);
+        try t.expect(engine.queue.paused);
+        try t.expect(!engine.queue.running());
+        try t.expect(engine.queue.runner == null);
+        const saved = try Queue.loadSaved(&engine, a);
+        if (operation == .remove) {
+            try t.expectEqual(1, saved.chapters.len);
+            try t.expectEqualStrings("1:/c2", saved.chapters[0]);
+        } else if (operation == .enqueue) {
+            try t.expectEqual(if (cold) @as(usize, 2) else 1, saved.chapters.len);
+        } else if (operation == .retry) {
+            try t.expectEqual(0, saved.browser_verification_required.len);
+            try t.expectEqual(Status.queued, engine.queue.items.items[0].status);
+        }
+    }
+};
+
+test "queue pause invalidates enqueue autostart across persistence and cold restoration" {
+    try StaleStartFixture.check(.enqueue, false);
+    try StaleStartFixture.check(.enqueue, true);
+}
+
+test "queue pause invalidates retry autostart across persistence and cold restoration" {
+    try StaleStartFixture.check(.retry, false);
+    try StaleStartFixture.check(.retry, true);
+}
+
+test "queue pause invalidates remove resume across persistence and cold restoration" {
+    try StaleStartFixture.check(.remove, false);
+    try StaleStartFixture.check(.remove, true);
+}
+
+test "queue pause invalidates a cold explicit start waiting for restoration" {
+    try StaleStartFixture.check(.start, true);
+}
+
+test "queue pause invalidates a start awaiting completed runner cleanup" {
+    const t = std.testing;
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = "unused" });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    engine.queue.loaded = true;
+    try engine.queue.append(t.allocator, "must not launch", 1);
+    var old: LifecycleGate = .{ .engine = &engine };
+    var starter: LifecycleGate = .{ .engine = &engine };
+    var pauser: LifecycleGate = .{ .engine = &engine };
+    old.parked.set(t.io);
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+    try old.cleaning.wait(t.io);
+    engine.queue.runner_done = true;
+    var starting = try t.io.concurrent(LifecycleGate.start, .{&starter});
+    while (engine.queue.lifecycle_lock.state.load(.acquire) == .unlocked)
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    var pausing = try t.io.concurrent(LifecycleGate.pause, .{&pauser});
+    try LifecycleGate.waitContended(&engine.queue.lifecycle_lock);
+    old.release.set(t.io);
+    try starting.await(t.io);
+    pausing.await(t.io);
+    try t.expect(engine.queue.paused);
+    try t.expect(engine.queue.runner == null);
 }
