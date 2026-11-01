@@ -245,6 +245,9 @@ pub const Queue = struct {
             self.persistence_lock.unlock(engine.io);
             self.acquire();
         }
+        // Teardown may have freed membership while this writer waited for
+        // persistence. Never turn its empty, closed state into a durable clear.
+        if (self.closed) return error.QueueClosed;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1961,4 +1964,38 @@ test "queue pause invalidates a start awaiting completed runner cleanup" {
     pausing.await(t.io);
     try t.expect(engine.queue.paused);
     try t.expect(engine.queue.runner == null);
+}
+
+test "queue pending persistence cannot erase durable membership after teardown" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    var fixture: PipelineFixture = .{};
+    var engine = Engine.init(t.allocator, t.io, fixture.backend(), .{ .dir = dir });
+    defer engine.deinit();
+    try PipelineFixture.setup(&engine, a);
+    _ = try engine.queue.enqueue(&engine, &.{ "1:/c1", "1:/c2" }, false);
+    const Writer = struct {
+        fn run(e: *Engine) !void {
+            try e.queue.moveToFront(e, "1:/c2");
+        }
+    };
+    engine.queue.persistence_lock.lockUncancelable(t.io);
+    var writer = try t.io.concurrent(Writer.run, .{&engine});
+    while (engine.queue.persistence_lock.state.load(.acquire) != .contended)
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    engine.queue.deinit(&engine);
+    engine.queue.persistence_lock.unlock(t.io);
+    try t.expectError(error.QueueClosed, writer.await(t.io));
+    var restored = Engine.init(t.allocator, t.io, fixture.backend(), .{ .dir = dir });
+    defer restored.deinit();
+    defer restored.queue.deinit(&restored);
+    const saved = try restored.queue.snapshot(&restored, a);
+    try t.expectEqual(2, saved.len);
+    try t.expectEqualStrings("1:/c1", saved[0].chapter_id);
+    try t.expectEqualStrings("1:/c2", saved[1].chapter_id);
 }
