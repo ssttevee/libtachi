@@ -14,6 +14,34 @@ fn uncancelable(io: Io, comptime function: anytype, args: anytype) @TypeOf(@call
     return @call(.auto, function, args);
 }
 
+/// Allocator calls cannot return Canceled. Preserve cancellation even when
+/// the backing allocator performs best-effort I/O for diagnostics. The wrapper
+/// must outlive its users; it adds no ownership or synchronization of its own.
+pub const Allocations = struct {
+    child: std.mem.Allocator,
+    io: Io,
+
+    pub fn allocator(self: *Allocations) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Allocations = @ptrCast(@alignCast(ptr));
+        return uncancelable(self.io, std.mem.Allocator.rawAlloc, .{ self.child, len, alignment, ret_addr });
+    }
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        const self: *Allocations = @ptrCast(@alignCast(ptr));
+        return uncancelable(self.io, std.mem.Allocator.rawResize, .{ self.child, memory, alignment, len, ret_addr });
+    }
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Allocations = @ptrCast(@alignCast(ptr));
+        return uncancelable(self.io, std.mem.Allocator.rawRemap, .{ self.child, memory, alignment, len, ret_addr });
+    }
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Allocations = @ptrCast(@alignCast(ptr));
+        uncancelable(self.io, std.mem.Allocator.rawFree, .{ self.child, memory, alignment, ret_addr });
+    }
+};
+
 /// Starts items in index order, publishing in completion order on the caller's
 /// task. `work(context, scratch, index)` returns an error union; all its output
 /// must belong to `scratch` or be borrowed. `publish(context, index, value,
@@ -31,7 +59,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
         future: ?Io.Future(void) = null,
 
         fn execute(self: *@This(), ctx: @TypeOf(context), slot: usize, task_io: Io, completions: *Io.Queue(usize)) void {
-            self.result = work(ctx, self.arena.allocator(), self.index);
+            // Protect calls through scratch, not the arena's backing allocator:
+            // publication may move the arena beyond this task/run's lifetime.
+            var allocations: Allocations = .{ .child = self.arena.allocator(), .io = task_io };
+            self.result = work(ctx, allocations.allocator(), self.index);
             completions.putOneUncancelable(task_io, slot) catch |err| switch (err) {
                 error.Closed => {},
             };
@@ -47,7 +78,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, count: usize, limit: usize, context: 
     var completions: Io.Queue(usize) = .init(buffer);
     defer {
         completions.close(io);
-        for (slots) |*slot| if (slot.future) |*future| future.cancel(io);
+        for (slots) |*slot| if (slot.future) |*future| uncancelable(io, Io.Future(void).cancel, .{ future, io });
     }
     for (slots, 0..) |*slot, i| slot.future = try uncancelable(io, Io.concurrent, .{ io, Slot.execute, .{ slot, context, i, io, &completions } });
     var next = width;
@@ -229,4 +260,80 @@ test "completed task teardown cannot consume cancellation with nested downloads 
     try t.expect(!ctx.swallowed);
     try t.expectEqual(2, ctx.ended.load(.acquire));
     try t.expectEqual(0, ctx.published);
+}
+
+test "worker scratch allocation cannot swallow cancellation before a backend wait" {
+    const t = std.testing;
+    const Context = struct {
+        allocating: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        armed: std.atomic.Value(bool) = .init(false),
+        swallowed: bool = false,
+        ended: bool = false,
+
+        fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            if (ctx.armed.swap(false, .acq_rel)) {
+                ctx.allocating.set(t.io);
+                const protection = t.io.swapCancelProtection(.unblocked);
+                ctx.parked.wait(t.io) catch {};
+                t.io.recancel();
+                _ = t.io.swapCancelProtection(protection);
+                // Same best-effort behavior as allocator stack diagnostics.
+                t.io.checkCancel() catch {
+                    ctx.swallowed = true;
+                };
+            }
+            return t.allocator.rawAlloc(len, alignment, ret_addr);
+        }
+        fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            t.allocator.rawFree(memory, alignment, ret_addr);
+        }
+        fn work(ctx: *@This(), scratch: std.mem.Allocator, _: usize) !void {
+            defer ctx.ended = true;
+            ctx.armed.store(true, .release);
+            _ = try scratch.alloc(u8, 1024);
+            try ctx.parked.wait(t.io);
+        }
+        fn publish(_: *@This(), _: usize, _: void, _: *std.heap.ArenaAllocator) !void {
+            return error.UnexpectedPublication;
+        }
+        fn call(ctx: *@This()) !void {
+            const allocator: std.mem.Allocator = .{ .ptr = ctx, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+            try run(allocator, t.io, 1, 1, ctx, work, publish);
+        }
+    };
+    var ctx: Context = .{};
+    var future = try t.io.concurrent(Context.call, .{&ctx});
+    try ctx.allocating.wait(t.io);
+    try t.expectError(error.Canceled, future.cancel(t.io));
+    try t.expect(!ctx.swallowed);
+    try t.expect(ctx.ended);
+}
+
+test "published arenas retain their backing allocator after workers and coordinator return" {
+    const t = std.testing;
+    const Context = struct {
+        arenas: [3]?std.heap.ArenaAllocator = @splat(null),
+        values: [3][]const u8 = undefined,
+        fn work(_: *@This(), scratch: std.mem.Allocator, i: usize) ![]const u8 {
+            return std.fmt.allocPrint(scratch, "retained {d}", .{i});
+        }
+        fn publish(ctx: *@This(), i: usize, value: []const u8, arena: *std.heap.ArenaAllocator) !void {
+            ctx.values[i] = value;
+            ctx.arenas[i] = arena.*;
+            arena.* = .init(t.allocator);
+        }
+    };
+    var ctx: Context = .{};
+    defer for (ctx.arenas) |arena| if (arena) |owned| owned.deinit();
+    try run(t.allocator, t.io, 3, 2, &ctx, Context.work, Context.publish);
+    for (ctx.arenas, ctx.values, 0..) |arena, value, i| {
+        // No allocator context owned by a departed task may escape in an arena.
+        try t.expectEqual(t.allocator.ptr, arena.?.child_allocator.ptr);
+        try t.expectEqual(t.allocator.vtable, arena.?.child_allocator.vtable);
+        const expected = try std.fmt.allocPrint(t.allocator, "retained {d}", .{i});
+        defer t.allocator.free(expected);
+        try t.expectEqualStrings(expected, value);
+    }
 }

@@ -599,7 +599,9 @@ pub const Queue = struct {
     /// Plan chapter lists independently from transfers. Two chapter windows
     /// per source let the successor use slots as the predecessor drains.
     fn run(self: *Queue, engine: *Engine) void {
-        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+        var allocations: parallel.Allocations = .{ .child = engine.gpa, .io = engine.io };
+        const gpa = allocations.allocator();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const settings = engine.loadSettings(arena.allocator()) catch |err| blk: {
             if (err == error.Canceled) engine.io.recancel();
@@ -610,44 +612,45 @@ pub const Queue = struct {
             if (err == error.Canceled) engine.io.recancel();
             break :blk 1;
         };
-        var scheduler: downloads.Scheduler = .init(engine.gpa, page_limit);
+        var scheduler: downloads.Scheduler = .init(gpa, page_limit);
         defer scheduler.deinit();
         defer if (engine.options.release_jvm) engine.backend.release();
         const Workers = struct {
             queue: *Queue,
             engine: *Engine,
+            gpa: std.mem.Allocator,
             scheduler: *downloads.Scheduler,
             source_limit: usize,
             fn work(ctx: *@This(), _: std.mem.Allocator, index: usize) !void {
                 if (index == 0) {
-                    try ctx.queue.plan(ctx.engine);
+                    try ctx.queue.plan(ctx.engine, ctx.gpa);
                 } else {
-                    try ctx.queue.work(ctx.engine, ctx.scheduler, ctx.source_limit, index);
+                    try ctx.queue.work(ctx.engine, ctx.gpa, ctx.scheduler, ctx.source_limit, index);
                 }
-                // Future.await can forward the runner's cancellation to this
-                // worker while it is finishing. Preserve it in Slot.result.
+                // Preserve cancellation that arrived as the worker finished
+                // its last operation, before publishing Slot.result.
                 try ctx.engine.io.checkCancel();
             }
             fn publish(_: *@This(), _: usize, _: void, _: *std.heap.ArenaAllocator) !void {}
         };
         const count = source_limit * 2 + 1;
-        const waiters = engine.gpa.alloc(Io.Event, count) catch {
+        const waiters = gpa.alloc(Io.Event, count) catch {
             self.acquire();
             self.runner_done = true;
             self.lock.unlock();
             return;
         };
-        defer engine.gpa.free(waiters);
+        defer gpa.free(waiters);
         for (waiters) |*event| event.* = .unset;
         self.acquire();
         self.waiters = waiters;
         self.lock.unlock();
-        var workers: Workers = .{ .queue = self, .engine = engine, .scheduler = &scheduler, .source_limit = source_limit };
+        var workers: Workers = .{ .queue = self, .engine = engine, .gpa = gpa, .scheduler = &scheduler, .source_limit = source_limit };
         while (true) {
             self.acquire();
             self.planner_done = false;
             self.lock.unlock();
-            parallel.run(engine.gpa, engine.io, count, count, &workers, Workers.work, Workers.publish) catch |err| {
+            parallel.run(gpa, engine.io, count, count, &workers, Workers.work, Workers.publish) catch |err| {
                 if (err != error.Canceled) log.warn("download queue stopped: {s}", .{@errorName(err)});
                 break;
             };
@@ -672,7 +675,7 @@ pub const Queue = struct {
         self.lock.unlock();
     }
 
-    fn plan(self: *Queue, engine: *Engine) Io.Cancelable!void {
+    fn plan(self: *Queue, engine: *Engine, gpa: std.mem.Allocator) Io.Cancelable!void {
         defer {
             self.acquire();
             self.planner_done = true;
@@ -691,12 +694,12 @@ pub const Queue = struct {
                 self.lock.unlock();
                 return;
             }
-            const id = engine.gpa.dupe(u8, next.?.chapter_id) catch {
+            const id = gpa.dupe(u8, next.?.chapter_id) catch {
                 self.lock.unlock();
                 return;
             };
-            defer engine.gpa.free(id);
-            var job: Job = .{ .arena = .init(engine.gpa), .engine = engine, .request = .{ .download = id } };
+            defer gpa.free(id);
+            var job: Job = .{ .arena = .init(gpa), .engine = engine, .request = .{ .download = id } };
             defer job.arena.deinit();
             next.?.status = .downloading;
             next.?.planning = true;
@@ -722,7 +725,7 @@ pub const Queue = struct {
         }
     }
 
-    fn work(self: *Queue, engine: *Engine, scheduler: *downloads.Scheduler, source_limit: usize, waiter: usize) Io.Cancelable!void {
+    fn work(self: *Queue, engine: *Engine, gpa: std.mem.Allocator, scheduler: *downloads.Scheduler, source_limit: usize, waiter: usize) Io.Cancelable!void {
         while (true) {
             try engine.io.checkCancel();
             const allowed = networkAllowed(engine);
@@ -766,12 +769,12 @@ pub const Queue = struct {
                 try self.waiters[waiter].wait(engine.io);
                 continue;
             }
-            const id = engine.gpa.dupe(u8, next.?.chapter_id) catch {
+            const id = gpa.dupe(u8, next.?.chapter_id) catch {
                 self.lock.unlock();
                 return;
             };
-            defer engine.gpa.free(id);
-            var job: Job = .{ .arena = .init(engine.gpa), .engine = engine, .request = .{ .download = id } };
+            defer gpa.free(id);
+            var job: Job = .{ .arena = .init(gpa), .engine = engine, .request = .{ .download = id } };
             defer job.arena.deinit();
             const Dispatch = struct {
                 queue: *Queue,
@@ -805,6 +808,8 @@ pub const Queue = struct {
         // The job remains owned by this worker until finish returns. Removing
         // an active item holds lifecycle through join and removal, so validation
         // can run unlocked even when another pause/start/teardown is pending.
+        var allocations: parallel.Allocations = .{ .child = engine.gpa, .io = engine.io };
+        const gpa = allocations.allocator();
         const saved_progress = engine.downloadProgress(job.arena.allocator(), id) catch |err| blk: {
             // Cancellation is one-shot. Swallowing it here can let the runner
             // await this successful worker and then wait forever on siblings.
@@ -843,7 +848,7 @@ pub const Queue = struct {
                     item.pages_total = progress.total;
                 }
             } else {
-                freeItem(engine.gpa, self.items.orderedRemove(i));
+                freeItem(gpa, self.items.orderedRemove(i));
                 self.persist(engine) catch |err| {
                     if (err == error.Canceled) engine.io.recancel();
                     log.warn("download queue not saved: {s}", .{@errorName(err)});
@@ -853,14 +858,14 @@ pub const Queue = struct {
             error.Canceled => item.status = .queued,
             else => {
                 item.status = .failed;
-                if (item.failure) |f| engine.gpa.free(f);
+                if (item.failure) |f| gpa.free(f);
                 const detail = tachi.lastError();
                 item.failure = (if (job.failure) |failure|
-                    engine.gpa.dupe(u8, failure)
+                    gpa.dupe(u8, failure)
                 else if (detail.len > 0)
-                    std.fmt.allocPrint(engine.gpa, "{s}: {s}", .{ @errorName(err), detail })
+                    std.fmt.allocPrint(gpa, "{s}: {s}", .{ @errorName(err), detail })
                 else
-                    engine.gpa.dupe(u8, @errorName(err))) catch null;
+                    gpa.dupe(u8, @errorName(err))) catch null;
                 item.browser_verification_required = err == error.BrowserVerificationRequired;
                 log.warn("download {s}: {s}", .{ id, item.failure orelse @errorName(err) });
                 self.persist(engine) catch |save_err| {
@@ -872,7 +877,8 @@ pub const Queue = struct {
     }
 
     fn networkAllowed(engine: *Engine) bool {
-        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+        var allocations: parallel.Allocations = .{ .child = engine.gpa, .io = engine.io };
+        var arena: std.heap.ArenaAllocator = .init(allocations.allocator());
         defer arena.deinit();
         const s = engine.loadSettings(arena.allocator()) catch |err| {
             if (err == error.Canceled) {

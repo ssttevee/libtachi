@@ -325,8 +325,13 @@ pub fn fetchTimed(client: *std.http.Client, store: PageStore, index: usize, requ
     var buffer: [2]Result = undefined;
     var select: Io.Select(Result) = .init(store.io, &buffer);
     defer select.cancelDiscard();
-    try select.concurrent(.transfer, fetch, .{ client, store, index, request });
-    try select.concurrent(.deadline, sleep, .{ store.io, timeout });
+    {
+        // Spawning group tasks owns allocator bookkeeping, not page I/O.
+        const protection = store.io.swapCancelProtection(.blocked);
+        defer _ = store.io.swapCancelProtection(protection);
+        try select.concurrent(.transfer, fetch, .{ client, store, index, request });
+        try select.concurrent(.deadline, sleep, .{ store.io, timeout });
+    }
     return switch (try select.await()) {
         .transfer => |result| result,
         .deadline => |result| {
@@ -427,7 +432,11 @@ pub const Chapter = struct {
 /// Downloads every page of `plan`, resuming pages an earlier attempt saved
 /// and retrying a failed page as Mihon does. Cancel through `io`: pages
 /// saved so far stay for the next attempt.
-pub fn downloadChapter(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, plan: []const ImageRequest, options: Options) !Chapter {
+pub fn downloadChapter(raw_gpa: std.mem.Allocator, raw_arena: std.mem.Allocator, io: Io, plan: []const ImageRequest, options: Options) !Chapter {
+    var allocations: parallel.Allocations = .{ .child = raw_gpa, .io = io };
+    var output_allocations: parallel.Allocations = .{ .child = raw_arena, .io = io };
+    const gpa = allocations.allocator();
+    const arena = output_allocations.allocator();
     if (plan.len == 0) return error.EmptyChapter;
     const store = try PageStore.initIn(arena, io, options.dir, options.root, options.chapter_id, plan);
     // Publish the plan before any transfer, including attempts canceled before page one.
