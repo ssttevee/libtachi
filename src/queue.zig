@@ -67,6 +67,10 @@ pub const Queue = struct {
     items: std.ArrayList(Item) = .empty,
     loaded: bool = false,
     paused: bool = true,
+    /// Removal temporarily pauses transfers while joining and persisting. Carry
+    /// its prior running intent across overlapping removals; explicit stops
+    /// clear it, and only a generation-valid restart may consume it.
+    resume_after_remove: bool = false,
     runner: ?Io.Future(void) = null,
     /// The runner ran out of work and returned; it still has to be awaited.
     runner_done: bool = false,
@@ -89,6 +93,7 @@ pub const Queue = struct {
         self.closed = true;
         self.generation +%= 1;
         self.paused = true;
+        self.resume_after_remove = false;
         self.notify(engine.io);
         self.lock.unlock();
         self.lifecycle_lock.lockUncancelable(engine.io);
@@ -360,6 +365,7 @@ pub const Queue = struct {
         if (self.closed) return error.QueueClosed;
         if (generation != self.generation) return;
         self.paused = false;
+        self.resume_after_remove = false;
         if (self.items.items.len == 0) return;
         self.runner_done = false;
         self.runner = try engine.io.concurrent(run, .{ self, engine });
@@ -382,6 +388,7 @@ pub const Queue = struct {
         self.acquire();
         self.generation +%= 1;
         self.paused = true;
+        self.resume_after_remove = false;
         self.notify(engine.io);
         self.lock.unlock();
         self.lifecycle_lock.lockUncancelable(engine.io);
@@ -420,7 +427,13 @@ pub const Queue = struct {
             self.lifecycle_lock.unlock(engine.io);
             return error.QueueClosed;
         }
-        const should_resume = was_running and request_generation == self.generation;
+        // A preceding removal may be waiting for persistence with no runner
+        // and paused=true. Its stale restart must transfer running intent to
+        // this removal, while an intervening explicit stop invalidates it.
+        const running_now = self.runner != null and !self.runner_done and !self.paused;
+        const should_resume = self.resume_after_remove or running_now or
+            (was_running and request_generation == self.generation);
+        self.resume_after_remove = should_resume;
         self.generation +%= 1;
         const generation = self.generation;
         self.paused = true;
@@ -461,6 +474,7 @@ pub const Queue = struct {
         self.acquire();
         self.generation +%= 1;
         self.paused = true;
+        self.resume_after_remove = false;
         self.notify(engine.io);
         self.lock.unlock();
         self.lifecycle_lock.lockUncancelable(engine.io);
@@ -1998,4 +2012,97 @@ test "queue pending persistence cannot erase durable membership after teardown" 
     try t.expectEqual(2, saved.len);
     try t.expectEqualStrings("1:/c1", saved[0].chapter_id);
     try t.expectEqualStrings("1:/c2", saved[1].chapter_id);
+}
+
+const RemovalIntentFixture = struct {
+    const Stop = enum { none, pause, clear, teardown };
+    fn remove(e: *Engine, id: []const u8) !void {
+        try e.queue.remove(e, id);
+    }
+    fn clear(e: *Engine) anyerror!void {
+        try e.queue.clear(e);
+    }
+    fn check(stop: Stop) !void {
+        const t = std.testing;
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fixture: PipelineFixture = .{ .park_images = true };
+        var engine = Engine.init(t.allocator, t.io, fixture.backend(), .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a), .parallelism = 2 });
+        defer engine.deinit();
+        defer engine.queue.deinit(&engine);
+        engine.setNetwork(.wifi);
+        try engine.store.save(a, .{ .manga = &.{.{ .id = "1:/m", .title = "M", .source_id = 1, .chapters = &.{
+            .{ .id = "1:/c1", .title = "C1", .source_order = 2, .remote = .{ .url = "/c1", .name = "C1" } },
+            .{ .id = "1:/c2", .title = "C2", .source_order = 1, .remote = .{ .url = "/c2", .name = "C2" } },
+            .{ .id = "1:/c3", .title = "C3", .source_order = 0, .remote = .{ .url = "/c3", .name = "C3" } },
+        } }} });
+        _ = try engine.queue.enqueue(&engine, &.{ "1:/c1", "1:/c2", "1:/c3" }, false);
+        // A real cancellable runner, with deterministic teardown and no page
+        // timing before the two membership updates are parked on persistence.
+        var old: LifecycleGate = .{ .engine = &engine };
+        old.release.set(t.io);
+        engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+        engine.queue.paused = false;
+        engine.queue.persistence_lock.lockUncancelable(t.io);
+        var first = try t.io.concurrent(remove, .{ &engine, "1:/c1" });
+        try LifecycleGate.waitContended(&engine.queue.persistence_lock);
+        var second = try t.io.concurrent(remove, .{ &engine, "1:/c2" });
+        while (true) {
+            engine.queue.acquire();
+            const ready = engine.queue.items.items.len == 1;
+            engine.queue.lock.unlock();
+            if (ready) break;
+            try t.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var clearing: ?Io.Future(anyerror!void) = null;
+        switch (stop) {
+            .none => {},
+            .pause => engine.queue.pause(&engine),
+            .teardown => engine.queue.deinit(&engine),
+            .clear => {
+                clearing = try t.io.concurrent(clear, .{&engine});
+                while (true) {
+                    engine.queue.acquire();
+                    const empty = engine.queue.items.items.len == 0;
+                    engine.queue.lock.unlock();
+                    if (empty) break;
+                    try t.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            },
+        }
+        engine.queue.persistence_lock.unlock(t.io);
+        if (stop == .teardown) {
+            try t.expectError(error.QueueClosed, first.await(t.io));
+            try t.expectError(error.QueueClosed, second.await(t.io));
+        } else {
+            try first.await(t.io);
+            try second.await(t.io);
+        }
+        if (clearing) |*future| try future.await(t.io);
+        if (stop == .none) {
+            try fixture.first_image.wait(t.io);
+            try t.expect(engine.queue.running());
+            const entries = try engine.queue.snapshot(&engine, a);
+            try t.expectEqual(1, entries.len);
+            try t.expectEqualStrings("1:/c3", entries[0].chapter_id);
+            try t.expectEqual(1, fixture.plans.load(.acquire));
+        } else {
+            try t.expect(engine.queue.paused);
+            try t.expect(!engine.queue.running());
+            try t.expectEqual(0, fixture.plans.load(.acquire));
+        }
+    }
+};
+
+test "queue overlapping removals transfer running intent to the surviving chapter" {
+    try RemovalIntentFixture.check(.none);
+}
+
+test "queue explicit stops invalidate overlapping removal resume intent" {
+    try RemovalIntentFixture.check(.pause);
+    try RemovalIntentFixture.check(.clear);
+    try RemovalIntentFixture.check(.teardown);
 }
