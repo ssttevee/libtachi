@@ -58,6 +58,10 @@ const Saved = struct {
 pub const Queue = struct {
     lock: std.atomic.Mutex = .unlocked,
     persistence_lock: Io.Mutex = .init,
+    /// Serializes ownership of runner futures, including the entire join. Never
+    /// acquired with state held, and never needed by a runner or its workers.
+    lifecycle_lock: Io.Mutex = .init,
+    closed: bool = false,
     items: std.ArrayList(Item) = .empty,
     loaded: bool = false,
     paused: bool = true,
@@ -79,9 +83,19 @@ pub const Queue = struct {
     }
 
     pub fn deinit(self: *Queue, engine: *Engine) void {
-        self.pause(engine);
+        self.acquire();
+        self.closed = true;
+        self.paused = true;
+        self.notify(engine.io);
+        self.lock.unlock();
+        self.lifecycle_lock.lockUncancelable(engine.io);
+        defer self.lifecycle_lock.unlock(engine.io);
+        self.acquire();
+        defer self.lock.unlock();
+        self.joinLocked(engine, true);
         for (self.items.items) |item| freeItem(engine.gpa, item);
         self.items.deinit(engine.gpa);
+        self.items = .empty;
     }
 
     fn freeItem(gpa: std.mem.Allocator, item: Item) void {
@@ -158,14 +172,27 @@ pub const Queue = struct {
 
     /// Loads the saved queue once; the caller holds the lock.
     fn ensureLoaded(self: *Queue, engine: *Engine) !void {
+        if (self.closed) return error.QueueClosed;
         if (self.loaded) return;
         self.lock.unlock();
-        defer self.acquire();
+        self.restore(engine) catch |err| {
+            self.acquire();
+            return err;
+        };
+        self.acquire();
+        if (self.closed) return error.QueueClosed;
+    }
+
+    /// Persistence ordering is acquired without state, and restored ownership
+    /// is published under state only if teardown has not closed the queue.
+    fn restore(self: *Queue, engine: *Engine) !void {
         self.persistence_lock.lockUncancelable(engine.io);
         defer self.persistence_lock.unlock(engine.io);
         self.acquire();
         const already_loaded = self.loaded;
+        const closed = self.closed;
         self.lock.unlock();
+        if (closed) return error.QueueClosed;
         if (already_loaded) return;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
@@ -190,12 +217,14 @@ pub const Queue = struct {
         self.acquire();
         // clear() may have published an empty queue during this read. Never
         // replace it with restored entries. Other loaders serialize above.
-        if (!self.loaded) {
+        if (!self.loaded and !self.closed) {
             self.items = restored.items;
             restored.items = .empty;
             self.loaded = true;
         }
+        const closed_after_load = self.closed;
         self.lock.unlock();
+        if (closed_after_load) return error.QueueClosed;
     }
 
     /// Caller holds state lock on entry and return. Serialize before capturing
@@ -303,17 +332,34 @@ pub const Queue = struct {
         try self.startLocked(engine);
     }
 
+    /// State is held on entry/return; only lifecycle owners touch the future.
     fn startLocked(self: *Queue, engine: *Engine) !void {
+        self.lock.unlock();
+        self.lifecycle_lock.lockUncancelable(engine.io);
+        self.acquire();
+        defer self.lifecycle_lock.unlock(engine.io);
+        if (self.closed) return error.QueueClosed;
         self.paused = false;
-        if (self.runner) |*r| {
+        if (self.runner != null) {
             if (!self.runner_done) return;
-            // Done already, so this returns at once.
-            r.await(engine.io);
-            self.runner = null;
+            self.joinLocked(engine, false);
         }
+        if (self.closed) return error.QueueClosed;
         if (self.items.items.len == 0) return;
         self.runner_done = false;
         self.runner = try engine.io.concurrent(run, .{ self, engine });
+    }
+
+    /// Caller owns lifecycle and state. Keep the handle published until join
+    /// finishes; workers and backend cleanup may need state while joining.
+    fn joinLocked(self: *Queue, engine: *Engine, cancel: bool) void {
+        if (self.runner) |*runner| {
+            self.lock.unlock();
+            if (cancel) runner.cancel(engine.io) else runner.await(engine.io);
+            self.acquire();
+            self.runner = null;
+            self.runner_done = false;
+        }
     }
 
     /// Stops after cancelling the download in progress; its saved pages stay.
@@ -321,10 +367,13 @@ pub const Queue = struct {
         self.acquire();
         self.paused = true;
         self.notify(engine.io);
-        var runner = self.runner;
-        self.runner = null;
         self.lock.unlock();
-        if (runner) |*r| r.cancel(engine.io);
+        self.lifecycle_lock.lockUncancelable(engine.io);
+        defer self.lifecycle_lock.unlock(engine.io);
+        self.acquire();
+        defer self.lock.unlock();
+        self.paused = true;
+        self.joinLocked(engine, true);
     }
 
     /// Removes a chapter from the queue, cancelling it if it is downloading.
@@ -345,8 +394,20 @@ pub const Queue = struct {
         // begin planning/transferring immediately after we drop this lock.
         const was_running = self.runner != null and !self.runner_done and !self.paused;
         self.lock.unlock();
-        if (was_running) self.pause(engine);
+        self.lifecycle_lock.lockUncancelable(engine.io);
         self.acquire();
+        if (self.closed) {
+            self.lock.unlock();
+            self.lifecycle_lock.unlock(engine.io);
+            return error.QueueClosed;
+        }
+        self.paused = true;
+        self.notify(engine.io);
+        self.joinLocked(engine, true);
+        // Release lifecycle before persistence: pause must be able to join
+        // without waiting for an unrelated durable membership update.
+        var lifecycle_held = true;
+        defer if (lifecycle_held) self.lifecycle_lock.unlock(engine.io);
         defer self.lock.unlock();
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
@@ -355,6 +416,8 @@ pub const Queue = struct {
             freeItem(engine.gpa, self.items.orderedRemove(i));
             break;
         };
+        self.lifecycle_lock.unlock(engine.io);
+        lifecycle_held = false;
         try self.persist(engine);
         if (was_running) try self.startLocked(engine);
     }
@@ -373,11 +436,20 @@ pub const Queue = struct {
     }
 
     pub fn clear(self: *Queue, engine: *Engine) !void {
-        self.pause(engine);
+        self.acquire();
+        self.paused = true;
+        self.notify(engine.io);
+        self.lock.unlock();
+        self.lifecycle_lock.lockUncancelable(engine.io);
+        var lifecycle_held = true;
+        defer if (lifecycle_held) self.lifecycle_lock.unlock(engine.io);
         self.acquire();
         defer self.lock.unlock();
+        self.paused = true;
+        self.joinLocked(engine, true);
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
+        if (self.closed) return error.QueueClosed;
         // Clear even before the saved queue has been loaded, and clean up
         // orphan plans left by an interrupted queue update.
         for (self.items.items) |*item| item.prepared = false;
@@ -386,6 +458,8 @@ pub const Queue = struct {
         self.loaded = true;
         for (self.items.items) |item| freeItem(engine.gpa, item);
         self.items.clearRetainingCapacity();
+        self.lifecycle_lock.unlock(engine.io);
+        lifecycle_held = false;
         try self.persist(engine);
     }
 
@@ -489,9 +563,15 @@ pub const Queue = struct {
     fn run(self: *Queue, engine: *Engine) void {
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
-        const settings = engine.loadSettings(arena.allocator()) catch @import("settings.zig").Settings{};
+        const settings = engine.loadSettings(arena.allocator()) catch |err| blk: {
+            if (err == error.Canceled) engine.io.recancel();
+            break :blk @import("settings.zig").Settings{};
+        };
         const source_limit = @max(1, settings.downloads.parallel_sources);
-        const page_limit = engine.pageParallelism(arena.allocator()) catch 1;
+        const page_limit = engine.pageParallelism(arena.allocator()) catch |err| blk: {
+            if (err == error.Canceled) engine.io.recancel();
+            break :blk 1;
+        };
         var scheduler: downloads.Scheduler = .init(engine.gpa, page_limit);
         defer scheduler.deinit();
         defer if (engine.options.release_jvm) engine.backend.release();
@@ -501,8 +581,14 @@ pub const Queue = struct {
             scheduler: *downloads.Scheduler,
             source_limit: usize,
             fn work(ctx: *@This(), _: std.mem.Allocator, index: usize) !void {
-                if (index == 0) return ctx.queue.plan(ctx.engine);
-                try ctx.queue.work(ctx.engine, ctx.scheduler, ctx.source_limit, index);
+                if (index == 0) {
+                    try ctx.queue.plan(ctx.engine);
+                } else {
+                    try ctx.queue.work(ctx.engine, ctx.scheduler, ctx.source_limit, index);
+                }
+                // Future.await can forward the runner's cancellation to this
+                // worker while it is finishing. Preserve it in Slot.result.
+                try ctx.engine.io.checkCancel();
             }
             fn publish(_: *@This(), _: usize, _: void, _: *std.heap.ArenaAllocator) !void {}
         };
@@ -556,6 +642,7 @@ pub const Queue = struct {
             self.lock.unlock();
         }
         while (true) {
+            try engine.io.checkCancel();
             const allowed = networkAllowed(engine);
             self.acquire();
             self.waiting_for_wifi = !allowed;
@@ -599,6 +686,7 @@ pub const Queue = struct {
 
     fn work(self: *Queue, engine: *Engine, scheduler: *downloads.Scheduler, source_limit: usize, waiter: usize) Io.Cancelable!void {
         while (true) {
+            try engine.io.checkCancel();
             const allowed = networkAllowed(engine);
             self.acquire();
             self.waiters[waiter].reset();
@@ -677,10 +765,19 @@ pub const Queue = struct {
 
     fn finish(self: *Queue, engine: *Engine, id: []const u8, job: *Job, outcome: anyerror!void, planning: bool) void {
         // The job remains owned by this worker until finish returns. Removing
-        // an active item first joins the runner, so validation can run unlocked.
-        const saved_progress = engine.downloadProgress(job.arena.allocator(), id) catch null;
+        // an active item holds lifecycle through join and removal, so validation
+        // can run unlocked even when another pause/start/teardown is pending.
+        const saved_progress = engine.downloadProgress(job.arena.allocator(), id) catch |err| blk: {
+            // Cancellation is one-shot. Swallowing it here can let the runner
+            // await this successful worker and then wait forever on siblings.
+            if (err == error.Canceled) engine.io.recancel();
+            break :blk null;
+        };
         if (!planning) if (outcome) |_| {
-            engine.discardQueuedPlan(job.arena.allocator(), id) catch |err| log.warn("page plan not removed: {s}", .{@errorName(err)});
+            engine.discardQueuedPlan(job.arena.allocator(), id) catch |err| {
+                if (err == error.Canceled) engine.io.recancel();
+                log.warn("page plan not removed: {s}", .{@errorName(err)});
+            };
         } else |_| {};
         self.acquire();
         defer self.lock.unlock();
@@ -709,7 +806,10 @@ pub const Queue = struct {
                 }
             } else {
                 freeItem(engine.gpa, self.items.orderedRemove(i));
-                self.persist(engine) catch |err| log.warn("download queue not saved: {s}", .{@errorName(err)});
+                self.persist(engine) catch |err| {
+                    if (err == error.Canceled) engine.io.recancel();
+                    log.warn("download queue not saved: {s}", .{@errorName(err)});
+                };
             }
         } else |err| switch (err) {
             error.Canceled => item.status = .queued,
@@ -725,7 +825,10 @@ pub const Queue = struct {
                     engine.gpa.dupe(u8, @errorName(err))) catch null;
                 item.browser_verification_required = err == error.BrowserVerificationRequired;
                 log.warn("download {s}: {s}", .{ id, item.failure orelse @errorName(err) });
-                self.persist(engine) catch |save_err| log.warn("download queue not saved: {s}", .{@errorName(save_err)});
+                self.persist(engine) catch |save_err| {
+                    if (save_err == error.Canceled) engine.io.recancel();
+                    log.warn("download queue not saved: {s}", .{@errorName(save_err)});
+                };
             },
         }
     }
@@ -733,7 +836,13 @@ pub const Queue = struct {
     fn networkAllowed(engine: *Engine) bool {
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
-        const s = engine.loadSettings(arena.allocator()) catch return true;
+        const s = engine.loadSettings(arena.allocator()) catch |err| {
+            if (err == error.Canceled) {
+                engine.io.recancel();
+                return false;
+            }
+            return true;
+        };
         return engine.downloadsAllowed(s);
     }
 
@@ -1491,5 +1600,226 @@ test "queue restore waits without state lock and honors an intervening clear pub
     try t.expect(engine.queue.tryActivity() != null);
     engine.queue.persistence_lock.unlock(t.io);
     try future.await(t.io);
+    try t.expectEqual(0, engine.queue.items.items.len);
+}
+
+const LifecycleGate = struct {
+    engine: *Engine,
+    parked: Io.Event = .unset,
+    cleaning: Io.Event = .unset,
+    release: Io.Event = .unset,
+    ended: std.atomic.Value(bool) = .init(false),
+    returned: std.atomic.Value(bool) = .init(false),
+
+    fn runner(ctx: *@This()) void {
+        ctx.parked.wait(std.testing.io) catch {};
+        ctx.cleaning.set(std.testing.io);
+        ctx.release.waitUncancelable(std.testing.io);
+        // Cancellation/cleanup is allowed to reacquire queue state. Holding
+        // state across either cancel or await deadlocks this barrier.
+        ctx.engine.queue.acquire();
+        ctx.ended.store(true, .release);
+        ctx.engine.queue.lock.unlock();
+    }
+    fn pause(ctx: *@This()) void {
+        ctx.engine.queue.pause(ctx.engine);
+        ctx.returned.store(true, .release);
+    }
+    fn start(ctx: *@This()) !void {
+        ctx.engine.queue.start(ctx.engine) catch |err| switch (err) {
+            error.QueueClosed => {},
+            else => return err,
+        };
+        ctx.returned.store(true, .release);
+    }
+    fn deinit(ctx: *@This()) void {
+        ctx.engine.queue.deinit(ctx.engine);
+        ctx.returned.store(true, .release);
+    }
+    fn waitContended(mutex: *Io.Mutex) !void {
+        for (0..5000) |_| {
+            if (mutex.state.load(.acquire) == .contended) return;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.LifecycleNotContended;
+    }
+};
+
+test "queue concurrent pauses keep the joining runner visible until cleanup ends" {
+    const t = std.testing;
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = "unused" });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    var first: LifecycleGate = .{ .engine = &engine };
+    var second: LifecycleGate = .{ .engine = &engine };
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&first});
+    engine.queue.paused = false;
+    var pause_one = try t.io.concurrent(LifecycleGate.pause, .{&first});
+    try first.cleaning.wait(t.io);
+    var pause_two = try t.io.concurrent(LifecycleGate.pause, .{&second});
+    try LifecycleGate.waitContended(&engine.queue.lifecycle_lock);
+    engine.queue.acquire();
+    const visible = engine.queue.runner != null;
+    engine.queue.lock.unlock();
+    const early = second.returned.load(.acquire);
+    first.release.set(t.io);
+    pause_one.await(t.io);
+    pause_two.await(t.io);
+    try t.expect(visible);
+    try t.expect(!early);
+    try t.expect(first.ended.load(.acquire));
+    try t.expect(engine.queue.runner == null);
+    try t.expect(engine.queue.paused);
+}
+
+test "queue start waits for a canceling runner without holding state" {
+    const t = std.testing;
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = "unused" });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    engine.queue.loaded = true;
+    var old: LifecycleGate = .{ .engine = &engine };
+    var starter: LifecycleGate = .{ .engine = &engine };
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+    engine.queue.paused = false;
+    var pausing = try t.io.concurrent(LifecycleGate.pause, .{&old});
+    try old.cleaning.wait(t.io);
+    var starting = try t.io.concurrent(LifecycleGate.start, .{&starter});
+    try LifecycleGate.waitContended(&engine.queue.lifecycle_lock);
+    const early = starter.returned.load(.acquire);
+    old.release.set(t.io);
+    pausing.await(t.io);
+    try starting.await(t.io);
+    try t.expect(!early);
+    try t.expect(old.ended.load(.acquire));
+}
+
+test "queue teardown joins concurrent pauses and rejects a waiting start" {
+    const t = std.testing;
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = "unused" });
+    defer engine.deinit();
+    engine.queue.loaded = true;
+    try engine.queue.append(t.allocator, "owned until join", 1);
+    var old: LifecycleGate = .{ .engine = &engine };
+    var second: LifecycleGate = .{ .engine = &engine };
+    var starter: LifecycleGate = .{ .engine = &engine };
+    var teardown: LifecycleGate = .{ .engine = &engine };
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+    engine.queue.paused = false;
+    var pause_one = try t.io.concurrent(LifecycleGate.pause, .{&old});
+    try old.cleaning.wait(t.io);
+    var pause_two = try t.io.concurrent(LifecycleGate.pause, .{&second});
+    var starting = try t.io.concurrent(LifecycleGate.start, .{&starter});
+    var deinitializing = try t.io.concurrent(LifecycleGate.deinit, .{&teardown});
+    // Closing publishes before waiting for lifecycle, regardless of which
+    // waiter acquires that mutex next.
+    while (true) {
+        engine.queue.acquire();
+        const closed = engine.queue.closed;
+        engine.queue.lock.unlock();
+        if (closed) break;
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const early = teardown.returned.load(.acquire) or second.returned.load(.acquire);
+    old.release.set(t.io);
+    pause_one.await(t.io);
+    pause_two.await(t.io);
+    try starting.await(t.io);
+    deinitializing.await(t.io);
+    try t.expect(!early);
+    try t.expect(old.ended.load(.acquire));
+    try t.expect(engine.queue.runner == null);
+    try t.expect(engine.queue.paused);
+    try t.expectEqual(0, engine.queue.items.items.len);
+    try t.expectError(error.QueueClosed, engine.queue.start(&engine));
+}
+
+test "queue start joins a completed runner outside state before replacement" {
+    const t = std.testing;
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = "unused" });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    engine.queue.loaded = true;
+    var old: LifecycleGate = .{ .engine = &engine };
+    var starter: LifecycleGate = .{ .engine = &engine };
+    old.parked.set(t.io);
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+    try old.cleaning.wait(t.io);
+    engine.queue.runner_done = true; // run's decision precedes deferred cleanup
+    var starting = try t.io.concurrent(LifecycleGate.start, .{&starter});
+    // Wait until start is actually awaiting the old future. Reacquiring
+    // state in runner cleanup then proves await did not keep it locked.
+    while (engine.queue.lifecycle_lock.state.load(.acquire) == .unlocked)
+        try t.io.sleep(.fromMilliseconds(1), .awake);
+    const early = starter.returned.load(.acquire);
+    old.release.set(t.io);
+    try starting.await(t.io);
+    try t.expect(!early);
+    try t.expect(old.ended.load(.acquire));
+}
+
+test "queue finish preserves cancellation during best effort progress inspection" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", arena.allocator()) });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    const Worker = struct {
+        engine: *Engine,
+        started: Io.Event = .unset,
+        parked: Io.Event = .unset,
+        fn run(ctx: *@This()) !void {
+            const e = ctx.engine;
+            var job: Job = .{ .arena = .init(t.allocator), .engine = e, .request = .{ .download = "c" } };
+            defer job.arena.deinit();
+            // Deterministically deliver cancellation to finish's I/O rather
+            // than the plan itself, matching the sampled pause deadlock.
+            ctx.started.set(t.io);
+            try t.expectError(error.Canceled, ctx.parked.wait(t.io));
+            t.io.recancel();
+            e.queue.finish(e, "c", &job, {}, true);
+            try t.expectError(error.Canceled, t.io.checkCancel());
+        }
+    };
+    var ctx: Worker = .{ .engine = &engine };
+    var worker = try t.io.concurrent(Worker.run, .{&ctx});
+    try ctx.started.wait(t.io);
+    try worker.cancel(t.io);
+}
+
+test "queue removal waits for another pause to finish owning its job" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", arena.allocator()) });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    engine.queue.loaded = true;
+    try engine.queue.append(t.allocator, "owned until join", 1);
+    var old: LifecycleGate = .{ .engine = &engine };
+    engine.queue.runner = try t.io.concurrent(LifecycleGate.runner, .{&old});
+    engine.queue.paused = false;
+    var pausing = try t.io.concurrent(LifecycleGate.pause, .{&old});
+    try old.cleaning.wait(t.io);
+    const Remover = struct {
+        fn run(e: *Engine) !void {
+            try e.queue.remove(e, "owned until join");
+        }
+    };
+    var removing = try t.io.concurrent(Remover.run, .{&engine});
+    try LifecycleGate.waitContended(&engine.queue.lifecycle_lock);
+    engine.queue.acquire();
+    const retained = engine.queue.items.items.len == 1;
+    engine.queue.lock.unlock();
+    old.release.set(t.io);
+    pausing.await(t.io);
+    try removing.await(t.io);
+    try t.expect(retained);
+    try t.expect(old.ended.load(.acquire));
     try t.expectEqual(0, engine.queue.items.items.len);
 }
