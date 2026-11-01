@@ -275,6 +275,8 @@ pub const Store = struct {
         if (options.limit == 0 or options.limit > 256) return error.InvalidPageSize;
         var db = try sql.open(self, a);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         try db.exec("BEGIN");
         errdefer db.rollback();
         const result = try @import("root_sqlite.zig").page(&db, a, options);
@@ -322,6 +324,8 @@ pub const Store = struct {
     pub fn loadTitle(self: *Store, a: std.mem.Allocator, id: []const u8) !Manga {
         var db = try sql.open(self, a);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         try db.exec("BEGIN");
         errdefer db.rollback();
         const result = try @import("root_sqlite.zig").title(&db, a, id);
@@ -341,6 +345,8 @@ pub const Store = struct {
         if (limit == 0 or limit > 256) return error.InvalidPageSize;
         var db = try sql.open(self, arena);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         try db.exec("BEGIN");
         errdefer db.rollback();
         const result = try sql.chapterPage(&db, arena, manga_id, flags, downloaded_only, offset, limit);
@@ -353,6 +359,8 @@ pub const Store = struct {
     pub fn chapterRank(self: *Store, a: std.mem.Allocator, manga_id: []const u8, flags: u32, downloaded_only: bool, chapter_id: []const u8) !?usize {
         var db = try sql.open(self, a);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         return sql.chapterRank(&db, a, manga_id, flags, downloaded_only, chapter_id);
     }
 
@@ -360,6 +368,8 @@ pub const Store = struct {
     pub fn chapterTotal(self: *Store, a: std.mem.Allocator, manga_id: []const u8, flags: u32, downloaded_only: bool) !usize {
         var db = try sql.open(self, a);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         return sql.chapterTotal(&db, a, manga_id, flags, downloaded_only);
     }
 
@@ -367,6 +377,8 @@ pub const Store = struct {
     pub fn titleCounts(self: *Store, a: std.mem.Allocator, manga_id: []const u8) !Counts {
         var db = try sql.open(self, a);
         defer db.close();
+        try self.io.checkCancel();
+        db.setCancellation(&self.io);
         return @import("root_sqlite.zig").counts(&db, manga_id);
     }
 

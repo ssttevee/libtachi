@@ -9,6 +9,7 @@ const c = struct {
     const sqlite3_destructor_type = ?*align(1) const fn (?*anyopaque) callconv(.c) void;
     extern "c" fn sqlite3_open_v2([*:0]const u8, *?*sqlite3, c_int, ?[*:0]const u8) c_int;
     extern "c" fn sqlite3_close_v2(*sqlite3) c_int;
+    extern "c" fn sqlite3_progress_handler(*sqlite3, c_int, ?*const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) void;
     extern "c" fn sqlite3_busy_timeout(*sqlite3, c_int) c_int;
     extern "c" fn sqlite3_exec(*sqlite3, [*:0]const u8, ?*const fn (?*anyopaque, c_int, ?[*]?[*:0]u8, ?[*]?[*:0]u8) callconv(.c) c_int, ?*anyopaque, ?*?[*:0]u8) c_int;
     extern "c" fn sqlite3_prepare_v2(*sqlite3, [*:0]const u8, c_int, *?*sqlite3_stmt, ?*?[*:0]const u8) c_int;
@@ -26,6 +27,7 @@ const c = struct {
     const SQLITE_OK = 0;
     const SQLITE_NOMEM = 7;
     const SQLITE_BUSY = 5;
+    const SQLITE_INTERRUPT = 9;
     const SQLITE_LOCKED = 6;
     const SQLITE_CORRUPT = 11;
     const SQLITE_NOTADB = 26;
@@ -44,6 +46,7 @@ const c = struct {
 };
 
 pub const Error = error{
+    Canceled,
     UnsupportedSchema,
     SqliteError,
     SqliteBusy,
@@ -59,6 +62,7 @@ pub const Error = error{
 fn check(code: c_int) Error!void {
     switch (code & 0xff) {
         c.SQLITE_OK, c.SQLITE_ROW, c.SQLITE_DONE => {},
+        c.SQLITE_INTERRUPT => return error.Canceled,
         c.SQLITE_NOMEM => return error.OutOfMemory,
         c.SQLITE_BUSY, c.SQLITE_LOCKED => return error.SqliteBusy,
         c.SQLITE_CORRUPT, c.SQLITE_NOTADB => return error.SqliteCorrupt,
@@ -123,6 +127,18 @@ pub const Db = struct {
         var handle: ?*c.sqlite3_stmt = null;
         try check(c.sqlite3_prepare_v2(db.handle, sql, -1, &handle, null));
         return .{ .handle = handle orelse return error.SqliteError };
+    }
+
+    /// The Io pointer must outlive this connection's statements. SQLite calls
+    /// this synchronously on the executing thread, including during sorts.
+    pub fn setCancellation(db: Db, io: *const std.Io) void {
+        c.sqlite3_progress_handler(db.handle, 1000, struct {
+            fn checkCanceled(ptr: ?*anyopaque) callconv(.c) c_int {
+                const current: *const std.Io = @ptrCast(@alignCast(ptr.?));
+                current.checkCancel() catch return 1;
+                return 0;
+            }
+        }.checkCanceled, @constCast(io));
     }
 
     pub fn begin(db: Db) Error!void {
@@ -253,4 +269,35 @@ test "SQLite rejects corrupt and future databases without replacing them" {
         try db.exec("PRAGMA user_version=999");
     }
     try t.expectError(error.UnsupportedSchema, Db.open(t.allocator, t.io, root));
+}
+
+test "SQLite progress cancellation interrupts scanning and permits rollback and reuse" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const db = try Db.open(t.allocator, t.io, root);
+    defer db.close();
+    var checks: usize = 0;
+    var vtable = t.io.vtable.*;
+    vtable.checkCancel = struct {
+        fn cancel(ptr: ?*anyopaque) std.Io.Cancelable!void {
+            const n: *usize = @ptrCast(@alignCast(ptr.?));
+            n.* += 1;
+            if (n.* > 2) return error.Canceled;
+        }
+    }.cancel;
+    const io: std.Io = .{ .userdata = &checks, .vtable = &vtable };
+    db.setCancellation(&io);
+    try db.begin();
+    try t.expectError(error.Canceled, db.exec("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) INSERT INTO documents SELECT printf('%d',x),'value' FROM n"));
+    db.rollback();
+    // Reset to the real token: cancellation does not poison a connection.
+    db.setCancellation(&t.io);
+    const row = try db.prepare("SELECT count(*) FROM documents");
+    defer row.close();
+    try t.expect(try row.step());
+    try t.expectEqual(0, row.columnInt(0));
+    try t.expect(checks > 2);
 }
