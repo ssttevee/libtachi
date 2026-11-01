@@ -56,6 +56,8 @@ const Saved = struct {
 };
 
 pub const Queue = struct {
+    metrics: downloads.Metrics = .{},
+    page_limit: usize = 1,
     lock: std.atomic.Mutex = .unlocked,
     persistence_lock: Io.Mutex = .init,
     /// Serializes ownership of runner futures, including the entire join. Never
@@ -537,13 +539,13 @@ pub const Queue = struct {
         return try self.snapshotPageLocked(arena, offset, limit);
     }
 
-    pub const Activity = struct { running: bool, waiting_for_wifi: bool };
+    pub const Activity = struct { running: bool, waiting_for_wifi: bool, active: usize = 0, allowed: usize = 1, bytes: u64 = 0 };
 
     /// Nonblocking status read; null means busy. No disk access, even at startup.
     pub fn tryActivity(self: *Queue) ?Activity {
         if (!self.lock.tryLock()) return null;
         defer self.lock.unlock();
-        return .{ .running = self.runner != null and !self.runner_done and !self.paused, .waiting_for_wifi = self.waiting_for_wifi };
+        return .{ .running = self.runner != null and !self.runner_done and !self.paused, .waiting_for_wifi = self.waiting_for_wifi, .active = self.metrics.active.load(.monotonic), .allowed = self.page_limit, .bytes = self.metrics.bytes.load(.monotonic) };
     }
 
     fn snapshotPageLocked(self: *Queue, arena: std.mem.Allocator, offset: usize, limit: usize) !SnapshotPage {
@@ -614,6 +616,10 @@ pub const Queue = struct {
         };
         var scheduler: downloads.Scheduler = .init(gpa, page_limit);
         defer scheduler.deinit();
+        scheduler.metrics = &self.metrics;
+        self.acquire();
+        self.page_limit = page_limit;
+        self.lock.unlock();
         defer if (engine.options.release_jvm) engine.backend.release();
         const Workers = struct {
             queue: *Queue,

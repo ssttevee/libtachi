@@ -259,6 +259,10 @@ pub const Transfer = struct { path: []const u8, bytes: usize, network_ms: i64, d
 /// `index`. Redirects are never followed, so the planned headers (cookies
 /// included) never reach another origin.
 pub fn fetch(client: *std.http.Client, store: PageStore, index: usize, request: ImageRequest) !Transfer {
+    return fetchMeasured(client, store, index, request, null);
+}
+
+fn fetchMeasured(client: *std.http.Client, store: PageStore, index: usize, request: ImageRequest, metrics: ?*Metrics) !Transfer {
     const io = store.io;
     const started = millis(io);
     var bytes: usize = 0;
@@ -303,6 +307,7 @@ pub fn fetch(client: *std.http.Client, store: PageStore, index: usize, request: 
             return req.connection.?.getReadError() orelse error.NetworkReadFailed;
         };
         if (n == 0) break;
+        if (metrics) |m| _ = m.bytes.fetchAdd(n, .monotonic);
         if (bytes == 0) extension = imageExtension(buffer[0..n]) orelse return error.JvmImageResponse;
         if (bytes + n > max_image) return error.ImageTooLarge;
         const disk_start = millis(io);
@@ -321,6 +326,10 @@ pub fn fetch(client: *std.http.Client, store: PageStore, index: usize, request: 
 
 /// `fetch` with a deadline for the whole page.
 pub fn fetchTimed(client: *std.http.Client, store: PageStore, index: usize, request: ImageRequest, timeout: Io.Duration) !Transfer {
+    return fetchTimedMeasured(client, store, index, request, timeout, null);
+}
+
+fn fetchTimedMeasured(client: *std.http.Client, store: PageStore, index: usize, request: ImageRequest, timeout: Io.Duration, metrics: ?*Metrics) !Transfer {
     const Result = union(enum) { transfer: anyerror!Transfer, deadline: Io.Cancelable!void };
     var buffer: [2]Result = undefined;
     var select: Io.Select(Result) = .init(store.io, &buffer);
@@ -329,7 +338,7 @@ pub fn fetchTimed(client: *std.http.Client, store: PageStore, index: usize, requ
         // Spawning group tasks owns allocator bookkeeping, not page I/O.
         const protection = store.io.swapCancelProtection(.blocked);
         defer _ = store.io.swapCancelProtection(protection);
-        try select.concurrent(.transfer, fetch, .{ client, store, index, request });
+        try select.concurrent(.transfer, fetchMeasured, .{ client, store, index, request, metrics });
         try select.concurrent(.deadline, sleep, .{ store.io, timeout });
     }
     return switch (try select.await()) {
@@ -372,7 +381,13 @@ pub const mihon_retry_ms: []const u32 = &.{ 2000, 4000, 8000 };
 
 /// Shared by the queued chapters: one bound on all transfers and one rate
 /// history for requests from the same source, including chapter boundaries.
+pub const Metrics = struct {
+    active: std.atomic.Value(usize) = .init(0),
+    bytes: std.atomic.Value(u64) = .init(0),
+};
+
 pub const Scheduler = struct {
+    metrics: ?*Metrics = null,
     permits: Io.Semaphore,
     limiter: Limiter,
 
@@ -514,6 +529,12 @@ pub fn downloadChapter(raw_gpa: std.mem.Allocator, raw_arena: std.mem.Allocator,
             }
             if (ctx.options.scheduler) |scheduler| try scheduler.permits.wait(ctx.io);
             defer if (ctx.options.scheduler) |scheduler| scheduler.permits.post(ctx.io);
+            if (ctx.options.scheduler) |scheduler| if (scheduler.metrics) |m| {
+                _ = m.active.fetchAdd(1, .monotonic);
+            };
+            defer if (ctx.options.scheduler) |scheduler| if (scheduler.metrics) |m| {
+                _ = m.active.fetchSub(1, .monotonic);
+            };
             ctx.dispatched();
             var fetcher: Fetcher = .{ .gpa = ctx.gpa, .io = ctx.io, .store = page_store, .options = ctx.options, .client = ctx.client, .limiter = if (ctx.options.scheduler) |scheduler| &scheduler.limiter else ctx.limiter, .https = ctx.https };
             var stats: Stats = .{};
@@ -600,7 +621,7 @@ const Fetcher = struct {
         var reason = request.fallback orelse "unsupported URI or method";
         if (nativeEligible(request)) {
             if (std.mem.startsWith(u8, request.url, "https://")) try self.https.prepare(self.client, self.gpa, io, self.options.ca_file);
-            if (fetchTimed(self.client, self.store, i, request, self.options.page_timeout)) |transfer| {
+            if (fetchTimedMeasured(self.client, self.store, i, request, self.options.page_timeout, if (self.options.scheduler) |scheduler| scheduler.metrics else null)) |transfer| {
                 stats.native += 1;
                 return transfer;
             } else |err| switch (err) {
@@ -619,6 +640,9 @@ const Fetcher = struct {
         const bytes = try fallback.fetch(fallback.context, self.gpa, request, reason);
         defer self.gpa.free(bytes);
         if (bytes.len > max_image) return error.ImageTooLarge;
+        if (self.options.scheduler) |scheduler| if (scheduler.metrics) |m| {
+            _ = m.bytes.fetchAdd(bytes.len, .monotonic);
+        };
         const disk_start = millis(io);
         const path = try self.store.put(i, bytes);
         const transfer: Transfer = .{ .path = path, .bytes = bytes.len, .network_ms = disk_start - network_start, .disk_ms = millis(io) - disk_start };
@@ -1043,7 +1067,13 @@ test "native chapter pages establish overlapping HTTP transfers" {
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/page", .{server.socket.address.getPort()});
     var plan: [2]ImageRequest = undefined;
     for (&plan, 0..) |*request, i| request.* = .{ .page = .{ .index = @intCast(i), .url = try std.fmt.allocPrint(a, "/{d}", .{i}) }, .url = url, .method = "GET", .headers = &.{} };
-    const chapter = try downloadChapter(std.testing.allocator, a, io, &plan, .{ .dir = root, .chapter_id = "native-parallel", .parallelism = 2, .retry_ms = &.{} });
+    var metrics: Metrics = .{};
+    var scheduler: Scheduler = .init(std.testing.allocator, 2);
+    defer scheduler.deinit();
+    scheduler.metrics = &metrics;
+    const chapter = try downloadChapter(std.testing.allocator, a, io, &plan, .{ .dir = root, .chapter_id = "native-parallel", .parallelism = 2, .scheduler = &scheduler, .retry_ms = &.{} });
+    try std.testing.expectEqual(0, metrics.active.load(.monotonic));
+    try std.testing.expectEqual(24, metrics.bytes.load(.monotonic));
     try serving.await(io);
     try std.testing.expectEqual(2, chapter.stats.native);
     try std.testing.expectEqual(24, chapter.stats.bytes);
