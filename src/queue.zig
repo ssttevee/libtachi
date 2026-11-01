@@ -793,7 +793,12 @@ pub const Queue = struct {
             self.lock.unlock();
             tachi.setLastError("");
             const outcome: anyerror!void = blk: {
-                const enough = enoughSpace(engine, id) catch |err| break :blk err;
+                const enough = enoughSpace(engine, gpa, id) catch |err| break :blk err;
+                engine.io.checkCancel() catch |err| break :blk err;
+                self.acquire();
+                const stopped = self.paused;
+                self.lock.unlock();
+                if (stopped) break :blk error.Canceled;
                 if (!enough) break :blk error.NotEnoughSpace;
                 const plan_value = engine.loadQueuedPlan(job.arena.allocator(), id) catch |err| break :blk err;
                 const plan_value_ready = plan_value orelse break :blk error.MissingPagePlan;
@@ -892,8 +897,10 @@ pub const Queue = struct {
 
     /// Mihon refuses to start a chapter with less than 200 MiB free; an
     /// unknown amount doesn't stop it.
-    fn enoughSpace(engine: *Engine, chapter_id: []const u8) !bool {
-        var arena: std.heap.ArenaAllocator = .init(engine.gpa);
+    fn enoughSpace(engine: *Engine, gpa: std.mem.Allocator, chapter_id: []const u8) !bool {
+        // Use the worker's cancellation-protected allocator for deferred frees
+        // as well as allocation: diagnostic I/O must not consume cancellation.
+        var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const target = try engine.downloadTarget(arena.allocator(), chapter_id);
         var buf: [std.fs.max_path_bytes:0]u8 = undefined;
@@ -1100,7 +1107,7 @@ test "queue capacity checks preserve an unavailable SD target error" {
     var prefs: @import("settings.zig").Settings = .{};
     prefs.downloads.storage = .sd_card;
     try prefs.save(a, std.testing.io, dir);
-    try std.testing.expectError(error.StorageUnavailable, Queue.enoughSpace(&engine, "chapter"));
+    try std.testing.expectError(error.StorageUnavailable, Queue.enoughSpace(&engine, std.testing.allocator, "chapter"));
 }
 
 const PipelineFixture = struct {
