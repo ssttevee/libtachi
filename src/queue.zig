@@ -159,29 +159,43 @@ pub const Queue = struct {
     /// Loads the saved queue once; the caller holds the lock.
     fn ensureLoaded(self: *Queue, engine: *Engine) !void {
         if (self.loaded) return;
+        self.lock.unlock();
+        defer self.acquire();
+        self.persistence_lock.lockUncancelable(engine.io);
+        defer self.persistence_lock.unlock(engine.io);
+        self.acquire();
+        const already_loaded = self.loaded;
+        self.lock.unlock();
+        if (already_loaded) return;
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const saved = try loadSaved(engine, a);
         const sources = try engine.store.chapterSources(a, saved.chapters);
-        const original_len = self.items.items.len;
-        errdefer {
-            for (self.items.items[original_len..]) |item| freeItem(engine.gpa, item);
-            self.items.shrinkRetainingCapacity(original_len);
+        var restored: Queue = .{};
+        defer {
+            for (restored.items.items) |item| freeItem(engine.gpa, item);
+            restored.items.deinit(engine.gpa);
         }
         for (saved.chapters, sources) |id, source| {
-            try self.append(engine.gpa, id, source);
-            // Validate page manifests/files only when this chapter is admitted
-            // to planning or transfer, rather than for every restored entry.
+            try restored.append(engine.gpa, id, source);
             for (saved.browser_verification_required) |blocked| if (std.mem.eql(u8, id, blocked.chapter_id)) {
-                const item = &self.items.items[self.items.items.len - 1];
+                const item = &restored.items.items[restored.items.items.len - 1];
                 item.failure = try engine.gpa.dupe(u8, blocked.failure);
                 item.browser_verification_required = true;
                 item.status = .failed;
                 break;
             };
         }
-        self.loaded = true;
+        self.acquire();
+        // clear() may have published an empty queue during this read. Never
+        // replace it with restored entries. Other loaders serialize above.
+        if (!self.loaded) {
+            self.items = restored.items;
+            restored.items = .empty;
+            self.loaded = true;
+        }
+        self.lock.unlock();
     }
 
     /// Caller holds state lock on entry and return. Serialize before capturing
@@ -798,6 +812,8 @@ test "queue restoration rolls back allocation failures and remains retryable" {
             var engine: Engine = .init(gpa, std.testing.io, @import("backend.zig").none, .{ .dir = root });
             defer engine.deinit();
             defer engine.queue.deinit(&engine);
+            engine.queue.acquire();
+            defer engine.queue.lock.unlock();
             engine.queue.ensureLoaded(&engine) catch |err| {
                 try std.testing.expect(!engine.queue.loaded);
                 try std.testing.expectEqual(0, engine.queue.items.items.len);
@@ -824,6 +840,8 @@ test "queue restoration retries a corrected file after a parse failure" {
     var engine: Engine = .init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = dir });
     defer engine.deinit();
     defer engine.queue.deinit(&engine);
+    engine.queue.acquire();
+    defer engine.queue.lock.unlock();
     try t.expectError(error.UnexpectedEndOfInput, engine.queue.ensureLoaded(&engine));
     try t.expect(!engine.queue.loaded);
     try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = "{\"chapters\":[\"recovered\"]}" });
@@ -1439,4 +1457,39 @@ test "queue persistence waits outside state lock and captures newest owned snaps
     try Queue.saveRows(&db, .{ .chapters = &.{"aborted"} });
     db.rollback();
     try t.expectEqualStrings("replacement", (try Queue.loadSaved(&engine, a)).chapters[0]);
+}
+
+test "queue restore waits without state lock and honors an intervening clear publication" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(t.io, "downloads");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "downloads/queue.json", .data = "{\"chapters\":[\"old\"]}" });
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a) });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    const Loader = struct {
+        engine: *Engine,
+        started: Io.Event = .unset,
+        fn run(ctx: *@This()) !void {
+            ctx.engine.queue.acquire();
+            defer ctx.engine.queue.lock.unlock();
+            ctx.started.set(ctx.engine.io);
+            try ctx.engine.queue.ensureLoaded(ctx.engine);
+        }
+    };
+    var loader: Loader = .{ .engine = &engine };
+    engine.queue.persistence_lock.lockUncancelable(t.io);
+    var future = try t.io.concurrent(Loader.run, .{&loader});
+    try loader.started.wait(t.io);
+    engine.queue.acquire();
+    engine.queue.loaded = true; // clear's state publication
+    engine.queue.lock.unlock();
+    try t.expect(engine.queue.tryActivity() != null);
+    engine.queue.persistence_lock.unlock(t.io);
+    try future.await(t.io);
+    try t.expectEqual(0, engine.queue.items.items.len);
 }
