@@ -348,6 +348,28 @@ pub const Store = struct {
         return result;
     }
 
+    /// Zero-based rank under exactly chapterPage's filters and stable ordering.
+    /// Null for an absent or filtered-out chapter/title; copies no chapter rows.
+    pub fn chapterRank(self: *Store, a: std.mem.Allocator, manga_id: []const u8, flags: u32, downloaded_only: bool, chapter_id: []const u8) !?usize {
+        var db = try sql.open(self, a);
+        defer db.close();
+        return sql.chapterRank(&db, a, manga_id, flags, downloaded_only, chapter_id);
+    }
+
+    /// Count under chapterPage's filters, without loading a page. Missing title=0.
+    pub fn chapterTotal(self: *Store, a: std.mem.Allocator, manga_id: []const u8, flags: u32, downloaded_only: bool) !usize {
+        var db = try sql.open(self, a);
+        defer db.close();
+        return sql.chapterTotal(&db, a, manga_id, flags, downloaded_only);
+    }
+
+    /// Visible chapter aggregates without deserializing a title/chapter list.
+    pub fn titleCounts(self: *Store, a: std.mem.Allocator, manga_id: []const u8) !Counts {
+        var db = try sql.open(self, a);
+        defer db.close();
+        return @import("root_sqlite.zig").counts(&db, manga_id);
+    }
+
     /// Patches download metadata for one chapter without touching reading state,
     /// sibling chapters or title metadata. Returns whether the count changed.
     pub fn setPageCount(self: *Store, a: std.mem.Allocator, id: []const u8, count: u32) !bool {

@@ -12,21 +12,12 @@ fn parse(comptime T: type, a: A, bytes: []const u8) !T {
 }
 fn menus(comptime T: type, db: *sqlite.Db, a: A, comptime table: []const u8) ![]const T {
     var list: std.ArrayList(T) = .empty;
-    var row = try db.prepare("SELECT metadata,id FROM " ++ table ++ " ORDER BY position LIMIT 64 OFFSET ?1");
+    var row = try db.prepare("SELECT metadata,id FROM " ++ table ++ " ORDER BY position");
     defer row.close();
-    var offset: usize = 0;
-    while (true) {
-        try row.bindInt(1, @intCast(offset));
-        var n: usize = 0;
-        while (try row.step()) {
-            const value = try parse(T, a, row.columnText(0));
-            if (value.id != row.columnInt(1)) return error.SqliteCorrupt;
-            try list.append(a, value);
-            n += 1;
-        }
-        if (n < 64) break;
-        offset += n;
-        try row.reset();
+    while (try row.step()) {
+        const value = try parse(T, a, row.columnText(0));
+        if (value.id != row.columnInt(1)) return error.SqliteCorrupt;
+        try list.append(a, value);
     }
     return list.toOwnedSlice(a);
 }
@@ -85,26 +76,15 @@ pub fn chapterPreview(db: *sqlite.Db, a: A, id: []const u8) !lib.Manga {
 pub fn title(db: *sqlite.Db, a: A, id: []const u8) !lib.Manga {
     var m = try manga(db, a, id);
     var list: std.ArrayList(lib.Chapter) = .empty;
-    var row = try db.prepare("SELECT " ++ chapter_columns ++ " FROM library_chapters c LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 ORDER BY c.position LIMIT 64 OFFSET ?2");
+    var row = try db.prepare("SELECT " ++ chapter_columns ++ " FROM library_chapters c LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 ORDER BY c.position");
     defer row.close();
-    var offset: usize = 0;
-    while (true) {
-        try row.bindText(1, id);
-        try row.bindInt(2, @intCast(offset));
-        var n: usize = 0;
-        while (try row.step()) {
-            try list.append(a, try chapter(row, a));
-            n += 1;
-        }
-        if (n < 64) break;
-        offset += n;
-        try row.reset();
-    }
+    try row.bindText(1, id);
+    while (try row.step()) try list.append(a, try chapter(row, a));
     m.chapters = try list.toOwnedSlice(a);
     return m;
 }
 const visible = " NOT EXISTS(SELECT 1 FROM json_each(m.metadata,'$.excluded_scanlators') e WHERE e.value=json_extract(c.metadata,'$.scanlator'))";
-fn counts(db: *sqlite.Db, id: []const u8) !lib.Counts {
+pub fn counts(db: *sqlite.Db, id: []const u8) !lib.Counts {
     var row = try db.prepare("SELECT count(*),coalesce(sum(coalesce(r.read,0)),0),coalesce(sum(coalesce(r.bookmark,0)),0),coalesce(sum(coalesce(json_array_length(c.metadata,'$.pages'),0)>0),0),coalesce(max(json_extract(c.metadata,'$.date_upload')),0),coalesce(max(json_extract(c.metadata,'$.date_fetch')),0),coalesce(max(r.last_read),0) FROM library_chapters c JOIN library_manga m ON m.id=c.manga_id LEFT JOIN library_reading r ON r.id=c.id WHERE m.id=?1 AND" ++ visible);
     defer row.close();
     try row.bindText(1, id);
@@ -148,24 +128,30 @@ pub fn page(db: *sqlite.Db, a: A, o: lib.RootOptions) !lib.RootPage {
         try insert.bindInt(1, o.category_id);
         _ = try insert.step();
     }
-    var scan = try db.prepare("SELECT id FROM library_manga ORDER BY position LIMIT 64 OFFSET ?1");
+    var scan = try db.prepare("SELECT id FROM library_manga WHERE (?1!=0 OR (coalesce(json_extract(metadata,'$.favorite'),1)!=0 AND ((?2=0 AND coalesce(json_array_length(metadata,'$.categories'),0)=0) OR EXISTS(SELECT 1 FROM json_each(metadata,'$.categories') WHERE value=?2)))) AND (?1 NOT IN(2,3) OR coalesce(json_extract(metadata,'$.favorite'),1)!=0) ORDER BY position");
     defer scan.close();
-    var scan_offset: usize = 0;
+    try scan.bindInt(1, switch (o.kind) {
+        .library => 0,
+        .history => 1,
+        .updates => 2,
+        .upcoming => 3,
+    });
+    try scan.bindInt(2, o.category_id);
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const matcher = try views.searchWithScratch(a, sa, result, o.query, 0);
     var rank: i64 = 0;
-    while (!direct) {
-        try scan.bindInt(1, @intCast(scan_offset));
-        var n: usize = 0;
+    if (!direct) {
         while (try scan.step()) {
-            n += 1;
-            var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-            defer scratch.deinit();
-            const sa = scratch.allocator();
+            _ = scratch.reset(.retain_capacity);
             const m = try manga(db, sa, scan.columnText(0));
-            const c = try counts(db, m.id);
+            var c: lib.Counts = .{};
             if (o.kind == .library) {
                 if (!m.favorite or (if (m.categories.len == 0) o.category_id != 0 else std.mem.indexOfScalar(u32, m.categories, o.category_id) == null)) continue;
+                c = try counts(db, m.id);
                 if (!views.libraryPasses(m, c, opts)) continue;
-                if (try views.search(sa, result, o.query, 0)) |matcher| if (!matcher.matches(matcher.context, &m, c)) continue;
+                if (matcher) |match| if (!match.matches(match.context, &m, c)) continue;
             }
             if (o.kind == .upcoming) {
                 if (!m.favorite or (m.status() != 1 and m.status() != 4) or m.next_update == 0 or m.next_update < views.dayStart(o.now, 0)) continue;
@@ -174,17 +160,13 @@ pub fn page(db: *sqlite.Db, a: A, o: lib.RootOptions) !lib.RootPage {
             if (o.kind == .history and o.query.len > 0 and std.ascii.findIgnoreCase(m.title, o.query) == null) continue;
             if (o.kind == .updates and (!m.favorite or !settings.categoryAllowed(m.categories, o.settings.updates.categories, o.settings.updates.exclude_categories))) continue;
             if (o.kind == .history or o.kind == .updates) {
-                var chapters = try db.prepare("SELECT c.id,coalesce(r.read,0),coalesce(r.bookmark,0),coalesce(r.page,0),coalesce(r.last_read,0),coalesce(json_extract(c.metadata,'$.date_fetch'),0),coalesce(json_extract(c.metadata,'$.date_upload'),0),json_extract(c.metadata,'$.scanlator'),coalesce(json_array_length(c.metadata,'$.pages'),0) FROM library_chapters c LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 AND (?2=0 OR coalesce(r.last_read,0)!=0) ORDER BY CASE WHEN ?2=1 THEN r.last_read ELSE json_extract(c.metadata,'$.date_fetch') END DESC,c.position LIMIT ?3 OFFSET ?4");
+                var chapters = try db.prepare("SELECT c.id,coalesce(r.read,0),coalesce(r.bookmark,0),coalesce(r.page,0),coalesce(r.last_read,0),coalesce(json_extract(c.metadata,'$.date_fetch'),0),coalesce(json_extract(c.metadata,'$.date_upload'),0),json_extract(c.metadata,'$.scanlator'),coalesce(json_array_length(c.metadata,'$.pages'),0) FROM library_chapters c LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 AND (?2=0 OR coalesce(r.last_read,0)!=0) ORDER BY CASE WHEN ?2=1 THEN r.last_read ELSE json_extract(c.metadata,'$.date_fetch') END DESC,c.position LIMIT ?3");
                 defer chapters.close();
-                var off: usize = 0;
-                while (true) {
+                {
                     try chapters.bindText(1, m.id);
                     try chapters.bindInt(2, @intFromBool(o.kind == .history));
-                    try chapters.bindInt(3, if (o.kind == .history) 1 else 64);
-                    try chapters.bindInt(4, @intCast(off));
-                    var cn: usize = 0;
+                    try chapters.bindInt(3, if (o.kind == .history) 1 else -1);
                     while (try chapters.step()) {
-                        cn += 1;
                         const ch: lib.Chapter = .{
                             .id = chapters.columnText(0),
                             .title = "",
@@ -215,9 +197,6 @@ pub fn page(db: *sqlite.Db, a: A, o: lib.RootOptions) !lib.RootPage {
                         try add.reset();
                         rank += 1;
                     }
-                    if (o.kind == .history or cn < 64) break;
-                    off += cn;
-                    try chapters.reset();
                 }
             } else {
                 const key: i64 = if (o.kind == .upcoming) m.next_update else switch (sort.mode) {
@@ -241,9 +220,6 @@ pub fn page(db: *sqlite.Db, a: A, o: lib.RootOptions) !lib.RootPage {
                 rank += 1;
             }
         }
-        if (n < 64) break;
-        scan_offset += n;
-        try scan.reset();
     }
     if (o.kind == .updates) {
         try db.exec("DELETE FROM root_candidates WHERE rank NOT IN(SELECT rank FROM root_candidates ORDER BY key DESC,rank LIMIT 500)");

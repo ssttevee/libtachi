@@ -345,6 +345,12 @@ pub fn libraryOptions(arena: std.mem.Allocator, lib: Library, s: settings.Settin
 /// A matcher for Mihon's library search syntax (see `query`); null for
 /// empty text, which matches everything.
 pub fn search(arena: std.mem.Allocator, lib: Library, text: []const u8, utc_offset_s: i32) !?Matcher {
+    return searchWithScratch(arena, arena, lib, text, utc_offset_s);
+}
+
+/// The compiled query belongs to arena; per-match genre parsing uses scratch.
+/// A caller scanning titles may reset scratch after each match.
+pub fn searchWithScratch(arena: std.mem.Allocator, scratch: std.mem.Allocator, lib: Library, text: []const u8, utc_offset_s: i32) !?Matcher {
     if (std.mem.trim(u8, text, " \t\r\n,").len == 0) return null;
     const Search = struct {
         query: query.Query,
@@ -384,7 +390,7 @@ pub fn search(arena: std.mem.Allocator, lib: Library, text: []const u8, utc_offs
         }
     };
     const context = try arena.create(Search);
-    context.* = .{ .query = try query.parse(arena, text), .sources = lib.sources, .utc_offset_s = utc_offset_s, .arena = arena };
+    context.* = .{ .query = try query.parse(arena, text), .sources = lib.sources, .utc_offset_s = utc_offset_s, .arena = scratch };
     return .{ .context = @ptrCast(context), .matches = Search.matches };
 }
 

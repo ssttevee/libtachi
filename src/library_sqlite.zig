@@ -72,23 +72,52 @@ pub fn load(db: *sqlite.Db, arena: std.mem.Allocator) !lib.Library {
     const root = @import("root_sqlite.zig");
     var result = try root.metadata(db, arena);
     var titles: std.ArrayList(lib.Manga) = .empty;
-    var rows = try db.prepare("SELECT id FROM library_manga ORDER BY position LIMIT 64 OFFSET ?1");
+    var rows = try db.prepare("SELECT id FROM library_manga ORDER BY position");
     defer rows.close();
-    var offset: usize = 0;
-    while (true) {
-        try rows.bindInt(1, @intCast(offset));
-        var n: usize = 0;
-        while (try rows.step()) {
-            try titles.append(arena, try root.title(db, arena, rows.columnText(0)));
-            n += 1;
-        }
-        if (n < 64) break;
-        offset += n;
-        try rows.reset();
-    }
+    while (try rows.step()) try titles.append(arena, try root.title(db, arena, rows.columnText(0)));
     result.manga = try titles.toOwnedSlice(arena);
     try lib.validate(arena, result);
     return result;
+}
+
+const chapter_predicate = " FROM library_chapters c JOIN library_manga m ON m.id=c.manga_id LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 AND (?2=0 OR (coalesce(r.read,0)=0)= (?2=1)) AND (?3=0 OR (coalesce(r.bookmark,0)!=0)= (?3=1)) AND (?4=0 OR (json_extract(m.metadata,'$.source_id') IS NULL OR coalesce(json_array_length(c.metadata,'$.pages'),0)>0)= (?4=1)) AND NOT EXISTS (SELECT 1 FROM json_each(m.metadata,'$.excluded_scanlators') e WHERE e.value=json_extract(c.metadata,'$.scanlator'))";
+fn chapterOrder(bits: u32) []const u8 {
+    const flags = @import("views.zig").ChapterFlags.decode(bits);
+    return switch (flags.sort) {
+        .source => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.source_order'),0) DESC" else "coalesce(json_extract(c.metadata,'$.source_order'),0) ASC",
+        .number => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.number'),-1) ASC" else "coalesce(json_extract(c.metadata,'$.number'),-1) DESC",
+        .upload => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.date_upload'),0) ASC" else "coalesce(json_extract(c.metadata,'$.date_upload'),0) DESC",
+        .alphabetical => if (flags.ascending) "json_extract(c.metadata,'$.title') COLLATE NOCASE ASC" else "json_extract(c.metadata,'$.title') COLLATE NOCASE DESC",
+    };
+}
+
+fn bindChapterFilter(stmt: sqlite.Stmt, manga_id: []const u8, bits: u32, downloaded_only: bool) !void {
+    const flags = @import("views.zig").ChapterFlags.decode(bits);
+    const downloaded = if (downloaded_only) @import("views.zig").TriState.include else flags.downloaded;
+    try stmt.bindText(1, manga_id);
+    for ([_]@import("views.zig").TriState{ flags.unread, flags.bookmarked, downloaded }, 2..) |filter, i| {
+        try stmt.bindInt(@intCast(i), switch (filter) {
+            .disabled => 0,
+            .include => 1,
+            .exclude => 2,
+        });
+    }
+}
+
+pub fn chapterRank(db: *sqlite.Db, a: std.mem.Allocator, manga_id: []const u8, bits: u32, downloaded_only: bool, chapter_id: []const u8) !?usize {
+    var row = try db.prepare(try std.fmt.allocPrintSentinel(a, "SELECT rank FROM (SELECT c.id,row_number() OVER(ORDER BY {s},c.position ASC)-1 AS rank{s}) WHERE id=?5", .{ chapterOrder(bits), chapter_predicate }, 0));
+    defer row.close();
+    try bindChapterFilter(row, manga_id, bits, downloaded_only);
+    try row.bindText(5, chapter_id);
+    return if (try row.step()) @intCast(row.columnInt(0)) else null;
+}
+
+pub fn chapterTotal(db: *sqlite.Db, a: std.mem.Allocator, manga_id: []const u8, bits: u32, downloaded_only: bool) !usize {
+    var row = try db.prepare(try std.fmt.allocPrintSentinel(a, "SELECT count(*){s}", .{chapter_predicate}, 0));
+    defer row.close();
+    try bindChapterFilter(row, manga_id, bits, downloaded_only);
+    _ = try row.step();
+    return @intCast(row.columnInt(0));
 }
 
 /// Predicates are identical for COUNT and page, including reading overlays and
@@ -98,37 +127,13 @@ pub fn chapterPage(db: *sqlite.Db, arena: std.mem.Allocator, manga_id: []const u
     defer exists.close();
     try exists.bindText(1, manga_id);
     if (!try exists.step()) return error.UnknownManga;
-    const flags = @import("views.zig").ChapterFlags.decode(bits);
-    const downloaded = if (downloaded_only) @import("views.zig").TriState.include else flags.downloaded;
-    const predicate = " FROM library_chapters c JOIN library_manga m ON m.id=c.manga_id LEFT JOIN library_reading r ON r.id=c.id WHERE c.manga_id=?1 AND (?2=0 OR (coalesce(r.read,0)=0)= (?2=1)) AND (?3=0 OR (coalesce(r.bookmark,0)!=0)= (?3=1)) AND (?4=0 OR (json_extract(m.metadata,'$.source_id') IS NULL OR coalesce(json_array_length(c.metadata,'$.pages'),0)>0)= (?4=1)) AND NOT EXISTS (SELECT 1 FROM json_each(m.metadata,'$.excluded_scanlators') e WHERE e.value=json_extract(c.metadata,'$.scanlator'))";
-    const order = switch (flags.sort) {
-        .source => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.source_order'),0) DESC" else "coalesce(json_extract(c.metadata,'$.source_order'),0) ASC",
-        .number => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.number'),-1) ASC" else "coalesce(json_extract(c.metadata,'$.number'),-1) DESC",
-        .upload => if (flags.ascending) "coalesce(json_extract(c.metadata,'$.date_upload'),0) ASC" else "coalesce(json_extract(c.metadata,'$.date_upload'),0) DESC",
-        .alphabetical => if (flags.ascending) "json_extract(c.metadata,'$.title') COLLATE NOCASE ASC" else "json_extract(c.metadata,'$.title') COLLATE NOCASE DESC",
-    };
+    const predicate = chapter_predicate;
+    const order = chapterOrder(bits);
     var count = try db.prepare(try std.fmt.allocPrintSentinel(arena, "SELECT count(*){s}", .{predicate}, 0));
     defer count.close();
     var rows = try db.prepare(try std.fmt.allocPrintSentinel(arena, "SELECT c.id,c.position{s} ORDER BY {s},c.position ASC LIMIT ?5 OFFSET ?6", .{ predicate, order }, 0));
     defer rows.close();
-    for ([_]sqlite.Stmt{ count, rows }) |stmt| {
-        try stmt.bindText(1, manga_id);
-        try stmt.bindInt(2, switch (flags.unread) {
-            .disabled => 0,
-            .include => 1,
-            .exclude => 2,
-        });
-        try stmt.bindInt(3, switch (flags.bookmarked) {
-            .disabled => 0,
-            .include => 1,
-            .exclude => 2,
-        });
-        try stmt.bindInt(4, switch (downloaded) {
-            .disabled => 0,
-            .include => 1,
-            .exclude => 2,
-        });
-    }
+    for ([_]sqlite.Stmt{ count, rows }) |stmt| try bindChapterFilter(stmt, manga_id, bits, downloaded_only);
     _ = try count.step();
     const total: usize = @intCast(count.columnInt(0));
     try rows.bindInt(5, @intCast(limit));
@@ -504,6 +509,8 @@ test "large chapter SQL pages bound returned IDs and preserve view order and fil
                 // Page two must select the same stable IDs as the reference view.
                 const page = try store.chapterPage(a, "m", manga.chapter_flags, false, 31, 31);
                 try t.expectEqual(expected.len, page.total);
+                try t.expectEqual(page.total, try store.chapterTotal(a, "m", manga.chapter_flags, false));
+                try t.expectEqual(@as(?usize, 31), try store.chapterRank(a, "m", manga.chapter_flags, false, page.entries[0].id));
                 try t.expectEqual(31, page.entries.len);
                 for (page.entries, 31..) |entry, row| {
                     try t.expectEqualStrings(expected[row].id, entry.id);
@@ -521,6 +528,13 @@ test "large chapter SQL pages bound returned IDs and preserve view order and fil
     try t.expect(bounded_page.total > 8000);
     try t.expectError(error.InvalidPageSize, store.chapterPage(a, "m", 0, false, 0, 10000));
     try t.expectEqual(0, (try store.chapterPage(a, "m", 0, true, 0, 31)).total);
+    try t.expectEqual(null, try store.chapterRank(a, "m", 0, true, chapters[0].id));
+    try t.expectEqual(null, try store.chapterRank(a, "missing", 0, false, chapters[0].id));
+    try t.expectEqual(0, try store.chapterTotal(a, "missing", 0, false));
+    const before = try store.chapterRank(a, "m", 0, false, chapters[2].id);
+    try store.putReading(a, &.{.{ .id = chapters[2].id, .read = true, .bookmark = true }});
+    try t.expectEqual(before, try store.chapterRank(a, "m", 0, false, chapters[2].id));
+    try t.expect((try store.titleCounts(a, "m")).bookmarked > 0);
     {
         var guard = try open(&store, a);
         defer guard.close();
