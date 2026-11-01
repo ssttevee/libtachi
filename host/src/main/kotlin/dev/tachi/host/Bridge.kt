@@ -113,13 +113,29 @@ object Bridge {
                 if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
                 source.getImage(page).use { response ->
                     // Thread-local JNI metadata belongs to the calling thread, not Dispatchers.IO.
-                    Pair(response.body.bytes(), response.body.contentType()?.toString() ?: response.header("Content-Type"))
+                    Pair(readImageBounded(response.body), response.body.contentType()?.toString() ?: response.header("Content-Type"))
                 }
             }.let { (bytes, mime) -> lastMime.set(mime); bytes }
         } catch (t: Throwable) {
             lastError.set(json.encodeToString(ErrorDto.serializer(), t.toErrorDto()).toByteArray())
             null
         }
+    }
+
+    /** Same cap as the native downloader, applied while consuming decoded data. */
+    internal fun readImageBounded(body: okhttp3.ResponseBody, limit: Int = 16 * 1024 * 1024): ByteArray = body.use {
+        require(limit >= 0)
+        val declared = body.contentLength()
+        if (declared > limit) throw java.io.IOException("Image exceeds $limit bytes")
+        val buffer = okio.Buffer()
+        val source = body.source()
+        while (true) {
+            val n = source.read(buffer, minOf(8192L, limit.toLong() - buffer.size + 1))
+            if (n == -1L) break
+            if (buffer.size > limit) throw java.io.IOException("Image exceeds $limit bytes")
+        }
+        if (declared >= 0 && declared != buffer.size) throw java.io.IOException("Image content length mismatch")
+        buffer.readByteArray()
     }
 
     @JvmStatic

@@ -9,6 +9,7 @@ import kotlinx.coroutines.runBlocking
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.buffer
 import java.nio.file.Files
 import java.io.File
 import java.util.concurrent.Semaphore
@@ -84,9 +85,43 @@ object ImageRequestsTest {
         println("PASS: browser challenge errors retain typed code through wrappers and JSON")
     }
 
+    private fun verifyBoundedImages() {
+        class StreamingBody(val declared: Long, val available: Long) : ResponseBody() {
+            var consumed = 0L
+            var closed = false
+            private val input = object : okio.Source {
+                override fun read(sink: okio.Buffer, byteCount: Long): Long {
+                    if (consumed == available) return -1
+                    val n = minOf(byteCount, available - consumed).toInt()
+                    sink.write(ByteArray(n))
+                    consumed += n
+                    return n.toLong()
+                }
+                override fun timeout() = okio.Timeout.NONE
+                override fun close() { closed = true }
+            }.buffer()
+            override fun contentType(): MediaType? = null
+            override fun contentLength() = declared
+            override fun source() = input
+        }
+        val oversized = StreamingBody(1000, 1000)
+        check(runCatching { Bridge.readImageBounded(oversized, 32) }.exceptionOrNull() is java.io.IOException)
+        check(oversized.closed && oversized.consumed == 0L)
+        val unknown = StreamingBody(-1, Long.MAX_VALUE)
+        check(runCatching { Bridge.readImageBounded(unknown, 32) }.exceptionOrNull() is java.io.IOException)
+        check(unknown.closed && unknown.consumed <= 8192)
+        val exact = StreamingBody(32, 32)
+        check(Bridge.readImageBounded(exact, 32).size == 32 && exact.closed)
+        val short = StreamingBody(32, 7)
+        check(runCatching { Bridge.readImageBounded(short, 32) }.exceptionOrNull() is java.io.IOException)
+        check(short.closed)
+        println("PASS: bounded image reads reject known/unknown oversize, close bodies and detect truncation")
+    }
+
     @JvmStatic fun main(args: Array<String>) {
         TachiRuntime.init(RuntimeConfig(dataDir = Files.createTempDirectory("tachi-plan-").toString()))
         verifyBrowserChallengeErrors()
+        verifyBoundedImages()
         val base = TachiRuntime.network.client
         native(plan(base))
         val jar = object : CookieJar {

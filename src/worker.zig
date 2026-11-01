@@ -76,6 +76,7 @@ pub const WireReply = struct {
             @field(wire, name) = @field(value, name);
         }
         wire.image_base64 = if (value.image) |bytes| blk: {
+            if (bytes.len > @import("downloads.zig").max_image) return error.ImageTooLarge;
             const encoder = std.base64.standard.Encoder;
             break :blk encoder.encode(try arena.alloc(u8, encoder.calcSize(bytes.len)), bytes);
         } else null;
@@ -90,7 +91,9 @@ pub const WireReply = struct {
         }
         out.image = if (self.image_base64) |encoded| blk: {
             const decoder = std.base64.standard.Decoder;
-            const bytes = try arena.alloc(u8, try decoder.calcSizeForSlice(encoded));
+            const size = try decoder.calcSizeForSlice(encoded);
+            if (size > @import("downloads.zig").max_image) return error.ImageTooLarge;
+            const bytes = try arena.alloc(u8, size);
             try decoder.decode(bytes, encoded);
             break :blk bytes;
         } else null;
@@ -796,4 +799,13 @@ test "parallel search requests and partial results survive worker framing" {
     try std.testing.expectEqual(.search_result, parsed.kind);
     try std.testing.expectEqual(2, parsed.search_result.?.source);
     try std.testing.expectEqualStrings("Two", parsed.search_result.?.mangas[0].title);
+}
+
+test "worker rejects oversized images before allocating base64" {
+    const t = std.testing;
+    const image = try t.allocator.alloc(u8, @import("downloads.zig").max_image + 1);
+    defer t.allocator.free(image);
+    var buffer: [1]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    try t.expectError(error.ImageTooLarge, WireReply.from(bounded.allocator(), .{ .image = image }));
 }
