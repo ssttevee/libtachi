@@ -85,7 +85,7 @@ pub const Settings = struct {
         /// Sources downloading at once (`download_parallel_source_limit`).
         parallel_sources: u8 = 5,
         /// Pages downloading at once per source (`download_parallel_page_limit`).
-        parallel_pages: u8 = 5,
+        parallel_pages: u31 = 5,
         /// Mihon's downloads layout names for import and export
         /// (`disallow_non_ascii_filenames`, `pref_enable_chapter_name_hash`).
         disallow_non_ascii_filenames: bool = false,

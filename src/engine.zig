@@ -185,6 +185,8 @@ pub const Options = struct {
     dir: []const u8,
     /// Maximum independent operations per search, chapter or bulk I/O loop.
     parallelism: usize = parallel.default_limit,
+    /// Optional independent cap for page downloads; null inherits parallelism.
+    download_parallelism: ?usize = null,
     /// PEM roots for native downloads; null uses the system's.
     ca_file: ?[]const u8 = null,
     /// Let a worker backend exit while a chapter downloads natively, and after.
@@ -695,7 +697,7 @@ pub const Engine = struct {
 
     pub fn pageParallelism(self: *Engine, a: std.mem.Allocator) !usize {
         const s = try self.loadSettings(a);
-        return @min(@max(1, self.options.parallelism), @max(1, s.downloads.parallel_pages));
+        return @min(@max(1, self.options.download_parallelism orelse self.options.parallelism), @max(1, s.downloads.parallel_pages));
     }
 
     fn readChapter(self: *Engine, job: *Job, chapter_id: []const u8, start: u32) !void {
@@ -4423,4 +4425,20 @@ test "resumable reader completion retries deletion and tracking without replayin
     try engine.leaveReader();
     try t.expect(!(try engine.loadLibrary(a)).manga[0].chapters[0].downloaded());
     try t.expectError(error.FileNotFound, tmp.dir.access(io, "downloads/c/p.png", .{}));
+}
+
+test "independent download cap persists thread counts above 255" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var engine: Engine = .init(t.allocator, t.io, be.none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a), .download_parallelism = std.math.maxInt(u31) });
+    defer engine.deinit();
+    var s: settings.Settings = .{};
+    s.downloads.parallel_pages = 1000;
+    try engine.saveSettings(s);
+    try t.expectEqual(1000, try engine.pageParallelism(a));
+    try t.expectEqual(parallel.default_limit, engine.options.parallelism);
 }

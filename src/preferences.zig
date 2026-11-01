@@ -328,7 +328,7 @@ fn applyOne(a: std.mem.Allocator, s: *Settings, p: Preference, categories: []con
     } else if (eql(u8, key, "download_parallel_source_limit")) {
         if (v == .int) s.downloads.parallel_sources = std.math.cast(u8, v.int) orelse s.downloads.parallel_sources;
     } else if (eql(u8, key, "download_parallel_page_limit")) {
-        if (v == .int) s.downloads.parallel_pages = std.math.cast(u8, v.int) orelse s.downloads.parallel_pages;
+        if (v == .int) s.downloads.parallel_pages = std.math.cast(u31, v.int) orelse s.downloads.parallel_pages;
     } else if (eql(u8, key, "auto_download_while_reading")) {
         if (v == .int) s.downloads.ahead = std.math.cast(u8, v.int) orelse 0;
     } else if (eql(u8, key, "disallow_non_ascii_filenames")) {
