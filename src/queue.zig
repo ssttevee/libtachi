@@ -170,15 +170,8 @@ pub const Queue = struct {
         }
         for (saved.chapters, sources) |id, source| {
             try self.append(engine.gpa, id, source);
-            const progress = engine.downloadProgress(a, id) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => null,
-            };
-            if (progress) |saved_pages| {
-                const item = &self.items.items[self.items.items.len - 1];
-                item.pages_done = saved_pages.done;
-                item.pages_total = saved_pages.total;
-            }
+            // Validate page manifests/files only when this chapter is admitted
+            // to planning or transfer, rather than for every restored entry.
             for (saved.browser_verification_required) |blocked| if (std.mem.eql(u8, id, blocked.chapter_id)) {
                 const item = &self.items.items[self.items.items.len - 1];
                 item.failure = try engine.gpa.dupe(u8, blocked.failure);
@@ -389,6 +382,29 @@ pub const Queue = struct {
         self.acquire();
         defer self.lock.unlock();
         try self.ensureLoaded(engine);
+        return self.snapshotPageLocked(arena, offset, limit);
+    }
+
+    /// Nonblocking UI poll. Null means busy or not yet restored; keep the last
+    /// view and retry later. Does no I/O and copies all strings to the caller.
+    pub fn trySnapshotPage(self: *Queue, arena: std.mem.Allocator, offset: usize, limit: usize) !?SnapshotPage {
+        if (limit == 0 or limit > 256) return error.InvalidPageSize;
+        if (!self.lock.tryLock()) return null;
+        defer self.lock.unlock();
+        if (!self.loaded) return null;
+        return try self.snapshotPageLocked(arena, offset, limit);
+    }
+
+    pub const Activity = struct { running: bool, waiting_for_wifi: bool };
+
+    /// Nonblocking status read; null means busy. No disk access, even at startup.
+    pub fn tryActivity(self: *Queue) ?Activity {
+        if (!self.lock.tryLock()) return null;
+        defer self.lock.unlock();
+        return .{ .running = self.runner != null and !self.runner_done and !self.paused, .waiting_for_wifi = self.waiting_for_wifi };
+    }
+
+    fn snapshotPageLocked(self: *Queue, arena: std.mem.Allocator, offset: usize, limit: usize) !SnapshotPage {
         const total = self.items.items.len;
         const base = if (total == 0) 0 else @min(offset / limit, (total - 1) / limit) * limit;
         const out = try arena.alloc(Entry, @min(limit, total - base));
@@ -1331,4 +1347,29 @@ test "cold queue restore resolves sources without loading unrelated library meta
     try std.testing.expectEqual(42, engine.queue.items.items[0].source);
     const sources = try engine.store.chapterSources(a, &.{ "c", "other", "missing" });
     try std.testing.expectEqualSlices(i64, &.{ 42, 0, 0 }, sources);
+}
+
+test "nonblocking queue polls return busy and own copied identity and failure" {
+    const t = std.testing;
+    var queue: Queue = .{};
+    defer {
+        for (queue.items.items) |item| Queue.freeItem(t.allocator, item);
+        queue.items.deinit(t.allocator);
+    }
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqual(null, try queue.trySnapshotPage(a, 0, 6));
+    queue.loaded = true;
+    queue.acquire();
+    try t.expectEqual(null, try queue.trySnapshotPage(a, 0, 6));
+    try t.expectEqual(null, queue.tryActivity());
+    queue.lock.unlock();
+    try queue.append(t.allocator, "owned", 1);
+    queue.items.items[0].failure = try t.allocator.dupe(u8, "failure");
+    const page = (try queue.trySnapshotPage(a, 0, 6)).?;
+    Queue.freeItem(t.allocator, queue.items.orderedRemove(0));
+    try t.expectEqualStrings("owned", page.entries[0].chapter_id);
+    try t.expectEqualStrings("failure", page.entries[0].failure.?);
+    try t.expect(!queue.tryActivity().?.running);
 }
