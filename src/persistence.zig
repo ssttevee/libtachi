@@ -8,19 +8,20 @@ const models = @import("tachicore").models;
 pub fn load(comptime T: type, gpa: std.mem.Allocator, io: Io, dir: []const u8, key: []const u8, legacy_relative: []const u8) !?T {
     var db = try sqlite.Db.open(gpa, io, dir);
     defer db.close();
-    try db.begin();
+    // Reads of migrated documents need only a shared snapshot. A deferred
+    // transaction must end before acquiring the migration write reservation.
+    try db.exec("BEGIN");
     errdefer db.rollback();
-    const query = try db.prepare("SELECT value FROM documents WHERE key=?1");
-    defer query.close();
-    try query.bindText(1, key);
-    if (try query.step()) {
-        const result = try std.json.parseFromSliceLeaky(T, gpa, query.columnText(0), models.parse_options);
+    if (try existing(T, &db, gpa, key)) |result| {
         try db.commit();
-        return result;
+        return result.value;
     }
-    if (try migrated(&db, key)) {
+    try db.commit();
+    try db.begin();
+    // Another connection may have imported, saved or removed it meanwhile.
+    if (try existing(T, &db, gpa, key)) |result| {
         try db.commit();
-        return null;
+        return result.value;
     }
     const path = try std.fs.path.join(gpa, &.{ dir, legacy_relative });
     defer gpa.free(path);
@@ -39,6 +40,15 @@ pub fn load(comptime T: type, gpa: std.mem.Allocator, io: Io, dir: []const u8, k
     try markMigrated(&db, key);
     try db.commit();
     return value;
+}
+
+fn existing(comptime T: type, db: *sqlite.Db, a: std.mem.Allocator, key: []const u8) !?struct { value: ?T } {
+    const query = try db.prepare("SELECT value FROM documents WHERE key=?1");
+    defer query.close();
+    try query.bindText(1, key);
+    if (try query.step()) return .{ .value = try std.json.parseFromSliceLeaky(T, a, query.columnText(0), models.parse_options) };
+    if (try migrated(db, key)) return .{ .value = null };
+    return null;
 }
 
 pub fn save(gpa: std.mem.Allocator, io: Io, dir: []const u8, key: []const u8, value: anytype) !void {
@@ -144,4 +154,24 @@ test "invalid legacy documents remain retryable and absent documents stay absent
     try t.expectEqual(null, try load(Value, a, t.io, dir, "absent", "missing.json"));
     try save(a, t.io, dir, "absent", Value{ .count = 3 });
     try t.expectEqual(3, (try load(Value, a, t.io, dir, "absent", "missing.json")).?.count);
+}
+
+test "migrated document reads do not reserve the writer" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const Value = struct { count: u32 };
+    try save(a, t.io, dir, "present", Value{ .count = 7 });
+    try remove(a, t.io, dir, "absent");
+    const writer = try sqlite.Db.open(a, t.io, dir);
+    defer writer.close();
+    try writer.begin();
+    defer writer.rollback();
+    try writer.exec("UPDATE documents SET value='{\"count\":8}' WHERE key='present'");
+    try t.expectEqual(7, (try load(Value, a, t.io, dir, "present", "unused")).?.count);
+    try t.expectEqual(null, try load(Value, a, t.io, dir, "absent", "unused"));
 }
