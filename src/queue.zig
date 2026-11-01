@@ -57,6 +57,7 @@ const Saved = struct {
 
 pub const Queue = struct {
     lock: std.atomic.Mutex = .unlocked,
+    persistence_lock: Io.Mutex = .init,
     items: std.ArrayList(Item) = .empty,
     loaded: bool = false,
     paused: bool = true,
@@ -183,17 +184,32 @@ pub const Queue = struct {
         self.loaded = true;
     }
 
-    /// Saves the queue; the caller holds the lock.
+    /// Caller holds state lock on entry and return. Serialize before capturing
+    /// an owning snapshot of the latest state; no older writer can commit last.
     fn persist(self: *Queue, engine: *Engine) !void {
+        self.lock.unlock();
+        // Uncancelable: queue membership changes must reach their durable save.
+        self.persistence_lock.lockUncancelable(engine.io);
+        self.acquire();
+        // Release persistence ordering before reacquiring state, to avoid a
+        // cycle with a later writer waiting for persistence without state.
+        var state_held = true;
+        defer {
+            if (state_held) self.lock.unlock();
+            self.persistence_lock.unlock(engine.io);
+            self.acquire();
+        }
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const ids = try a.alloc([]const u8, self.items.items.len);
-        for (self.items.items, ids) |item, *id| id.* = item.chapter_id;
+        for (self.items.items, ids) |item, *id| id.* = try a.dupe(u8, item.chapter_id);
         var blocked: std.ArrayList(Blocked) = .empty;
         for (self.items.items) |item| if (item.browser_verification_required) {
-            try blocked.append(a, .{ .chapter_id = item.chapter_id, .failure = item.failure orelse "BrowserVerificationRequired" });
+            try blocked.append(a, .{ .chapter_id = try a.dupe(u8, item.chapter_id), .failure = try a.dupe(u8, item.failure orelse "BrowserVerificationRequired") });
         };
+        state_held = false;
+        self.lock.unlock();
         var db = try openDatabase(engine);
         defer db.close();
         try db.begin();
@@ -646,6 +662,12 @@ pub const Queue = struct {
     }
 
     fn finish(self: *Queue, engine: *Engine, id: []const u8, job: *Job, outcome: anyerror!void, planning: bool) void {
+        // The job remains owned by this worker until finish returns. Removing
+        // an active item first joins the runner, so validation can run unlocked.
+        const saved_progress = engine.downloadProgress(job.arena.allocator(), id) catch null;
+        if (!planning) if (outcome) |_| {
+            engine.discardQueuedPlan(job.arena.allocator(), id) catch |err| log.warn("page plan not removed: {s}", .{@errorName(err)});
+        } else |_| {};
         self.acquire();
         defer self.lock.unlock();
         defer self.notify(engine.io);
@@ -659,7 +681,7 @@ pub const Queue = struct {
         item.pages_total = job.pages_total.load(.acquire);
         // Cancellation may happen after atomic page publication but before
         // the progress callback. The filesystem is the resumability authority.
-        if (!planning) if (engine.downloadProgress(job.arena.allocator(), id) catch null) |progress| {
+        if (!planning) if (saved_progress) |progress| {
             item.pages_done = progress.done;
             item.pages_total = progress.total;
         };
@@ -667,12 +689,11 @@ pub const Queue = struct {
             if (planning) {
                 item.prepared = true;
                 item.status = .queued;
-                if (engine.downloadProgress(job.arena.allocator(), id) catch null) |progress| {
+                if (saved_progress) |progress| {
                     item.pages_done = progress.done;
                     item.pages_total = progress.total;
                 }
             } else {
-                engine.discardQueuedPlan(job.arena.allocator(), id) catch |err| log.warn("page plan not removed: {s}", .{@errorName(err)});
                 freeItem(engine.gpa, self.items.orderedRemove(i));
                 self.persist(engine) catch |err| log.warn("download queue not saved: {s}", .{@errorName(err)});
             }
@@ -689,8 +710,8 @@ pub const Queue = struct {
                 else
                     engine.gpa.dupe(u8, @errorName(err))) catch null;
                 item.browser_verification_required = err == error.BrowserVerificationRequired;
-                self.persist(engine) catch |save_err| log.warn("download queue not saved: {s}", .{@errorName(save_err)});
                 log.warn("download {s}: {s}", .{ id, item.failure orelse @errorName(err) });
+                self.persist(engine) catch |save_err| log.warn("download queue not saved: {s}", .{@errorName(save_err)});
             },
         }
     }
@@ -1372,4 +1393,50 @@ test "nonblocking queue polls return busy and own copied identity and failure" {
     try t.expectEqualStrings("owned", page.entries[0].chapter_id);
     try t.expectEqualStrings("failure", page.entries[0].failure.?);
     try t.expect(!queue.tryActivity().?.running);
+}
+
+test "queue persistence waits outside state lock and captures newest owned snapshot" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var engine = Engine.init(t.allocator, t.io, @import("backend.zig").none, .{ .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a) });
+    defer engine.deinit();
+    defer engine.queue.deinit(&engine);
+    engine.queue.loaded = true;
+    try engine.queue.append(t.allocator, "first", 1);
+    const Writer = struct {
+        engine: *Engine,
+        started: Io.Event = .unset,
+        fn run(ctx: *@This()) !void {
+            ctx.engine.queue.acquire();
+            defer ctx.engine.queue.lock.unlock();
+            ctx.started.set(ctx.engine.io);
+            try ctx.engine.queue.persist(ctx.engine);
+        }
+    };
+    var writer: Writer = .{ .engine = &engine };
+    engine.queue.persistence_lock.lockUncancelable(t.io);
+    var future = try t.io.concurrent(Writer.run, .{&writer});
+    try writer.started.wait(t.io);
+    // acquire succeeds once the writer parks on persistence ordering. This
+    // would deadlock if it waited with the state lock held.
+    engine.queue.acquire();
+    Queue.freeItem(t.allocator, engine.queue.items.orderedRemove(0));
+    try engine.queue.append(t.allocator, "replacement", 2);
+    engine.queue.lock.unlock();
+    engine.queue.persistence_lock.unlock(t.io);
+    try future.await(t.io);
+    const saved = try Queue.loadSaved(&engine, a);
+    try t.expectEqual(1, saved.chapters.len);
+    try t.expectEqualStrings("replacement", saved.chapters[0]);
+    // An aborted replacement transaction leaves the last committed order.
+    var db = try Queue.openDatabase(&engine);
+    defer db.close();
+    try db.begin();
+    try Queue.saveRows(&db, .{ .chapters = &.{"aborted"} });
+    db.rollback();
+    try t.expectEqualStrings("replacement", (try Queue.loadSaved(&engine, a)).chapters[0]);
 }
