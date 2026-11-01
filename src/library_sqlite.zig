@@ -531,9 +531,12 @@ test "large chapter SQL pages bound returned IDs and preserve view order and fil
     try t.expectEqual(null, try store.chapterRank(a, "m", 0, true, chapters[0].id));
     try t.expectEqual(null, try store.chapterRank(a, "missing", 0, false, chapters[0].id));
     try t.expectEqual(0, try store.chapterTotal(a, "missing", 0, false));
-    const before = try store.chapterRank(a, "m", 0, false, chapters[2].id);
-    try store.putReading(a, &.{.{ .id = chapters[2].id, .read = true, .bookmark = true }});
-    try t.expectEqual(before, try store.chapterRank(a, "m", 0, false, chapters[2].id));
+    const unread_flags = (views.ChapterFlags{ .unread = .include }).encode(0);
+    const unread_before = try store.chapterTotal(a, "m", unread_flags, false);
+    try t.expect(try store.chapterRank(a, "m", unread_flags, false, chapters[1].id) != null);
+    try store.putReading(a, &.{.{ .id = chapters[1].id, .read = true, .bookmark = true }});
+    try t.expectEqual(null, try store.chapterRank(a, "m", unread_flags, false, chapters[1].id));
+    try t.expectEqual(unread_before - 1, try store.chapterTotal(a, "m", unread_flags, false));
     try t.expect((try store.titleCounts(a, "m")).bookmarked > 0);
     {
         var guard = try open(&store, a);
