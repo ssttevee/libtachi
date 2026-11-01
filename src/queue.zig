@@ -539,7 +539,7 @@ pub const Queue = struct {
         return try self.snapshotPageLocked(arena, offset, limit);
     }
 
-    pub const Activity = struct { running: bool, waiting_for_wifi: bool, active: usize = 0, allowed: usize = 1, bytes: u64 = 0 };
+    pub const Activity = struct { running: bool, waiting_for_wifi: bool, active: usize = 0, allowed: usize = 1, bytes: u32 = 0 };
 
     /// Nonblocking status read; null means busy. No disk access, even at startup.
     pub fn tryActivity(self: *Queue) ?Activity {

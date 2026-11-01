@@ -307,7 +307,7 @@ fn fetchMeasured(client: *std.http.Client, store: PageStore, index: usize, reque
             return req.connection.?.getReadError() orelse error.NetworkReadFailed;
         };
         if (n == 0) break;
-        if (metrics) |m| _ = m.bytes.fetchAdd(n, .monotonic);
+        if (metrics) |m| _ = m.bytes.fetchAdd(@intCast(n), .monotonic);
         if (bytes == 0) extension = imageExtension(buffer[0..n]) orelse return error.JvmImageResponse;
         if (bytes + n > max_image) return error.ImageTooLarge;
         const disk_start = millis(io);
@@ -383,7 +383,7 @@ pub const mihon_retry_ms: []const u32 = &.{ 2000, 4000, 8000 };
 /// history for requests from the same source, including chapter boundaries.
 pub const Metrics = struct {
     active: std.atomic.Value(usize) = .init(0),
-    bytes: std.atomic.Value(u64) = .init(0),
+    bytes: std.atomic.Value(u32) = .init(0),
 };
 
 pub const Scheduler = struct {
@@ -641,7 +641,7 @@ const Fetcher = struct {
         defer self.gpa.free(bytes);
         if (bytes.len > max_image) return error.ImageTooLarge;
         if (self.options.scheduler) |scheduler| if (scheduler.metrics) |m| {
-            _ = m.bytes.fetchAdd(bytes.len, .monotonic);
+            _ = m.bytes.fetchAdd(@intCast(bytes.len), .monotonic);
         };
         const disk_start = millis(io);
         const path = try self.store.put(i, bytes);
