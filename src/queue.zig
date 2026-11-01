@@ -215,13 +215,17 @@ pub const Queue = struct {
         var arena: std.heap.ArenaAllocator = .init(engine.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const lib = try engine.store.load(a);
         const Found = struct { chapter: library.Chapter, source: i64 };
         var chapters: std.ArrayList(Found) = .empty;
-        for (chapter_ids) |id| for (lib.manga) |m| {
+        for (chapter_ids) |id| {
+            const m = engine.store.chapterPreview(a, id) catch |err| switch (err) {
+                error.UnknownChapter => continue,
+                else => return err,
+            };
             const source = m.source_id orelse continue;
-            for (m.chapters) |ch| if (std.mem.eql(u8, ch.id, id) and !ch.downloaded()) try chapters.append(a, .{ .chapter = ch, .source = source });
-        };
+            const ch = m.chapters[0];
+            if (!ch.downloaded()) try chapters.append(a, .{ .chapter = ch, .source = source });
+        }
         // Oldest first: the source lists newest first.
         std.mem.sort(Found, chapters.items, {}, struct {
             fn less(_: void, x: Found, y: Found) bool {

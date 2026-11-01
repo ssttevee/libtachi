@@ -700,8 +700,8 @@ pub const Engine = struct {
 
     fn readChapter(self: *Engine, job: *Job, chapter_id: []const u8, start: u32) !void {
         const a = job.arena.allocator();
-        const current = try self.store.load(a);
-        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
+        const preview = try self.store.chapterPreview(a, chapter_id);
+        const found: Found = .{ .manga = preview, .chapter = preview.chapters[0] };
         if (found.manga.local() or found.chapter.downloaded()) {
             job.setPages(found.chapter.pages.len);
             for (found.chapter.pages, 0..) |path, i| job.pageReady(i, path);
@@ -722,18 +722,7 @@ pub const Engine = struct {
             break :blk fetched;
         };
         if (plan.len == 0) return error.EmptyChapter;
-        const Count = struct {
-            chapter_id: []const u8,
-            count: u32,
-            changed: *bool,
-            fn apply(value: @This(), arena: std.mem.Allocator, lib: library.Library) !?library.Library {
-                const next = try library.setPageCount(arena, lib, value.chapter_id, value.count);
-                value.changed.* = next != null;
-                return next;
-            }
-        };
-        var count_changed = false;
-        _ = try self.store.update(a, Count{ .chapter_id = chapter_id, .count = @intCast(plan.len), .changed = &count_changed }, Count.apply);
+        const count_changed = try self.store.setPageCount(a, chapter_id, @intCast(plan.len));
         job.result.library_changed = count_changed;
         job.setPages(plan.len);
         const chapter = try downloads.downloadChapter(self.gpa, a, self.io, plan, .{
@@ -2624,8 +2613,8 @@ pub const Engine = struct {
             job.pages_total.store(plan.len, .release);
             return;
         }
-        const current = try self.store.load(a);
-        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
+        const preview = try self.store.chapterPreview(a, chapter_id);
+        const found: Found = .{ .manga = preview, .chapter = preview.chapters[0] };
         const source = found.manga.source_id orelse return error.LocalChapter;
         const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
         const plan = try self.requestDownloadPlan(job, source, remote);
@@ -2671,8 +2660,8 @@ pub const Engine = struct {
         const target = try self.downloadTarget(a, chapter_id);
         const use_sd = target.sd_card;
         const destination_file = try self.downloadDestinationPath(a, chapter_id);
-        const current = try self.store.load(a);
-        const found = findChapter(current, chapter_id) orelse return error.UnknownChapter;
+        const preview = try self.store.chapterPreview(a, chapter_id);
+        const found: Found = .{ .manga = preview, .chapter = preview.chapters[0] };
         const source = found.manga.source_id orelse return error.LocalChapter;
         const remote = found.chapter.remote orelse return error.MissingChapterMetadata;
         try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(destination_file).?);
@@ -2705,14 +2694,7 @@ pub const Engine = struct {
         } else chapter.pages;
         const s = chapter.stats;
         log.info("chapter pages={d}/{d} resumed={d} native={d} bytes={d} network_ms={d} disk_ms={d} elapsed_ms={d} planning_ms={d} worker_start_ms={d} total_elapsed_ms={d}", .{ job.pages_done.load(.acquire), plan.len, s.resumed, s.native, s.bytes, s.network_ms, s.disk_ms, s.elapsed_ms, planning_ms, job.start_ms, millis(self.io) - chapter_started });
-        const Edit = struct {
-            id: []const u8,
-            pages: []const []const u8,
-            fn apply(edit: @This(), arena: std.mem.Allocator, lib: library.Library) !?library.Library {
-                return library.setPages(arena, lib, edit.id, edit.pages);
-            }
-        };
-        _ = try self.store.update(a, Edit{ .id = chapter_id, .pages = stored_pages }, Edit.apply);
+        try self.store.setPages(a, chapter_id, stored_pages);
         job.result = .{ .library_changed = true, .manga_id = found.manga.id, .message = "Chapter downloaded" };
     }
 };

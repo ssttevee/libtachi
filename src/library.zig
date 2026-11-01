@@ -348,6 +348,40 @@ pub const Store = struct {
         return result;
     }
 
+    /// Patches download metadata for one chapter without touching reading state,
+    /// sibling chapters or title metadata. Returns whether the count changed.
+    pub fn setPageCount(self: *Store, a: std.mem.Allocator, id: []const u8, count: u32) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var db = try sql.open(self, a);
+        defer db.close();
+        var row = try db.prepare("UPDATE library_chapters SET metadata=json_set(metadata,'$.page_count',?2) WHERE id=?1 AND coalesce(json_extract(metadata,'$.page_count'),0)!=?2 RETURNING id");
+        defer row.close();
+        try row.bindText(1, id);
+        try row.bindInt(2, count);
+        const changed = try row.step();
+        if (changed) _ = try row.step();
+        return changed;
+    }
+
+    /// Atomic page publication. Files must already be durable; reading overlays
+    /// remain independent. Reject invalid paths before opening a transaction.
+    pub fn setPages(self: *Store, a: std.mem.Allocator, id: []const u8, pages: []const []const u8) !void {
+        for (pages) |path| if (!safePath(path)) return error.UnsafePagePath;
+        const bytes = try std.json.Stringify.valueAlloc(a, pages, .{});
+        defer a.free(bytes);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var db = try sql.open(self, a);
+        defer db.close();
+        var row = try db.prepare("UPDATE library_chapters SET metadata=json_set(metadata,'$.pages',json(?2),'$.page_count',CASE WHEN json_array_length(?2)>0 THEN json_array_length(?2) WHEN coalesce(json_array_length(metadata,'$.pages'),0)>0 THEN json_array_length(metadata,'$.pages') ELSE coalesce(json_extract(metadata,'$.page_count'),0) END) WHERE id=?1 RETURNING id");
+        defer row.close();
+        try row.bindText(1, id);
+        try row.bindText(2, bytes);
+        if (!try row.step()) return error.UnknownChapter;
+        _ = try row.step();
+    }
+
     /// Targeted metadata edit: never loads chapters or saves a library snapshot.
     pub fn setChapterFlags(self: *Store, arena: std.mem.Allocator, manga_id: []const u8, flags: u32) !void {
         try self.setFlags(arena, manga_id, flags, "chapter_flags");
@@ -1075,4 +1109,32 @@ test "known chapter page totals survive deletion, metadata refresh and reload" {
 
 test "root SQLite backend" {
     _ = @import("root_sqlite.zig");
+}
+
+test "targeted download patches preserve siblings and independent reading state" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var store: Store = .{ .io = t.io, .dir = try tmp.dir.realPathFileAlloc(t.io, ".", a) };
+    try store.save(a, .{ .manga = &.{.{ .id = "m", .title = "Title", .chapters = &.{ .{ .id = "c", .title = "Chapter" }, .{ .id = "sibling", .title = "Unchanged" } } }} });
+    _ = try store.setProgress(a, &.{.{ .chapter_id = "c", .page = 3, .read = true, .read_ms = 20, .now = 99 }});
+    try t.expect(try store.setPageCount(a, "c", 4));
+    try t.expect(!try store.setPageCount(a, "c", 4));
+    try store.setPages(a, "c", &.{"downloads/a.png"});
+    try t.expectError(error.UnsafePagePath, store.setPages(a, "c", &.{"../lost.png"}));
+    try t.expectError(error.UnknownChapter, store.setPages(a, "missing", &.{"downloads/a.png"}));
+    const title = try store.loadTitle(a, "m");
+    try t.expectEqualStrings("Unchanged", title.chapters[1].title);
+    try t.expectEqual(0, title.chapters[1].page_count);
+    const ch = title.chapters[0];
+    try t.expectEqualStrings("downloads/a.png", ch.pages[0]);
+    try t.expectEqual(1, ch.page_count);
+    try t.expect(ch.read);
+    try t.expectEqual(3, ch.last_page_read);
+    try t.expectEqual(20, ch.read_ms);
+    try store.setPages(a, "c", &.{});
+    try t.expectEqual(1, (try store.chapterPreview(a, "c")).chapters[0].page_count);
 }
